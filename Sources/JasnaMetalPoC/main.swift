@@ -244,10 +244,14 @@ private func benchmark(runner: MetalDeformConv, weightSet: DeformConvWeightSet? 
     print("SIMD range:      \(String(format: "%.3f", result.simdMinimumMilliseconds))–\(String(format: "%.3f", result.simdMaximumMilliseconds)) ms")
     print("Tiled median:    \(String(format: "%.3f", result.medianMilliseconds)) ms")
     print("Tiled range:     \(String(format: "%.3f", result.minimumMilliseconds))–\(String(format: "%.3f", result.maximumMilliseconds)) ms")
-    print("Speedup:         \(String(format: "%.2f", result.baselineMedianMilliseconds / result.medianMilliseconds))×")
+    print("Gather+GEMM:     \(String(format: "%.3f", result.simdgroupGEMMMedianMilliseconds)) ms")
+    print("GEMM range:      \(String(format: "%.3f", result.simdgroupGEMMMinimumMilliseconds))–\(String(format: "%.3f", result.simdgroupGEMMMaximumMilliseconds)) ms")
+    print("Tiled speedup:   \(String(format: "%.2f", result.baselineMedianMilliseconds / result.medianMilliseconds))×")
+    print("GEMM speedup:    \(String(format: "%.2f", result.baselineMedianMilliseconds / result.simdgroupGEMMMedianMilliseconds))×")
     print("Iterations:      \(result.iterations)")
     print("Checksum:        \(String(format: "%.6f", result.checksum))")
     print("Max FP16 delta:  \(result.maxDifferenceFromBaseline)")
+    print("GEMM FP16 delta: \(result.simdgroupGEMMMaxDifferenceFromBaseline)")
 }
 
 do {

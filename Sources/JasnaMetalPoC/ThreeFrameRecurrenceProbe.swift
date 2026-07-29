@@ -60,6 +60,12 @@ func verifyThreeFrameRecurrence(
         }
         return buffer
     }
+    func makePrivateBuffer(bytes: Int) throws -> MTLBuffer {
+        guard let buffer = device.makeBuffer(length: bytes, options: .storageModePrivate) else {
+            throw DeformConvError.metalUnavailable
+        }
+        return buffer
+    }
     func makeTensor(dimensions: [Int]) throws -> (any MTLTensor, MTLBuffer) {
         var strides = [Int]()
         var elements = 1
@@ -200,6 +206,8 @@ func verifyThreeFrameRecurrence(
     let offsetBuffer = try makeBuffer(elements: 288 * plane)
     let maskBuffer = try makeBuffer(elements: 144 * plane)
     let alignedBuffer = try makeBuffer(elements: featureCount)
+    let gatheredBuffer = try makePrivateBuffer(bytes: plane * 128 * 9 * 2)
+    let matrixOutputBuffer = try makePrivateBuffer(bytes: plane * 64 * 4)
     let propagationBuffers = try (0..<3).map { _ in try makeBuffer(elements: featureCount) }
     let checkpoint = try DeformConvWeightSet(
         direction: branchName,
@@ -225,7 +233,9 @@ func verifyThreeFrameRecurrence(
     guard let accumulateFunction = library.makeFunction(name: "accumulate_second_order_flow_fp16"),
           let prepareFunction = library.makeFunction(name: "assemble_temporal_alignment_fp16"),
           let transformFunction = library.makeFunction(name: "prepare_dcn_offsets_fp16"),
-          let deformFunction = library.makeFunction(name: "deform_conv2d_fp16_jasna_tiled"),
+          let gatherFunction = library.makeFunction(name: "deform_conv2d_fp16_jasna_gather"),
+          let gemmFunction = library.makeFunction(name: "deform_conv2d_fp16_jasna_simdgroup_gemm"),
+          let gemmOutputFunction = library.makeFunction(name: "deform_conv2d_fp16_jasna_float_gemm_output"),
           let simpleBackboneAssemblyFunction = library.makeFunction(name: "assemble_propagation_backbone_fp16"),
           let temporalBackboneAssemblyFunction = library.makeFunction(name: "assemble_temporal_backbone_fp16"),
           let residualFunction = library.makeFunction(name: "add_propagation_residual_fp16")
@@ -233,7 +243,9 @@ func verifyThreeFrameRecurrence(
     let accumulatePipeline = try device.makeComputePipelineState(function: accumulateFunction)
     let preparePipeline = try device.makeComputePipelineState(function: prepareFunction)
     let transformPipeline = try device.makeComputePipelineState(function: transformFunction)
-    let deformPipeline = try device.makeComputePipelineState(function: deformFunction)
+    let gatherPipeline = try device.makeComputePipelineState(function: gatherFunction)
+    let gemmPipeline = try device.makeComputePipelineState(function: gemmFunction)
+    let gemmOutputPipeline = try device.makeComputePipelineState(function: gemmOutputFunction)
     let simpleBackboneAssemblyPipeline = try device.makeComputePipelineState(
         function: simpleBackboneAssemblyFunction
     )
@@ -245,9 +257,14 @@ func verifyThreeFrameRecurrence(
     let residualPipeline = try device.makeComputePipelineState(function: residualFunction)
 
     var transformArguments = [any MTL4ArgumentTable]()
-    let deformArguments = try makeComputeArguments([
-        deformInputBuffer, offsetBuffer, maskBuffer, checkpoint.weight, checkpoint.bias,
-        alignedBuffer, deformShapeBuffer,
+    let gatherArguments = try makeComputeArguments([
+        deformInputBuffer, offsetBuffer, maskBuffer, gatheredBuffer, deformShapeBuffer,
+    ])
+    let gemmArguments = try makeComputeArguments([
+        gatheredBuffer, checkpoint.weight, matrixOutputBuffer,
+    ])
+    let gemmOutputArguments = try makeComputeArguments([
+        matrixOutputBuffer, checkpoint.bias, alignedBuffer, deformShapeBuffer,
     ])
     let traversal = direction == .backward ? [2, 1, 0] : [0, 1, 2]
     func priorBuffer(_ priorIndex: Int, frame: Int) -> MTLBuffer {
@@ -318,6 +335,8 @@ func verifyThreeFrameRecurrence(
         secondShapeBuffer, planeBuffer, branchIndexBuffer, prefixChannelsBuffer, featureCountBuffer,
         deformShapeBuffer,
     ] + flowBuffers + propagationBuffers + priorBranchBuffers.flatMap { $0 }
+    residencySet.addAllocation(gatheredBuffer)
+    residencySet.addAllocation(matrixOutputBuffer)
     for buffer in residentBuffers { residencySet.addAllocation(buffer) }
     for heap in featureHeaps { residencySet.addAllocation(heap) }
     residencySet.addAllocation(offsetHeap)
@@ -482,8 +501,23 @@ func verifyThreeFrameRecurrence(
                 afterEncoderStages: .dispatch, beforeEncoderStages: .dispatch, visibilityOptions: .device
             )
             dispatch1D(
-                alignment, pipeline: deformPipeline,
-                arguments: deformArguments, count: plane, threads: 128, threadgroups: true
+                alignment, pipeline: gatherPipeline,
+                arguments: gatherArguments, count: plane * 128 * 9
+            )
+            alignment.barrier(
+                afterEncoderStages: .dispatch, beforeEncoderStages: .dispatch, visibilityOptions: .device
+            )
+            dispatch1D(
+                alignment, pipeline: gemmPipeline,
+                arguments: gemmArguments, count: plane / 8,
+                threads: 8 * gemmPipeline.threadExecutionWidth, threadgroups: true
+            )
+            alignment.barrier(
+                afterEncoderStages: .dispatch, beforeEncoderStages: .dispatch, visibilityOptions: .device
+            )
+            dispatch1D(
+                alignment, pipeline: gemmOutputPipeline,
+                arguments: gemmOutputArguments, count: featureCount
             )
             alignment.barrier(
                 afterEncoderStages: .dispatch, beforeEncoderStages: .dispatch, visibilityOptions: .device

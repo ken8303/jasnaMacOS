@@ -292,6 +292,96 @@ kernel void deform_conv2d_fp16_jasna_tiled(
     }
 }
 
+// Materializes deformable im2col as a row-major [output pixel, 1,152]
+// matrix. The following dense multiply uses the GPU's SIMD-group matrix
+// instructions instead of performing 64 scalar reductions here.
+kernel void deform_conv2d_fp16_jasna_gather(
+    device const half *input [[buffer(0)]],
+    device const half *offset [[buffer(1)]],
+    device const half *mask [[buffer(2)]],
+    device half *gathered [[buffer(3)]],
+    constant DeformConvShape &s [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    constexpr uint sampleCount = 128 * 9;
+    uint outputPlane = s.outputHeight * s.outputWidth;
+    uint total = s.batch * outputPlane * sampleCount;
+    if (gid >= total) return;
+
+    uint sampleIndex = gid % sampleCount;
+    uint row = gid / sampleCount;
+    uint n = row / outputPlane;
+    uint spatial = row % outputPlane;
+    uint oy = spatial / s.outputWidth;
+    uint ox = spatial % s.outputWidth;
+    uint ic = sampleIndex / 9;
+    uint k = sampleIndex % 9;
+    uint ky = k / 3;
+    uint kx = k % 3;
+    uint channelsPerOffsetGroup = 128 / s.offsetGroups;
+    uint offsetGroup = ic / channelsPerOffsetGroup;
+    uint offsetChannel = 2 * (offsetGroup * 9 + k);
+    uint offsetBase = n * 2 * s.offsetGroups * 9 * outputPlane;
+    float offY = float(offset[offsetBase + offsetChannel * outputPlane + spatial]);
+    float offX = float(offset[offsetBase + (offsetChannel + 1) * outputPlane + spatial]);
+    float y = float(int(oy * s.strideHeight + ky * s.dilationHeight) - int(s.padHeight)) + offY;
+    float x = float(int(ox * s.strideWidth + kx * s.dilationWidth) - int(s.padWidth)) + offX;
+    uint inputPlane = s.inputHeight * s.inputWidth;
+    float sampled = sample_fp16(
+        input, (n * 128 + ic) * inputPlane,
+        s.inputHeight, s.inputWidth, y, x
+    );
+    uint maskIndex = n * s.offsetGroups * 9 * outputPlane
+        + (offsetGroup * 9 + k) * outputPlane + spatial;
+    gathered[gid] = half(sampled * float(mask[maskIndex]));
+}
+
+// Eight SIMD groups cooperatively produce an 8x64 output tile using the
+// GPU's 8x8 matrix instructions. This form is usable from both Metal 3 and
+// Metal 4 command encoders, unlike an MPSMatrixMultiplication object.
+kernel void deform_conv2d_fp16_jasna_simdgroup_gemm(
+    device const half *gathered [[buffer(0)]],
+    device const half *weight [[buffer(1)]],
+    device float *matrixOutput [[buffer(2)]],
+    uint tile [[threadgroup_position_in_grid]],
+    uint simdgroupIndex [[simdgroup_index_in_threadgroup]]
+) {
+    constexpr uint innerColumns = 128 * 9;
+    constexpr uint outputColumns = 64;
+    uint row = tile * 8;
+    uint column = simdgroupIndex * 8;
+    simdgroup_half8x8 matrixA;
+    simdgroup_half8x8 matrixB;
+    simdgroup_float8x8 matrixC(0.0f);
+    for (uint k = 0; k < innerColumns; k += 8) {
+        simdgroup_load(matrixA, gathered + row * innerColumns + k, innerColumns);
+        simdgroup_load(matrixB, weight + k * outputColumns + column, outputColumns);
+        simdgroup_multiply_accumulate(matrixC, matrixA, matrixB, matrixC);
+    }
+    simdgroup_store(matrixC, matrixOutput + row * outputColumns + column, outputColumns);
+}
+
+// Converts the row-major FP32 accumulator back to Jasna's NCHW FP16 tensor
+// layout and applies the convolution bias.
+kernel void deform_conv2d_fp16_jasna_float_gemm_output(
+    device const float *matrixOutput [[buffer(0)]],
+    device const half *bias [[buffer(1)]],
+    device half *output [[buffer(2)]],
+    constant DeformConvShape &s [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint outputPlane = s.outputHeight * s.outputWidth;
+    uint total = s.batch * outputPlane * 64;
+    if (gid >= total) return;
+    uint oc = gid % 64;
+    uint row = gid / 64;
+    uint n = row / outputPlane;
+    uint spatial = row % outputPlane;
+    output[(n * 64 + oc) * outputPlane + spatial] = half(
+        matrixOutput[gid] + float(bias[oc])
+    );
+}
+
 struct SPyNetPrepareShape {
     uint width;
     uint height;

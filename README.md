@@ -77,11 +77,13 @@ boundary, and allocate the complete buffer-backed clip arena:
 ## Measured result
 
 On a 10-GPU-core Apple M4 with Xcode 27 beta 4, a 20-sample run measured the
-tiled FP16 deformable convolution at 1.175 ms median (1.172–1.178 ms), versus
-9.035 ms (8.992–9.406 ms) for the first SIMD version and 16.017 ms
-(15.918–16.402 ms) for the direct baseline, a 13.63× median speedup. Its maximum
-FP16 difference from the baseline was `0.000244`, and its FP32 implementation
-passed the CPU oracle with a maximum absolute error of about `3e-8`.
+gather-plus-SIMD-group-GEMM FP16 deformable convolution at 0.908 ms median
+(0.904–0.911 ms), versus 1.177 ms (1.173–2.056 ms) for the tiled scalar
+reduction, 9.113 ms for the first SIMD version, and 16.742 ms for the direct
+baseline. The new Metal-4-compatible path is 23% faster than tiled and 18.4×
+faster than the direct kernel at the median. Its maximum FP16 difference from
+the baseline was `0.000244`, and its FP32 implementation passed the CPU oracle
+with a maximum absolute error of about `3e-8`.
 
 The converted feature extractor executes in about 0.42 ms median. The offset,
 propagation-backbone, reconstruction, and six split SPyNet convolution packages
@@ -107,9 +109,10 @@ usage.
 `tools/export_deform_weights.py` extracts the four learned deformable-
 convolution parameter sets from the public checkpoint and writes the packed
 FP16 `[input channel, kernel element, output channel]` layout consumed directly
-by the tiled Metal kernel. Each direction is 147,584 bytes including bias. All
-four load into Metal buffers and benchmark at 1.175–1.187 ms, with a maximum
-delta of `0.000977` from the direct FP16 implementation. The custom
+by the Metal kernels. Each direction is 147,584 bytes including bias. All four
+load into Metal buffers and benchmark at 0.908–0.917 ms through gather plus
+SIMD-group GEMM, with a maximum delta of `0.000977` from the direct FP16
+implementation. The custom
 offset/mask stage implements Jasna's `10*tanh`, interleaved flipped-flow add,
 and sigmoid mask and passes its CPU oracle with maximum error `0.00195`.
 
@@ -187,19 +190,20 @@ the fused four-branch graph will share the three spatial tensors without CPU
 staging.
 
 The four-pass staged probe adds `backward_2` and `forward_2`, preserving the
-per-frame prefix order and real 128/192/256/320-channel backbone widths. The
-four branches measured 9.654 / 7.825 / 8.176 / 8.571 ms in the user's run, for
-a 34.227 ms staged total. All twelve propagated frame features were deterministic;
-the final-frame checksums were `18.276567`, `33.585654`, `65.272682`, and
-`176.354721`, with zero repeat error. This total intentionally includes four
-separate feature-extraction passes and CPU-visible branch boundaries. It is a
-correctness baseline, not the expected fused runtime. The graph now also feeds
-all three sets of spatial and propagation features through the real
+per-frame prefix order and real 128/192/256/320-channel backbone widths. With
+the SIMD-group GEMM DCNv2 path, the four branches measured
+8.027 / 10.359 / 7.894 / 7.945 ms, for a 34.226 ms staged total. All twelve
+propagated frame features were deterministic, with zero repeat error. This
+total intentionally includes four separate feature-extraction passes and
+CPU-visible branch boundaries. It is a correctness baseline, not the expected
+fused runtime. The graph now also feeds all three sets of spatial and
+propagation features through the real
 reconstruction/upsampling package and input-frame residual. The three
-reconstruction paths now share one Metal 4 command buffer and measured 3.441 ms
-median (3.387–4.015 ms) locally, with zero repeat error,
-`0.000488` maximum residual-add error, and frame checksums `389.918312`,
-`390.329422`, and `387.071564`.
+reconstruction paths share one Metal 4 command buffer and measured 3.379 ms in
+the same run. Propagation plus reconstruction measured 37.605 ms, down from the
+previous 44.431 ms tiled-kernel run, with zero repeat error,
+`0.000488` maximum residual-add error, and frame checksums `389.915688`,
+`390.335297`, and `387.072357`.
 
 The bidirectional SPyNet probe now builds normalized 2/4/8/16/32/64 pyramids,
 uses padded row strides required by Metal ML at the small levels, runs twelve
@@ -220,8 +224,11 @@ The specialized tiled DCNv2 kernel now applies the shape's stride and dilation
 when forming sample coordinates, and the Swift dispatch path rejects unsupported
 channel/kernel/group shapes before encoding instead of relying on a shader
 early return. An experiment splitting each output-channel reduction across two
-threads regressed from 1.175 ms to 2.059 ms and was rejected. A gather-then-GEMM
-implementation remains the credible next DCNv2 optimization.
+threads regressed from 1.175 ms to 2.059 ms and was rejected. The replacement
+materializes the 4,096×1,152 deformable im2col matrix, multiplies it by the
+1,152×64 packed checkpoint weights using 8×8 SIMD-group matrix instructions,
+and converts the FP32 accumulator back to NCHW FP16. It works inside the same
+Metal 4 command buffer as the Metal ML recurrence stages.
 
 ## Model conversion
 
