@@ -1,0 +1,6 @@
+.build/
+work/
+Models/
+__pycache__/
+*.pyc
+.DS_Store
