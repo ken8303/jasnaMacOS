@@ -2,6 +2,7 @@ import Foundation
 import Metal
 
 struct ClipReconstructionResult {
+    let statistics: BenchmarkStatistics
     let medianMilliseconds: Double
     let minimumMilliseconds: Double
     let maximumMilliseconds: Double
@@ -264,15 +265,18 @@ func verifyReconstructedClip(
 
     _ = try execute()
     _ = try execute()
+    _ = try execute()
     let (firstMilliseconds, first) = try execute()
     var samples = [firstMilliseconds]
     var last = first
-    for _ in 1..<7 {
+    for _ in 1..<20 {
         let (milliseconds, outputs) = try execute()
         samples.append(milliseconds)
         last = outputs
     }
-    samples.sort()
+    guard let statistics = BenchmarkStatistics(samples) else {
+        throw DeformConvError.commandFailed("invalid reconstruction benchmark samples")
+    }
     var maximumMagnitude: Float = 0
     var residualError: Float = 0
     var repeatError: Float = 0
@@ -305,10 +309,11 @@ func verifyReconstructedClip(
     }
     _ = heldTensors
     return ClipReconstructionResult(
-        medianMilliseconds: samples[samples.count / 2],
-        minimumMilliseconds: samples[0],
-        maximumMilliseconds: samples[samples.count - 1],
-        iterations: samples.count,
+        statistics: statistics,
+        medianMilliseconds: statistics.median,
+        minimumMilliseconds: statistics.minimum,
+        maximumMilliseconds: statistics.maximum,
+        iterations: statistics.samples.count,
         elementCount: 3 * frameCount,
         maximumMagnitude: maximumMagnitude,
         residualMaximumError: residualError,

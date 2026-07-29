@@ -65,6 +65,10 @@ struct TemporalPreparationResult {
 }
 
 struct BenchmarkResult {
+    let baselineStatistics: BenchmarkStatistics
+    let simdStatistics: BenchmarkStatistics
+    let tiledStatistics: BenchmarkStatistics
+    let gemmStatistics: BenchmarkStatistics
     let baselineMedianMilliseconds: Double
     let baselineMinimumMilliseconds: Double
     let baselineMaximumMilliseconds: Double
@@ -330,20 +334,31 @@ final class MetalDeformConv {
                 "SIMD-group GEMM FP16 result differs from baseline by \(simdgroupGEMMMaxDifference)"
             )
         }
+        guard let baselineStatistics = BenchmarkStatistics(baselineSamples),
+              let simdStatistics = BenchmarkStatistics(simdSamples),
+              let tiledStatistics = BenchmarkStatistics(samples),
+              let gemmStatistics = BenchmarkStatistics(simdgroupGEMMSamples)
+        else {
+            throw DeformConvError.commandFailed("invalid DCNv2 benchmark samples")
+        }
         return BenchmarkResult(
-            baselineMedianMilliseconds: baselineSamples[baselineSamples.count / 2],
-            baselineMinimumMilliseconds: baselineSamples[0],
-            baselineMaximumMilliseconds: baselineSamples[baselineSamples.count - 1],
-            simdMedianMilliseconds: simdSamples[simdSamples.count / 2],
-            simdMinimumMilliseconds: simdSamples[0],
-            simdMaximumMilliseconds: simdSamples[simdSamples.count - 1],
-            medianMilliseconds: samples[samples.count / 2],
-            minimumMilliseconds: samples[0],
-            maximumMilliseconds: samples[samples.count - 1],
-            simdgroupGEMMMedianMilliseconds: simdgroupGEMMSamples[simdgroupGEMMSamples.count / 2],
-            simdgroupGEMMMinimumMilliseconds: simdgroupGEMMSamples[0],
-            simdgroupGEMMMaximumMilliseconds: simdgroupGEMMSamples[simdgroupGEMMSamples.count - 1],
-            iterations: samples.count,
+            baselineStatistics: baselineStatistics,
+            simdStatistics: simdStatistics,
+            tiledStatistics: tiledStatistics,
+            gemmStatistics: gemmStatistics,
+            baselineMedianMilliseconds: baselineStatistics.median,
+            baselineMinimumMilliseconds: baselineStatistics.minimum,
+            baselineMaximumMilliseconds: baselineStatistics.maximum,
+            simdMedianMilliseconds: simdStatistics.median,
+            simdMinimumMilliseconds: simdStatistics.minimum,
+            simdMaximumMilliseconds: simdStatistics.maximum,
+            medianMilliseconds: tiledStatistics.median,
+            minimumMilliseconds: tiledStatistics.minimum,
+            maximumMilliseconds: tiledStatistics.maximum,
+            simdgroupGEMMMedianMilliseconds: gemmStatistics.median,
+            simdgroupGEMMMinimumMilliseconds: gemmStatistics.minimum,
+            simdgroupGEMMMaximumMilliseconds: gemmStatistics.maximum,
+            iterations: gemmStatistics.samples.count,
             checksum: checksum,
             maxDifferenceFromBaseline: maxDifference,
             simdgroupGEMMMaxDifferenceFromBaseline: simdgroupGEMMMaxDifference
@@ -646,7 +661,6 @@ final class MetalDeformConv {
         else { throw DeformConvError.invalidShape }
 
         let rows = shape.outputHeight * shape.outputWidth
-        let innerColumns = shape.inputChannels * shape.kernelArea
         gatherEncoder.setComputePipelineState(fp16JasnaGatherPipeline)
         gatherEncoder.setBuffer(buffers[0], offset: 0, index: 0)
         gatherEncoder.setBuffer(buffers[1], offset: 0, index: 1)
@@ -654,11 +668,9 @@ final class MetalDeformConv {
         gatherEncoder.setBuffer(buffers[5], offset: 0, index: 3)
         var metalShape = MetalShape(shape)
         gatherEncoder.setBytes(&metalShape, length: MemoryLayout<MetalShape>.stride, index: 4)
-        gatherEncoder.dispatchThreads(
-            MTLSize(width: rows * innerColumns, height: 1, depth: 1),
-            threadsPerThreadgroup: MTLSize(
-                width: fp16JasnaGatherPipeline.threadExecutionWidth, height: 1, depth: 1
-            )
+        gatherEncoder.dispatchThreadgroups(
+            MTLSize(width: rows, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1)
         )
         gatherEncoder.endEncoding()
 

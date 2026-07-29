@@ -77,13 +77,14 @@ boundary, and allocate the complete buffer-backed clip arena:
 ## Measured result
 
 On a 10-GPU-core Apple M4 with Xcode 27 beta 4, a 20-sample run measured the
-gather-plus-SIMD-group-GEMM FP16 deformable convolution at 0.908 ms median
-(0.904–0.911 ms), versus 1.177 ms (1.173–2.056 ms) for the tiled scalar
-reduction, 9.113 ms for the first SIMD version, and 16.742 ms for the direct
-baseline. The new Metal-4-compatible path is 23% faster than tiled and 18.4×
-faster than the direct kernel at the median. Its maximum FP16 difference from
-the baseline was `0.000244`, and its FP32 implementation passed the CPU oracle
-with a maximum absolute error of about `3e-8`.
+gather-plus-SIMD-group-GEMM FP16 deformable convolution at 0.742 ms median.
+Its 20-sample P10–P90 interval was 0.741–0.745 ms; one 1.723 ms outlier raised
+the standard deviation to 0.214 ms. The tiled scalar reduction measured
+1.175 ms, the first SIMD version 9.166 ms, and the direct baseline 16.572 ms.
+The Metal-4-compatible path is 37% faster than tiled and 22.3× faster than the
+direct kernel at the median. Its maximum FP16 difference from the baseline was
+`0.000244`, and its FP32 implementation passed the CPU oracle with a maximum
+absolute error of about `3e-8`.
 
 The converted feature extractor executes in about 0.42 ms median. The offset,
 propagation-backbone, reconstruction, and six split SPyNet convolution packages
@@ -110,9 +111,9 @@ usage.
 convolution parameter sets from the public checkpoint and writes the packed
 FP16 `[input channel, kernel element, output channel]` layout consumed directly
 by the Metal kernels. Each direction is 147,584 bytes including bias. All four
-load into Metal buffers and benchmark at 0.908–0.917 ms through gather plus
-SIMD-group GEMM, with a maximum delta of `0.000977` from the direct FP16
-implementation. The custom
+load into Metal buffers and benchmark at 0.741–0.742 ms median through gather
+plus SIMD-group GEMM. Their P10–P90 intervals stay within 0.740–0.747 ms, with
+a maximum delta of `0.000977` from the direct FP16 implementation. The custom
 offset/mask stage implements Jasna's `10*tanh`, interleaved flipped-flow add,
 and sigmoid mask and passes its CPU oracle with maximum error `0.00195`.
 
@@ -185,23 +186,26 @@ the corresponding persistent `backward_1` frame feature, and its own aligned
 feature. In the user's run it measured 8.915 ms for `backward_1` and 8.488 ms
 for `forward_1`, or 17.403 ms staged, with zero repeat error and stable
 `18.276567` / `33.585654` output checksums. This deliberately uses two command
-buffers and repeats feature extraction while validating the branch boundary;
-the fused four-branch graph will share the three spatial tensors without CPU
-staging.
+buffers while validating the branch boundary; `forward_1` reuses the three
+spatial tensors extracted by `backward_1`.
 
 The four-pass staged probe adds `backward_2` and `forward_2`, preserving the
 per-frame prefix order and real 128/192/256/320-channel backbone widths. With
-the SIMD-group GEMM DCNv2 path, the four branches measured
-8.027 / 10.359 / 7.894 / 7.945 ms, for a 34.226 ms staged total. All twelve
-propagated frame features were deterministic, with zero repeat error. This
-total intentionally includes four separate feature-extraction passes and
-CPU-visible branch boundaries. It is a correctness baseline, not the expected
-fused runtime. The graph now also feeds all three sets of spatial and
-propagation features through the real
+the cooperative-gather SIMD-group GEMM DCNv2 path, a 20-sample run measured
+9.311 / 8.909 / 9.419 / 8.415 ms branch medians, for a 36.054 ms staged total.
+The branch P10–P90 intervals were 7.378–10.050 / 8.093–10.448 /
+8.043–10.925 / 7.418–12.746 ms, with 1.018 / 1.026 / 1.165 / 2.111 ms standard
+deviations. All twelve propagated frame features were deterministic, with zero
+repeat error. This
+total intentionally includes four separate branch command buffers and
+CPU-visible boundaries; spatial features are extracted once and reused. It is
+a correctness baseline, not the expected fused runtime. The graph now also
+feeds all three sets of spatial and propagation features through the real
 reconstruction/upsampling package and input-frame residual. The three
-reconstruction paths share one Metal 4 command buffer and measured 3.379 ms in
-the same run. Propagation plus reconstruction measured 37.605 ms, down from the
-previous 44.431 ms tiled-kernel run, with zero repeat error,
+reconstruction paths share one Metal 4 command buffer and measured 3.363 ms in
+the same run, with a 3.324–3.885 ms P10–P90 interval and 0.526 ms standard
+deviation. The staged medians sum to 39.416 ms. This is not a directly sampled
+end-to-end latency distribution. Outputs had zero repeat error,
 `0.000488` maximum residual-add error, and frame checksums `389.915688`,
 `390.335297`, and `387.072357`.
 

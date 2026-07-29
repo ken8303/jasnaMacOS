@@ -301,39 +301,41 @@ kernel void deform_conv2d_fp16_jasna_gather(
     device const half *mask [[buffer(2)]],
     device half *gathered [[buffer(3)]],
     constant DeformConvShape &s [[buffer(4)]],
-    uint gid [[thread_position_in_grid]]
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint threadsPerGroup [[threads_per_threadgroup]]
 ) {
     constexpr uint sampleCount = 128 * 9;
     uint outputPlane = s.outputHeight * s.outputWidth;
-    uint total = s.batch * outputPlane * sampleCount;
-    if (gid >= total) return;
-
-    uint sampleIndex = gid % sampleCount;
-    uint row = gid / sampleCount;
+    if (row >= s.batch * outputPlane) return;
     uint n = row / outputPlane;
     uint spatial = row % outputPlane;
     uint oy = spatial / s.outputWidth;
     uint ox = spatial % s.outputWidth;
-    uint ic = sampleIndex / 9;
-    uint k = sampleIndex % 9;
-    uint ky = k / 3;
-    uint kx = k % 3;
     uint channelsPerOffsetGroup = 128 / s.offsetGroups;
-    uint offsetGroup = ic / channelsPerOffsetGroup;
-    uint offsetChannel = 2 * (offsetGroup * 9 + k);
     uint offsetBase = n * 2 * s.offsetGroups * 9 * outputPlane;
-    float offY = float(offset[offsetBase + offsetChannel * outputPlane + spatial]);
-    float offX = float(offset[offsetBase + (offsetChannel + 1) * outputPlane + spatial]);
-    float y = float(int(oy * s.strideHeight + ky * s.dilationHeight) - int(s.padHeight)) + offY;
-    float x = float(int(ox * s.strideWidth + kx * s.dilationWidth) - int(s.padWidth)) + offX;
     uint inputPlane = s.inputHeight * s.inputWidth;
-    float sampled = sample_fp16(
-        input, (n * 128 + ic) * inputPlane,
-        s.inputHeight, s.inputWidth, y, x
-    );
-    uint maskIndex = n * s.offsetGroups * 9 * outputPlane
-        + (offsetGroup * 9 + k) * outputPlane + spatial;
-    gathered[gid] = half(sampled * float(mask[maskIndex]));
+    for (uint sampleIndex = tid; sampleIndex < sampleCount; sampleIndex += threadsPerGroup) {
+        uint ic = sampleIndex / 9;
+        uint k = sampleIndex % 9;
+        uint ky = k / 3;
+        uint kx = k % 3;
+        uint offsetGroup = ic / channelsPerOffsetGroup;
+        uint offsetChannel = 2 * (offsetGroup * 9 + k);
+        float offY = float(offset[offsetBase + offsetChannel * outputPlane + spatial]);
+        float offX = float(offset[offsetBase + (offsetChannel + 1) * outputPlane + spatial]);
+        float y = float(int(oy * s.strideHeight + ky * s.dilationHeight) - int(s.padHeight)) + offY;
+        float x = float(int(ox * s.strideWidth + kx * s.dilationWidth) - int(s.padWidth)) + offX;
+        float sampled = sample_fp16(
+            input, (n * 128 + ic) * inputPlane,
+            s.inputHeight, s.inputWidth, y, x
+        );
+        uint maskIndex = n * s.offsetGroups * 9 * outputPlane
+            + (offsetGroup * 9 + k) * outputPlane + spatial;
+        gathered[row * sampleCount + sampleIndex] = half(
+            sampled * float(mask[maskIndex])
+        );
+    }
 }
 
 // Eight SIMD groups cooperatively produce an 8x64 output tile using the

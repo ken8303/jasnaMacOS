@@ -2,6 +2,7 @@ import Foundation
 import Metal
 
 struct ThreeFrameRecurrenceResult {
+    let statistics: BenchmarkStatistics
     let medianMilliseconds: Double
     let minimumMilliseconds: Double
     let maximumMilliseconds: Double
@@ -502,7 +503,8 @@ func verifyThreeFrameRecurrence(
             )
             dispatch1D(
                 alignment, pipeline: gatherPipeline,
-                arguments: gatherArguments, count: plane * 128 * 9
+                arguments: gatherArguments, count: plane,
+                threads: 128, threadgroups: true
             )
             alignment.barrier(
                 afterEncoderStages: .dispatch, beforeEncoderStages: .dispatch, visibilityOptions: .device
@@ -581,15 +583,18 @@ func verifyThreeFrameRecurrence(
 
     _ = try execute()
     _ = try execute()
+    _ = try execute()
     let (firstMilliseconds, first) = try execute()
     var samples = [firstMilliseconds]
     var last = first
-    for _ in 1..<7 {
+    for _ in 1..<20 {
         let (milliseconds, output) = try execute()
         samples.append(milliseconds)
         last = output
     }
-    samples.sort()
+    guard let statistics = BenchmarkStatistics(samples) else {
+        throw DeformConvError.commandFailed("invalid three-frame benchmark samples")
+    }
     var maximumMagnitude: Float = 0
     var repeatMaximumError: Float = 0
     var checksum = 0.0
@@ -625,10 +630,11 @@ func verifyThreeFrameRecurrence(
     }
     _ = heldTensors
     return ThreeFrameRecurrenceResult(
-        medianMilliseconds: samples[samples.count / 2],
-        minimumMilliseconds: samples[0],
-        maximumMilliseconds: samples[samples.count - 1],
-        iterations: samples.count,
+        statistics: statistics,
+        medianMilliseconds: statistics.median,
+        minimumMilliseconds: statistics.minimum,
+        maximumMilliseconds: statistics.maximum,
+        iterations: statistics.samples.count,
         elementCount: featureCount,
         maximumMagnitude: maximumMagnitude,
         secondOrderFlowMaximum: secondOrderMaximum,
