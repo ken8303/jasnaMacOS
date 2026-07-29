@@ -251,7 +251,8 @@ kernel void deform_conv2d_fp16_jasna_tiled(
     uint threadsPerGroup [[threads_per_threadgroup]]
 ) {
     if (s.inputChannels != 128 || s.outputChannels != 64 ||
-        s.kernelHeight != 3 || s.kernelWidth != 3 || s.groups != 1) return;
+        s.kernelHeight != 3 || s.kernelWidth != 3 || s.groups != 1 ||
+        s.offsetGroups == 0) return;
     constexpr uint sampleCount = 128 * 9;
     threadgroup half samples[sampleCount];
     uint outputPlane = s.outputHeight * s.outputWidth;
@@ -273,8 +274,8 @@ kernel void deform_conv2d_fp16_jasna_tiled(
         uint offsetBase = n * 2 * s.offsetGroups * 9 * outputPlane;
         float offY = float(offset[offsetBase + offsetChannel * outputPlane + spatial]);
         float offX = float(offset[offsetBase + (offsetChannel + 1) * outputPlane + spatial]);
-        float y = float(int(oy + ky) - int(s.padHeight)) + offY;
-        float x = float(int(ox + kx) - int(s.padWidth)) + offX;
+        float y = float(int(oy * s.strideHeight + ky * s.dilationHeight) - int(s.padHeight)) + offY;
+        float x = float(int(ox * s.strideWidth + kx * s.dilationWidth) - int(s.padWidth)) + offX;
         float sampled = sample_fp16(input, (n * 128 + ic) * inputPlane, s.inputHeight, s.inputWidth, y, x);
         uint maskIndex = n * s.offsetGroups * 9 * outputPlane
             + (offsetGroup * 9 + k) * outputPlane + spatial;
@@ -282,7 +283,7 @@ kernel void deform_conv2d_fp16_jasna_tiled(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    if (tid < 64) {
+    if (tid < 64u) {
         float sum = float(bias[tid]);
         for (uint sampleIndex = 0; sampleIndex < sampleCount; ++sampleIndex) {
             sum += float(samples[sampleIndex]) * float(weight[sampleIndex * 64 + tid]);

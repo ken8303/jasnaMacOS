@@ -66,9 +66,14 @@ struct TemporalPreparationResult {
 
 struct BenchmarkResult {
     let baselineMedianMilliseconds: Double
+    let baselineMinimumMilliseconds: Double
+    let baselineMaximumMilliseconds: Double
     let simdMedianMilliseconds: Double
+    let simdMinimumMilliseconds: Double
+    let simdMaximumMilliseconds: Double
     let medianMilliseconds: Double
     let minimumMilliseconds: Double
+    let maximumMilliseconds: Double
     let iterations: Int
     let checksum: Double
     let maxDifferenceFromBaseline: Float
@@ -157,7 +162,7 @@ final class MetalDeformConv {
     }
 
     func benchmarkJasnaShape(
-        iterations: Int = 8,
+        iterations: Int = 20,
         weightSet: DeformConvWeightSet? = nil
     ) throws -> BenchmarkResult {
         let shape = DeformConvShape(
@@ -235,9 +240,11 @@ final class MetalDeformConv {
         let tiledBuffers = [inputBuffer, offsetBuffer, maskBuffer, packedWeightBuffer, biasBuffer, tiledOutputBuffer]
         let baselineBuffers = [inputBuffer, offsetBuffer, maskBuffer, weightBuffer, biasBuffer, baselineOutputBuffer]
 
-        _ = try execute(pipeline: fp16Pipeline, shape: shape, buffers: baselineBuffers)
+        for _ in 0..<2 {
+            _ = try execute(pipeline: fp16Pipeline, shape: shape, buffers: baselineBuffers)
+        }
         var baselineSamples = [Double]()
-        for _ in 0..<3 {
+        for _ in 0..<max(iterations, 1) {
             baselineSamples.append(try execute(pipeline: fp16Pipeline, shape: shape, buffers: baselineBuffers))
         }
         baselineSamples.sort()
@@ -274,9 +281,14 @@ final class MetalDeformConv {
         }
         return BenchmarkResult(
             baselineMedianMilliseconds: baselineSamples[baselineSamples.count / 2],
+            baselineMinimumMilliseconds: baselineSamples[0],
+            baselineMaximumMilliseconds: baselineSamples[baselineSamples.count - 1],
             simdMedianMilliseconds: simdSamples[simdSamples.count / 2],
+            simdMinimumMilliseconds: simdSamples[0],
+            simdMaximumMilliseconds: simdSamples[simdSamples.count - 1],
             medianMilliseconds: samples[samples.count / 2],
             minimumMilliseconds: samples[0],
+            maximumMilliseconds: samples[samples.count - 1],
             iterations: samples.count,
             checksum: checksum,
             maxDifferenceFromBaseline: maxDifference
@@ -499,6 +511,8 @@ final class MetalDeformConv {
 
     private func executeJasnaSIMD(shape: DeformConvShape, buffers: [MTLBuffer]) throws -> Double {
         guard shape.outputChannels == 64,
+              shape.groups == 1,
+              shape.offsetGroups > 0,
               let commandBuffer = queue.makeCommandBuffer(),
               let encoder = commandBuffer.makeComputeCommandEncoder()
         else { throw DeformConvError.invalidShape }
@@ -527,7 +541,12 @@ final class MetalDeformConv {
     }
 
     private func executeJasnaTiled(shape: DeformConvShape, buffers: [MTLBuffer]) throws -> Double {
-        guard shape.outputChannels == 64,
+        guard shape.inputChannels == 128,
+              shape.outputChannels == 64,
+              shape.kernelHeight == 3,
+              shape.kernelWidth == 3,
+              shape.groups == 1,
+              shape.offsetGroups > 0,
               let commandBuffer = queue.makeCommandBuffer(),
               let encoder = commandBuffer.makeComputeCommandEncoder()
         else { throw DeformConvError.invalidShape }

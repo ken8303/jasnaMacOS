@@ -239,9 +239,11 @@ private func benchmark(runner: MetalDeformConv, weightSet: DeformConvWeightSet? 
     if let weightSet { print("Checkpoint weights: \(weightSet.direction)") }
     print("Jasna DCNv2 shape: 1×128×64×64 → 1×64×64×64, FP16")
     print("Baseline median: \(String(format: "%.3f", result.baselineMedianMilliseconds)) ms")
+    print("Baseline range:  \(String(format: "%.3f", result.baselineMinimumMilliseconds))–\(String(format: "%.3f", result.baselineMaximumMilliseconds)) ms")
     print("SIMD median:     \(String(format: "%.3f", result.simdMedianMilliseconds)) ms")
+    print("SIMD range:      \(String(format: "%.3f", result.simdMinimumMilliseconds))–\(String(format: "%.3f", result.simdMaximumMilliseconds)) ms")
     print("Tiled median:    \(String(format: "%.3f", result.medianMilliseconds)) ms")
-    print("Tiled best:      \(String(format: "%.3f", result.minimumMilliseconds)) ms")
+    print("Tiled range:     \(String(format: "%.3f", result.minimumMilliseconds))–\(String(format: "%.3f", result.maximumMilliseconds)) ms")
     print("Speedup:         \(String(format: "%.2f", result.baselineMedianMilliseconds / result.medianMilliseconds))×")
     print("Iterations:      \(result.iterations)")
     print("Checksum:        \(String(format: "%.6f", result.checksum))")
