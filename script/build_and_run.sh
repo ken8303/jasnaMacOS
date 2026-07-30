@@ -77,7 +77,7 @@ case "$MODE" in
     "$APP_BINARY" --three-frame-first-pass "$ROOT_DIR/Models/MetalML" "$ROOT_DIR/Models/DeformConv" "$ROOT_DIR/Models/SPyNetOracle"
     ;;
   --three-frame-four-pass|three-frame-four-pass)
-    "$APP_BINARY" --three-frame-four-pass "$ROOT_DIR/Models/MetalML" "$ROOT_DIR/Models/DeformConv" "$ROOT_DIR/Models/SPyNetOracle"
+    "$APP_BINARY" --three-frame-four-pass "$ROOT_DIR/Models/MetalML" "$ROOT_DIR/Models/DeformConv" "$ROOT_DIR/Models/SPyNetOracle" "$ROOT_DIR/Models/FullModelOracle"
     ;;
   --schedule|schedule)
     "$APP_BINARY" --schedule "${2:-5}"

@@ -195,15 +195,24 @@ records three bicubic flow-input downscales, two adjacent bidirectional SPyNet
 pairs (24 Metal ML residual-block calls), three feature extractions, all four
 recurrent branches, twelve backbone calls, eight offset/DCNv2 alignments, three
 reconstruction/upsampling networks, the input-frame residuals, and every
-dependency barrier in one Metal 4 command buffer. Over 20 samples the directly
-measured input-to-restored graph took 32.348 ms median, with a 29.514–32.669 ms
-P10–P90 interval and 1.242 ms standard deviation. It starts with three 256×256
-input frames and ends with all three restored 256×256 RGB frames.
+dependency barrier in one Metal 4 command buffer. Two 20-sample runs measured
+30.349 ms and 31.137 ms medians. Their P10–P90 intervals were 28.980–31.200 ms
+and 29.554–31.796 ms, with 0.802 ms and 0.885 ms standard deviations. The graph
+starts with three 256×256 input frames and ends with all three restored 256×256
+RGB frames.
 
 All four fused flows, all twelve fused propagation tensors, and all three
 restored frames matched their separately submitted oracles bit-for-bit and had
 zero repeat error. The residual add had `0.000488` maximum error, and frame
 checksums were `389.891747`, `388.891373`, and `387.192463`.
+
+The complete Metal output is also checked against an independent CPU execution
+of the original PyTorch BasicVSR++ generator, rather than only against staged
+Metal implementations. Across all 589,824 restored values, the measured maximum
+absolute error was `0.008633`, mean error `0.000203`, P99 error `0.001040`, and
+RMSE `0.000299`, for 70.49 dB PSNR. The command fails unless maximum error is at
+most `0.02`, mean error at most `0.0005`, P99 error at most `0.002`, and PSNR at
+least 60 dB.
 
 The bidirectional SPyNet probe now builds normalized 2/4/8/16/32/64 pyramids,
 uses padded row strides required by Metal ML at the small levels, runs twelve
@@ -262,3 +271,17 @@ The six `spynet_level_*.mtlpackage` files are the supported replacement.
 The model converter expects the public Lada/Jasna checkpoint path as its first
 argument. Use `--help` for all output-path and validation options. Model weights
 are intentionally not copied into this repository's source history.
+
+Generate the independent three-frame full-model oracle with the same Python
+environment, Jasna checkout, and checkpoint used for conversion:
+
+```sh
+python tools/export_full_model_oracle.py \
+  --jasna-source /path/to/jasna \
+  --weights /path/to/lada_mosaic_restoration_model_generic_v1.2.pth \
+  --output Models/FullModelOracle
+```
+
+The exporter reproduces the Metal probe's deterministic FP16 input
+quantization, then saves both FP32 and FP16 restored tensors. Oracle data and
+model weights remain excluded from version control.

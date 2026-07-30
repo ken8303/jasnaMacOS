@@ -790,9 +790,9 @@ do {
         print("Output checksums:      \(String(format: "%.6f", backward.checksum)) / \(String(format: "%.6f", forward.checksum))")
     }
     if let fourPassIndex = CommandLine.arguments.firstIndex(of: "--three-frame-four-pass") {
-        guard CommandLine.arguments.indices.contains(fourPassIndex + 3) else {
+        guard CommandLine.arguments.indices.contains(fourPassIndex + 4) else {
             throw DeformConvError.commandFailed(
-                "--three-frame-four-pass requires MetalML, DeformConv, and SPyNetOracle directories"
+                "--three-frame-four-pass requires MetalML, DeformConv, SPyNetOracle, and FullModelOracle directories"
             )
         }
         guard #available(macOS 27.0, *) else {
@@ -806,6 +806,9 @@ do {
         )
         let oracleURL = URL(
             fileURLWithPath: CommandLine.arguments[fourPassIndex + 3], isDirectory: true
+        )
+        let fullOracleURL = URL(
+            fileURLWithPath: CommandLine.arguments[fourPassIndex + 4], isDirectory: true
         )
         let (firstFlow, secondFlow) = try verifySyntheticClipFlows(
             runner: runner, modelsURL: modelsURL, oracleURL: oracleURL
@@ -856,6 +859,19 @@ do {
             stagedBranchFrames: branches.map(\.propagatedFrames),
             stagedRestoredFrames: reconstruction.restoredFrames
         )
+        let fullOracle = try compareFullModelOracle(
+            restoredFrames: fused.restoredFrames, oracleURL: fullOracleURL
+        )
+        guard fullOracle.maximumAbsoluteError <= 0.02,
+              fullOracle.meanAbsoluteError <= 0.0005,
+              fullOracle.percentile99AbsoluteError <= 0.002,
+              fullOracle.psnr >= 60
+        else {
+            throw DeformConvError.commandFailed(
+                "full-model oracle mismatch (max=\(fullOracle.maximumAbsoluteError), "
+                    + "p99=\(fullOracle.percentile99AbsoluteError), psnr=\(fullOracle.psnr))"
+            )
+        }
         print("Three-frame fused input-to-restored graph: PASS")
         print("Chain: bicubic → two bidirectional SPyNet pairs → feature extraction → four propagation passes → reconstruction")
         print("Branch medians: \(branches.map { String(format: "%.3f", $0.medianMilliseconds) }.joined(separator: " / ")) ms")
@@ -873,6 +889,10 @@ do {
         print("Fused flow checksums: \(fused.flowChecksums.map { String(format: "%.6f", $0) }.joined(separator: " / "))")
         print("Fused propagation checksums: \(fused.propagationChecksums.map { String(format: "%.6f", $0) }.joined(separator: " / "))")
         print("Fused frame checksums: \(fused.restoredChecksums.map { String(format: "%.6f", $0) }.joined(separator: " / "))")
+        print("PyTorch full-model oracle: PASS (\(fullOracle.elementCount) values)")
+        print("PyTorch max/mean/P99 error: \(String(format: "%.7f / %.7f / %.7f", fullOracle.maximumAbsoluteError, fullOracle.meanAbsoluteError, fullOracle.percentile99AbsoluteError))")
+        print("PyTorch RMSE/PSNR: \(String(format: "%.7f / %.2f dB", fullOracle.rootMeanSquaredError, fullOracle.psnr))")
+        print("PyTorch FP16 max error: \(fullOracle.fp16MaximumError)")
         print("Separate SPyNet oracle medians: \(String(format: "%.3f / %.3f", firstFlow.medianMilliseconds, secondFlow.medianMilliseconds)) ms")
         print("Backward flow checksums: \(String(format: "%.6f / %.6f", firstFlow.backwardChecksum, secondFlow.backwardChecksum))")
         print("Forward flow checksums:  \(String(format: "%.6f / %.6f", firstFlow.forwardChecksum, secondFlow.forwardChecksum))")
