@@ -8,6 +8,9 @@ struct FusedFourPassRecurrenceResult {
     let restoredRepeatMaximumError: Float
     let restoredStagedMaximumError: Float
     let residualMaximumError: Float
+    let flowRepeatMaximumError: Float
+    let flowOracleMaximumError: Float
+    let flowChecksums: [Double]
     let propagationChecksums: [Double]
     let restoredChecksums: [Double]
     let propagatedFrames: [[[Float16]]]
@@ -130,23 +133,6 @@ func verifyFusedFourPassRecurrence(
             try Support.makeSharedFP16Buffer(device: device, elements: featureCount)
         }
     }
-    let backwardFlowBuffers = try backwardFlows.map { values -> MTLBuffer in
-        let buffer = try Support.makeSharedFP16Buffer(device: device, elements: values.count)
-        values.withUnsafeBufferPointer { source in
-            buffer.contents().bindMemory(to: Float16.self, capacity: values.count)
-                .update(from: source.baseAddress!, count: values.count)
-        }
-        return buffer
-    }
-    let forwardFlowBuffers = try forwardFlows.map { values -> MTLBuffer in
-        let buffer = try Support.makeSharedFP16Buffer(device: device, elements: values.count)
-        values.withUnsafeBufferPointer { source in
-            buffer.contents().bindMemory(to: Float16.self, capacity: values.count)
-                .update(from: source.baseAddress!, count: values.count)
-        }
-        return buffer
-    }
-
     var firstShape = ThreeFramePrepareShape(hasSecondOrder: 0)
     var secondShape = ThreeFramePrepareShape(hasSecondOrder: 1)
     var planeValue = UInt32(plane)
@@ -188,6 +174,11 @@ func verifyFusedFourPassRecurrence(
         function: reconstructionAssemblyFunction
     )
     let frameResidualPipeline = try device.makeComputePipelineState(function: frameResidualFunction)
+    let spynetGraph = try FusedSPyNetClipGraph(
+        device: device, modelsURL: modelsURL, library: library, sourceFrames: frameBuffers
+    )
+    let backwardFlowBuffers = spynetGraph.backwardFlowBuffers
+    let forwardFlowBuffers = spynetGraph.forwardFlowBuffers
     let gatherArguments = try Support.makeComputeArguments(
         device: device,
         buffers: [deformInputBuffer, offsetBuffer, maskBuffer, gatheredBuffer, deformShapeBuffer]
@@ -377,6 +368,7 @@ func verifyFusedFourPassRecurrence(
     for buffer in sharedBuffers { residencySet.addAllocation(buffer) }
     for heap in featureHeaps { residencySet.addAllocation(heap) }
     for heap in upsampleHeaps { residencySet.addAllocation(heap) }
+    spynetGraph.addAllocations(to: residencySet)
     for branch in branches {
         residencySet.addAllocation(branch.offsetHeap)
         residencySet.addAllocation(branch.backboneHeap)
@@ -394,6 +386,7 @@ func verifyFusedFourPassRecurrence(
         deformInputBuffer, offsetBuffer, maskBuffer, alignedBuffer,
     ] + reconstructionBuffers + predictedBuffers + restoredBuffers
     func initializeBuffers() {
+        spynetGraph.initializeBuffers()
         for buffer in transientBuffers {
             buffer.contents().initializeMemory(as: UInt8.self, repeating: 0, count: buffer.length)
         }
@@ -405,7 +398,7 @@ func verifyFusedFourPassRecurrence(
         }
     }
 
-    func execute() throws -> (Double, [[[Float16]]], [[Float16]]) {
+    func execute() throws -> (Double, [[[Float16]]], [[Float16]], [[Float16]]) {
         initializeBuffers()
         guard let allocator = device.makeCommandAllocator(),
               let commandBuffer = device.makeCommandBuffer()
@@ -421,6 +414,7 @@ func verifyFusedFourPassRecurrence(
             encoder.dispatchNetwork(intermediatesHeap: featureHeaps[index])
             encoder.endEncoding()
         }
+        try spynetGraph.encode(into: commandBuffer)
         for (branchIndex, branch) in branches.enumerated() {
             let assemblyPipeline = branchIndex == 0 ? simpleAssemblyPipeline : temporalAssemblyPipeline
             guard let initialAssembly = commandBuffer.makeComputeCommandEncoder() else {
@@ -633,22 +627,28 @@ func verifyFusedFourPassRecurrence(
             let pointer = buffer.contents().bindMemory(to: Float16.self, capacity: frameElements)
             return Array(UnsafeBufferPointer(start: pointer, count: frameElements))
         }
-        return (milliseconds, outputs, restored)
+        let flows = (backwardFlowBuffers + forwardFlowBuffers).map { buffer -> [Float16] in
+            let pointer = buffer.contents().bindMemory(to: Float16.self, capacity: 2 * plane)
+            return Array(UnsafeBufferPointer(start: pointer, count: 2 * plane))
+        }
+        return (milliseconds, outputs, restored, flows)
     }
 
     let measurementCount = 20
     _ = try execute()
     _ = try execute()
     _ = try execute()
-    let (firstMilliseconds, firstOutputs, firstRestored) = try execute()
+    let (firstMilliseconds, firstOutputs, firstRestored, firstFlows) = try execute()
     var samples = [firstMilliseconds]
     var lastOutputs = firstOutputs
     var lastRestored = firstRestored
+    var lastFlows = firstFlows
     for _ in 1..<measurementCount {
-        let (milliseconds, outputs, restored) = try execute()
+        let (milliseconds, outputs, restored, flows) = try execute()
         samples.append(milliseconds)
         lastOutputs = outputs
         lastRestored = restored
+        lastFlows = flows
     }
     guard let statistics = BenchmarkStatistics(samples) else {
         throw DeformConvError.commandFailed("invalid fused four-pass benchmark samples")
@@ -711,18 +711,40 @@ func verifyFusedFourPassRecurrence(
             if index.isMultiple(of: 257) { restoredChecksums[frame] += Double(value) }
         }
     }
+    let flowOracles = backwardFlows + forwardFlows
+    var flowRepeatMaximumError: Float = 0
+    var flowOracleMaximumError: Float = 0
+    var flowChecksums = [Double](repeating: 0, count: 4)
+    for flow in 0..<4 {
+        for index in 0..<(2 * plane) {
+            let value = Float(lastFlows[flow][index])
+            guard value.isFinite else {
+                throw DeformConvError.commandFailed("fused SPyNet produced a non-finite flow")
+            }
+            flowRepeatMaximumError = max(
+                flowRepeatMaximumError, abs(Float(firstFlows[flow][index]) - value)
+            )
+            flowOracleMaximumError = max(
+                flowOracleMaximumError, abs(Float(flowOracles[flow][index]) - value)
+            )
+            if index.isMultiple(of: 257) { flowChecksums[flow] += Double(value) }
+        }
+    }
     guard propagationRepeatMaximumError <= 0.001,
           propagationStagedMaximumError <= 0.002,
           restoredRepeatMaximumError <= 0.001,
           restoredStagedMaximumError <= 0.002,
-          residualMaximumError <= 0.001
+          residualMaximumError <= 0.001,
+          flowRepeatMaximumError <= 0.001,
+          flowOracleMaximumError <= 0.002
     else {
         throw DeformConvError.commandFailed(
             "fused graph mismatch (propagation repeat=\(propagationRepeatMaximumError), "
                 + "propagation staged=\(propagationStagedMaximumError), "
                 + "restored repeat=\(restoredRepeatMaximumError), "
                 + "restored staged=\(restoredStagedMaximumError), "
-                + "residual=\(residualMaximumError), branches=\(stagedBranchErrors))"
+                + "residual=\(residualMaximumError), flow repeat=\(flowRepeatMaximumError), "
+                + "flow oracle=\(flowOracleMaximumError), branches=\(stagedBranchErrors))"
         )
     }
     _ = heldTensors
@@ -734,6 +756,9 @@ func verifyFusedFourPassRecurrence(
         restoredRepeatMaximumError: restoredRepeatMaximumError,
         restoredStagedMaximumError: restoredStagedMaximumError,
         residualMaximumError: residualMaximumError,
+        flowRepeatMaximumError: flowRepeatMaximumError,
+        flowOracleMaximumError: flowOracleMaximumError,
+        flowChecksums: flowChecksums,
         propagationChecksums: checksums,
         restoredChecksums: restoredChecksums,
         propagatedFrames: lastOutputs,
