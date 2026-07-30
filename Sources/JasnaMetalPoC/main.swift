@@ -813,6 +813,13 @@ do {
         )
         let branches = [backward1, forward1, backward2, forward2]
         let total = branches.reduce(0.0) { $0 + $1.medianMilliseconds }
+        let reconstruction = try verifyReconstructedClip(
+            device: runner.device,
+            modelsURL: modelsURL,
+            spatialFrames: backward1.spatialFrames,
+            branchFrames: branches.map(\.propagatedFrames),
+            inputFrames: backward1.inputFrames
+        )
         let fused = try verifyFusedFourPassRecurrence(
             device: runner.device,
             modelsURL: modelsURL,
@@ -820,33 +827,28 @@ do {
             backwardFlows: backwardFlows,
             forwardFlows: forwardFlows,
             inputFrames: backward1.inputFrames,
-            stagedBranchFrames: branches.map(\.propagatedFrames)
+            stagedBranchFrames: branches.map(\.propagatedFrames),
+            stagedRestoredFrames: reconstruction.restoredFrames
         )
-        let reconstruction = try verifyReconstructedClip(
-            device: runner.device,
-            modelsURL: modelsURL,
-            spatialFrames: backward1.spatialFrames,
-            branchFrames: fused.propagatedFrames,
-            inputFrames: backward1.inputFrames
-        )
-        print("Three-frame four-pass propagation: PASS")
-        print("Chain: backward_1 → forward_1 → backward_2 → forward_2 with persistent per-frame prefixes")
+        print("Three-frame fused feature-to-restored graph: PASS")
+        print("Chain: feature extraction → four propagation passes → upsample/reconstruction → frame residual")
         print("Branch medians: \(branches.map { String(format: "%.3f", $0.medianMilliseconds) }.joined(separator: " / ")) ms")
         print("Branch ranges:  \(branches.map { String(format: "%.3f–%.3f", $0.minimumMilliseconds, $0.maximumMilliseconds) }.joined(separator: " / ")) ms")
         print("Branch P10–P90: \(branches.map { String(format: "%.3f–%.3f", $0.statistics.percentile10, $0.statistics.percentile90) }.joined(separator: " / ")) ms")
         print("Branch stddev:  \(branches.map { String(format: "%.3f", $0.statistics.standardDeviation) }.joined(separator: " / ")) ms")
         print("Branch samples: \(branches.map(\.iterations))")
         print("Staged total:   \(String(format: "%.3f", total)) ms")
-        print("Fused four-pass median: \(String(format: "%.3f", fused.statistics.median)) ms")
-        print("Fused P10–P90/stddev: \(String(format: "%.3f–%.3f / %.3f", fused.statistics.percentile10, fused.statistics.percentile90, fused.statistics.standardDeviation)) ms")
-        print("Fused best/worst/samples: \(String(format: "%.3f / %.3f / %d", fused.statistics.minimum, fused.statistics.maximum, fused.statistics.samples.count))")
-        print("Fused staged/repeat error: \(fused.stagedMaximumError) / \(fused.repeatMaximumError)")
-        print("Fused checksums: \(fused.checksums.map { String(format: "%.6f", $0) }.joined(separator: " / "))")
-        print("Fused 3-frame reconstruction: \(String(format: "%.3f", reconstruction.medianMilliseconds)) ms")
+        print("Fused feature→restored median: \(String(format: "%.3f", fused.statistics.median)) ms")
+        print("Fused end-to-end P10–P90/stddev: \(String(format: "%.3f–%.3f / %.3f", fused.statistics.percentile10, fused.statistics.percentile90, fused.statistics.standardDeviation)) ms")
+        print("Fused end-to-end best/worst/samples: \(String(format: "%.3f / %.3f / %d", fused.statistics.minimum, fused.statistics.maximum, fused.statistics.samples.count))")
+        print("Propagation staged/repeat error: \(fused.propagationStagedMaximumError) / \(fused.propagationRepeatMaximumError)")
+        print("Restored staged/repeat/residual error: \(fused.restoredStagedMaximumError) / \(fused.restoredRepeatMaximumError) / \(fused.residualMaximumError)")
+        print("Fused propagation checksums: \(fused.propagationChecksums.map { String(format: "%.6f", $0) }.joined(separator: " / "))")
+        print("Fused frame checksums: \(fused.restoredChecksums.map { String(format: "%.6f", $0) }.joined(separator: " / "))")
+        print("Separate 3-frame reconstruction oracle: \(String(format: "%.3f", reconstruction.medianMilliseconds)) ms")
         print("Reconstruction best/worst: \(String(format: "%.3f", reconstruction.minimumMilliseconds)) / \(String(format: "%.3f", reconstruction.maximumMilliseconds)) ms")
         print("Reconstruction P10–P90/stddev: \(String(format: "%.3f–%.3f / %.3f", reconstruction.statistics.percentile10, reconstruction.statistics.percentile90, reconstruction.statistics.standardDeviation)) ms")
         print("Propagation + reconstruction: \(String(format: "%.3f", total + reconstruction.medianMilliseconds)) ms")
-        print("Fused propagation + reconstruction medians: \(String(format: "%.3f", fused.statistics.median + reconstruction.medianMilliseconds)) ms")
         print("Output maxima:  \(branches.map(\.maximumMagnitude))")
         print("Flow2 maxima:   \(branches.map(\.secondOrderFlowMaximum))")
         print("Repeat error:   \(branches.map(\.repeatMaximumError).max() ?? 0)")

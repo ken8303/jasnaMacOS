@@ -192,20 +192,18 @@ spatial tensors extracted by `backward_1`.
 The four-pass probe adds `backward_2` and `forward_2`, preserving the per-frame
 prefix order and real 128/192/256/320-channel backbone widths. Its fused path
 records three feature extractions, all four recurrent branches, twelve backbone
-calls, eight offset/DCNv2 alignments, and every dependency barrier in one
-Metal 4 command buffer. Over 20 samples it measured 22.828 ms median, with a
-22.434–23.033 ms P10–P90 interval and 0.303 ms standard deviation. The same
-work measured 29.101 ms as four separately submitted branch medians in that
-run. All twelve fused propagation tensors matched the staged oracle bit-for-bit
-and had zero repeat error.
+calls, eight offset/DCNv2 alignments, three reconstruction/upsampling networks,
+the input-frame residuals, and every dependency barrier in one Metal 4 command
+buffer. Over 20 samples the directly measured feature-to-restored graph took
+27.098 ms median, with a 24.876–27.991 ms P10–P90 interval and 1.125 ms standard
+deviation. This timing starts with input frames and precomputed flows and ends
+with all three restored 256×256 RGB frames; SPyNet remains separately measured.
 
-The graph also feeds all three sets of spatial and propagation features through
-the real reconstruction/upsampling package and input-frame residual. The three
-reconstruction paths share one Metal 4 command buffer and measured 3.558 ms
-median. Fused propagation plus reconstruction medians sum to 26.386 ms; this
-sum is not yet a directly sampled combined command buffer. Outputs had zero repeat error,
-`0.000488` maximum residual-add error, and frame checksums `389.915688`,
-`390.335297`, and `387.072357`.
+All twelve fused propagation tensors and all three restored frames matched the
+separately submitted staged oracles bit-for-bit and had zero repeat error. The
+residual add had `0.000488` maximum error, and frame checksums were `389.915688`,
+`390.335297`, and `387.072357`. In the same run the four staged branch medians
+totaled 40.641 ms and the independent reconstruction oracle measured 3.394 ms.
 
 The bidirectional SPyNet probe now builds normalized 2/4/8/16/32/64 pyramids,
 uses padded row strides required by Metal ML at the small levels, runs twelve

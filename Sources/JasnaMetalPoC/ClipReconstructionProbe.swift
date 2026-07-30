@@ -12,6 +12,7 @@ struct ClipReconstructionResult {
     let residualMaximumError: Float
     let repeatMaximumError: Float
     let checksums: [Double]
+    let restoredFrames: [[Float16]]
 }
 
 @available(macOS 27.0, *)
@@ -318,6 +319,7 @@ func verifyReconstructedClip(
         maximumMagnitude: maximumMagnitude,
         residualMaximumError: residualError,
         repeatMaximumError: repeatError,
-        checksums: checksums
+        checksums: checksums,
+        restoredFrames: last
     )
 }
