@@ -5,6 +5,28 @@ MODE="${1:-run}"
 APP_NAME="JasnaMetalPoC"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+case "$MODE" in
+  --restore-sbs-video|restore-sbs-video|--restore-sbs-window|restore-sbs-window)
+    [[ $# -ge 3 ]] || {
+      echo "error: restore mode requires input and output video paths" >&2
+      exit 2
+    }
+    RESTORE_OUTPUT_PATH="$3"
+    RESTORE_OUTPUT_DIR="$(cd "$(dirname "$RESTORE_OUTPUT_PATH")" && pwd)"
+    RESTORE_OUTPUT_NAME="$(basename "$RESTORE_OUTPUT_PATH")"
+    RESTORE_OUTPUT_STEM="${RESTORE_OUTPUT_NAME%.*}"
+    export JASNA_WORK_DIR="$RESTORE_OUTPUT_DIR/${RESTORE_OUTPUT_STEM}.jasna-work"
+    JASNA_LOG_PATH="$RESTORE_OUTPUT_DIR/${RESTORE_OUTPUT_STEM}.jasna.log"
+    mkdir -p "$JASNA_WORK_DIR"
+    exec > >(/usr/bin/tee -a "$JASNA_LOG_PATH") 2>&1
+    echo
+    echo "===== Jasna restoration session $(date -u '+%Y-%m-%dT%H:%M:%SZ') ====="
+    echo "Log:      $JASNA_LOG_PATH"
+    echo "Work dir: $JASNA_WORK_DIR"
+    echo "Output:   $RESTORE_OUTPUT_PATH"
+    ;;
+esac
+
 cd "$ROOT_DIR"
 pkill -x "$APP_NAME" >/dev/null 2>&1 || true
 mkdir -p "$ROOT_DIR/.build/ModuleCache"

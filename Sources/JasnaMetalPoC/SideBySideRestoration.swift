@@ -36,6 +36,14 @@ enum SideBySideRestoration {
             sourceFramesPerSecond: inputInfo.nominalFramesPerSecond,
             durationSeconds: inputInfo.durationSeconds
         )
+        report(
+            "Restoration plan: \(plan.dimensions.width)×\(plan.dimensions.height), "
+                + "\(plan.frameRate.outputFrameCount) frames, "
+                + "\(plan.temporalWindowCount) windows, \(plan.tiles.count) tiles/window"
+        )
+        if let workDirectory = ProcessInfo.processInfo.environment["JASNA_WORK_DIR"] {
+            report("Persistent work directory: \(workDirectory)")
+        }
         let decoder = try await FrameDecoder(inputURL: inputURL, plan: plan)
         let writer = try RestoredFrameWriter(outputURL: outputURL, plan: plan)
         var totalGPU: Double = 0
@@ -44,6 +52,10 @@ enum SideBySideRestoration {
 
         for (windowIndex, outputCount) in plan.temporalWindowFrameCounts.enumerated() {
             let windowStart = windowIndex * SideBySideVideoPlan.temporalWindowFrames
+            report(
+                "Window \(windowIndex + 1)/\(plan.temporalWindowCount): decoding "
+                    + "\(outputCount) output frames from frame \(windowStart)"
+            )
             var decoded = try (0..<outputCount).map {
                 try decoder.copyFrame(outputIndex: windowStart + $0)
             }
@@ -57,6 +69,8 @@ enum SideBySideRestoration {
                 plan: plan,
                 decodedFrames: decoded,
                 outputCount: outputCount,
+                windowIndex: windowIndex,
+                windowCount: plan.temporalWindowCount,
                 modelsURL: modelsURL,
                 weightsURL: weightsURL
             )
@@ -68,11 +82,13 @@ enum SideBySideRestoration {
                 plan: plan
             )
             try FileManager.default.removeItem(at: window.cacheDirectory)
+            report("Window \(windowIndex + 1)/\(plan.temporalWindowCount): encoded and cache removed")
             totalGPU += window.gpuMilliseconds
             peakCacheBytes = max(peakCacheBytes, window.cacheBytes)
             windows += 1
         }
         try await writer.finish()
+        report("Restoration writer completed \(plan.frameRate.outputFrameCount) frames")
 
         let outputInfo = try await SideBySideVideoIO.inspect(url: outputURL)
         guard outputInfo.dimensions == inputInfo.dimensions,
@@ -103,11 +119,19 @@ enum SideBySideRestoration {
         plan: SideBySideVideoPlan,
         decodedFrames: [CVPixelBuffer],
         outputCount: Int,
+        windowIndex: Int,
+        windowCount: Int,
         modelsURL: URL,
         weightsURL: URL
     ) throws -> WindowResult {
         let cacheBytes = plan.tiles.count * outputCount * tileBytes
-        let temporaryURL = FileManager.default.temporaryDirectory
+        let configuredWorkPath = ProcessInfo.processInfo.environment["JASNA_WORK_DIR"]
+        let temporaryURL = configuredWorkPath.map {
+            URL(fileURLWithPath: $0, isDirectory: true)
+        } ?? FileManager.default.temporaryDirectory
+        try FileManager.default.createDirectory(
+            at: temporaryURL, withIntermediateDirectories: true
+        )
         let available = try temporaryURL.resourceValues(
             forKeys: [.volumeAvailableCapacityForImportantUsageKey]
         ).volumeAvailableCapacityForImportantUsage
@@ -118,7 +142,7 @@ enum SideBySideRestoration {
             )
         }
         let directory = temporaryURL.appendingPathComponent(
-            "JasnaMetalTileCache-\(UUID().uuidString)", isDirectory: true
+            "window-\(windowIndex + 1)-\(UUID().uuidString)", isDirectory: true
         )
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
         do {
@@ -133,7 +157,12 @@ enum SideBySideRestoration {
             }
             defer { for handle in handles { try? handle.close() } }
             var gpuMilliseconds: Double = 0
-            for tile in plan.tiles {
+            let progressInterval = max(1, plan.tiles.count / 20)
+            report(
+                "Window \(windowIndex + 1)/\(windowCount): restoring \(plan.tiles.count) tiles; "
+                    + "cache \(String(format: "%.2f", Double(cacheBytes) / 1_073_741_824)) GiB"
+            )
+            for (tileIndex, tile) in plan.tiles.enumerated() {
                 let tileFrames = try decodedFrames.map {
                     try TilePixelPipeline.extractPlanarRGB(from: $0, tile: tile)
                 }
@@ -158,6 +187,15 @@ enum SideBySideRestoration {
                         try handles[frame].write(contentsOf: Data(bytes))
                     }
                 }
+                if tileIndex == 0
+                    || tileIndex + 1 == plan.tiles.count
+                    || (tileIndex + 1).isMultiple(of: progressInterval) {
+                    report(
+                        "Window \(windowIndex + 1)/\(windowCount): tile "
+                            + "\(tileIndex + 1)/\(plan.tiles.count), GPU "
+                            + "\(String(format: "%.3f", gpuMilliseconds)) ms"
+                    )
+                }
             }
             for handle in handles { try handle.close() }
             handles.removeAll()
@@ -168,9 +206,18 @@ enum SideBySideRestoration {
                 cacheBytes: cacheBytes
             )
         } catch {
-            try? FileManager.default.removeItem(at: directory)
+            if configuredWorkPath == nil {
+                try? FileManager.default.removeItem(at: directory)
+            } else {
+                report("Preserving failed window cache at \(directory.path)")
+            }
             throw error
         }
+    }
+
+    private static func report(_ message: String) {
+        let timestamp = ISO8601DateFormatter().string(from: Date())
+        FileHandle.standardOutput.write(Data("[\(timestamp)] \(message)\n".utf8))
     }
 
     private final class FrameDecoder {

@@ -151,6 +151,21 @@ sample prepared this way decoded and re-encoded successfully through the
 AVFoundation video path. The original 8192×4096 spatial resolution is not
 reduced.
 
+Restoration runs keep their diagnostics beside the requested output. For an
+output named `restored.mov`, the launcher creates:
+
+- `restored.jasna.log` with all build output, timestamps, window progress, tile
+  progress, GPU time, errors, and later sessions appended;
+- `restored.jasna-work/` as the persistent tile-cache root.
+
+The work directory is not under macOS temporary storage, so a system restart
+does not erase an interrupted window cache. Successfully encoded window caches
+are removed to reclaim space; a cache involved in a handled failure is
+preserved and its exact path is written to the log. Automatic resume from a
+preserved partial cache is not implemented yet, so retain the log and work
+directory for diagnosis rather than assuming a restarted command will reuse
+them.
+
 Inspect the real four-pass temporal traversal, validate every converted package
 boundary, and allocate the complete buffer-backed clip arena:
 
