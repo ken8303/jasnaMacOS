@@ -31,3 +31,10 @@ import Testing
     #expect(forward.map(\.flowIndex) == [nil, 0, 1, 2, 3])
     #expect(forward.map(\.secondOrderFrameIndex) == [nil, nil, 0, 1, 2])
 }
+
+@Test func thirtyFrameScheduleHasProductionLengthResources() throws {
+    let schedule = try TemporalSchedule(frameCount: 30)
+    #expect(schedule.flowCountPerDirection == 29)
+    #expect(schedule.steps.count == 120)
+    #expect(schedule.persistentTensorBytes == 91_389_952)
+}

@@ -8,6 +8,7 @@ struct FusedFourPassRecurrenceResult {
     let restoredRepeatMaximumError: Float
     let restoredStagedMaximumError: Float
     let residualMaximumError: Float
+    let flowOracleCompared: Bool
     let flowRepeatMaximumError: Float
     let flowOracleMaximumError: Float
     let flowChecksums: [Double]
@@ -60,6 +61,7 @@ func verifyFusedFourPassRecurrence(
     let frameElements = 3 * 256 * 256
     let frameCount = inputFrames.count
     let flowCount = frameCount - 1
+    let hasFlowOracle = !backwardFlows.isEmpty || !forwardFlows.isEmpty
     let hasStagedPropagation = !stagedBranchFrames.isEmpty
     let hasStagedRestoration = !stagedRestoredFrames.isEmpty
     let branchSpecs: [(String, PropagationDirection)] = [
@@ -67,8 +69,11 @@ func verifyFusedFourPassRecurrence(
         ("backward_2", .backward), ("forward_2", .forward),
     ]
     guard frameCount >= 3,
-          backwardFlows.count == flowCount, forwardFlows.count == flowCount,
-          (backwardFlows + forwardFlows).allSatisfy({ $0.count == 2 * plane }),
+          (!hasFlowOracle || (
+              backwardFlows.count == flowCount
+                  && forwardFlows.count == flowCount
+                  && (backwardFlows + forwardFlows).allSatisfy({ $0.count == 2 * plane })
+          )),
           inputFrames.allSatisfy({ $0.count == frameElements }),
           (!hasStagedPropagation || (
               stagedBranchFrames.count == 4
@@ -738,9 +743,11 @@ func verifyFusedFourPassRecurrence(
             flowRepeatMaximumError = max(
                 flowRepeatMaximumError, abs(Float(firstFlows[flow][index]) - value)
             )
-            flowOracleMaximumError = max(
-                flowOracleMaximumError, abs(Float(flowOracles[flow][index]) - value)
-            )
+            if hasFlowOracle {
+                flowOracleMaximumError = max(
+                    flowOracleMaximumError, abs(Float(flowOracles[flow][index]) - value)
+                )
+            }
             if index.isMultiple(of: 257) { flowChecksums[flow] += Double(value) }
         }
     }
@@ -750,7 +757,7 @@ func verifyFusedFourPassRecurrence(
           restoredStagedMaximumError <= 0.002,
           residualMaximumError <= 0.001,
           flowRepeatMaximumError <= 0.001,
-          flowOracleMaximumError <= 0.002
+          (!hasFlowOracle || flowOracleMaximumError <= 0.002)
     else {
         throw DeformConvError.commandFailed(
             "fused graph mismatch (propagation repeat=\(propagationRepeatMaximumError), "
@@ -770,6 +777,7 @@ func verifyFusedFourPassRecurrence(
         restoredRepeatMaximumError: restoredRepeatMaximumError,
         restoredStagedMaximumError: restoredStagedMaximumError,
         residualMaximumError: residualMaximumError,
+        flowOracleCompared: hasFlowOracle,
         flowRepeatMaximumError: flowRepeatMaximumError,
         flowOracleMaximumError: flowOracleMaximumError,
         flowChecksums: flowChecksums,

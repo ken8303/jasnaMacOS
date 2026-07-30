@@ -3,6 +3,7 @@ import Foundation
 struct FullModelOracleMetrics {
     let elementCount: Int
     let maximumAbsoluteError: Float
+    let maximumErrorIndex: Int
     let meanAbsoluteError: Double
     let percentile99AbsoluteError: Float
     let rootMeanSquaredError: Double
@@ -26,6 +27,7 @@ func calculateFullModelOracleMetrics(
     var absoluteSum: Double = 0
     var squaredSum: Double = 0
     var maximumError: Float = 0
+    var maximumErrorIndex = 0
     var fp16MaximumError: Float = 0
     for index in 0..<elementCount {
         let value = Float(restored[index])
@@ -34,7 +36,10 @@ func calculateFullModelOracleMetrics(
             throw DeformConvError.commandFailed("non-finite full-model comparison value")
         }
         errors.append(error)
-        maximumError = max(maximumError, error)
+        if error > maximumError {
+            maximumError = error
+            maximumErrorIndex = index
+        }
         absoluteSum += Double(error)
         squaredSum += Double(error) * Double(error)
         fp16MaximumError = max(
@@ -50,6 +55,7 @@ func calculateFullModelOracleMetrics(
     return FullModelOracleMetrics(
         elementCount: elementCount,
         maximumAbsoluteError: maximumError,
+        maximumErrorIndex: maximumErrorIndex,
         meanAbsoluteError: mean,
         percentile99AbsoluteError: errors[p99Index],
         rootMeanSquaredError: rmse,
