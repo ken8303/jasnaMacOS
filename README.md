@@ -68,6 +68,7 @@ real offset and backbone packages plus the checkpoint DCNv2 weights:
 ./script/build_and_run.sh --inspect-sbs-video /path/to/input.mov
 ./script/build_and_run.sh --transcode-sbs-30 /path/to/input.mov /path/to/output.mov
 ./script/build_and_run.sh --transcode-sbs-30-tiled /path/to/input.mov /path/to/output.mov
+./script/build_and_run.sh --restore-sbs-window /path/to/input.mov /path/to/output.mov
 ```
 
 The side-by-side planner takes `width height source-fps duration-seconds`.
@@ -95,6 +96,22 @@ its actual four overlap widths. A 960×256 unit test round-trips every pixel
 through overlapping FP16 tiles within one byte and proves the accumulated
 weight is exactly one everywhere. The end-to-end 60→30 fps tiled smoke output
 decoded identically to the direct output across all 30 frames (`inf` PSNR).
+
+The first real restored-video command now replaces those identity tiles with
+the fused Metal graph: bicubic flow inputs, bidirectional SPyNet, feature
+extraction, all four recurrent propagation passes, reconstruction, and frame
+residual. A generated one-second 512×256 SBS source produced two independent
+eye tiles and thirty restored HEVC frames. The two graph submissions took
+`792.518 ms` total and used a 22.50 MiB temporary FP16 tile cache. The output is
+512×256, exactly 30 fps, 30 frames, and 1.000 second; its 38.53 dB PSNR versus
+passthrough confirms that actual model output reached the encoder.
+
+This command currently accepts exactly one 30-output-frame window. It retains
+the decoded BGRA window, but writes restored FP16 tiles to temporary storage
+and composites only one full frame at a time. At 7680×4320 the tile cache is
+about 7.47 GiB, so the command checks temporary-disk headroom before starting.
+Supporting arbitrary durations requires a sequential multi-window driver and
+temporal overlap at each 30-frame boundary.
 
 Inspect the real four-pass temporal traversal, validate every converted package
 boundary, and allocate the complete buffer-backed clip arena:
