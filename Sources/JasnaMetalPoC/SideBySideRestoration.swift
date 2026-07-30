@@ -111,6 +111,53 @@ enum SideBySideRestoration {
         )
     }
 
+    static func diagnoseTile(
+        device: MTLDevice,
+        inputURL: URL,
+        tileNumber: Int,
+        modelsURL: URL,
+        weightsURL: URL
+    ) async throws {
+        let inputInfo = try await SideBySideVideoIO.inspect(url: inputURL)
+        let plan = try SideBySideVideoPlan(
+            width: inputInfo.dimensions.width,
+            height: inputInfo.dimensions.height,
+            sourceFramesPerSecond: inputInfo.nominalFramesPerSecond,
+            durationSeconds: inputInfo.durationSeconds
+        )
+        guard plan.tiles.indices.contains(tileNumber - 1),
+              let outputCount = plan.temporalWindowFrameCounts.first
+        else { throw DeformConvError.invalidShape }
+        let tile = plan.tiles[tileNumber - 1]
+        report(
+            "Diagnosing tile \(tileNumber)/\(plan.tiles.count) at eye \(tile.eyeIndex), "
+                + "x \(tile.x), y \(tile.y) with \(outputCount) frames"
+        )
+        let decoder = try await FrameDecoder(inputURL: inputURL, plan: plan)
+        var decoded = try (0..<outputCount).map { try decoder.copyFrame(outputIndex: $0) }
+        while decoded.count < 3 {
+            guard let last = decoded.last else { throw DeformConvError.invalidShape }
+            decoded.append(last)
+        }
+        let tileFrames = try decoded.map {
+            try TilePixelPipeline.extractPlanarRGB(from: $0, tile: tile)
+        }
+        let result = try autoreleasepool {
+            try restoreTileWithFallback(
+                device: device,
+                modelsURL: modelsURL,
+                weightsURL: weightsURL,
+                inputFrames: tileFrames,
+                context: "Diagnostic tile \(tileNumber)/\(plan.tiles.count)"
+            )
+        }
+        report(
+            "Diagnostic tile \(tileNumber)/\(plan.tiles.count): PASS, "
+                + "\(result.frames.count) frames, GPU "
+                + "\(String(format: "%.3f", result.gpuMilliseconds)) ms"
+        )
+    }
+
     private struct WindowResult {
         let cacheDirectory: URL
         let cacheURLs: [URL]
@@ -208,29 +255,22 @@ enum SideBySideRestoration {
                     let tileFrames = try decodedFrames.map {
                         try TilePixelPipeline.extractPlanarRGB(from: $0, tile: tile)
                     }
-                    let restored = try verifyFusedFourPassRecurrence(
+                    let context = "Window \(windowIndex + 1)/\(windowCount): tile "
+                        + "\(tileIndex + 1)/\(plan.tiles.count) at eye \(tile.eyeIndex), "
+                        + "x \(tile.x), y \(tile.y)"
+                    let restored = try restoreTileWithFallback(
                         device: device,
                         modelsURL: modelsURL,
                         weightsURL: weightsURL,
-                        backwardFlows: [],
-                        forwardFlows: [],
                         inputFrames: tileFrames,
-                        stagedBranchFrames: [],
-                        stagedRestoredFrames: [],
-                        warmupCount: 0,
-                        measurementCount: 1
+                        context: context
                     )
-                    guard restored.restoredFrames.count == decodedFrames.count else {
-                        throw DeformConvError.commandFailed(
-                            "Metal graph returned the wrong frame count"
-                        )
-                    }
                     for frame in 0..<outputCount {
-                        try restored.restoredFrames[frame].withUnsafeBytes { bytes in
+                        try restored.frames[frame].withUnsafeBytes { bytes in
                             try handles[frame].write(contentsOf: Data(bytes))
                         }
                     }
-                    return restored.statistics.median
+                    return restored.gpuMilliseconds
                 }
                 gpuMilliseconds += tileGPU
                 let completed = tileIndex + 1
@@ -266,6 +306,162 @@ enum SideBySideRestoration {
                 report("Preserving failed window cache at \(directory.path)")
             }
             throw error
+        }
+    }
+
+    private static func restoreTileWithFallback(
+        device: MTLDevice,
+        modelsURL: URL,
+        weightsURL: URL,
+        inputFrames: [[Float16]],
+        context: String
+    ) throws -> (frames: [[Float16]], gpuMilliseconds: Double) {
+        do {
+            return try restoreTileFrames(
+                device: device,
+                modelsURL: modelsURL,
+                weightsURL: weightsURL,
+                inputFrames: inputFrames,
+                maximumFramesPerChunk: inputFrames.count
+            )
+        } catch {
+            report(
+                "\(context) failed its full temporal window (\(error)); "
+                    + "retrying shorter recurrence chunks"
+            )
+            var lastError: Error = error
+            for chunkSize in [10, 5, 3] where chunkSize < inputFrames.count {
+                do {
+                    let recovered = try restoreTileFrames(
+                        device: device,
+                        modelsURL: modelsURL,
+                        weightsURL: weightsURL,
+                        inputFrames: inputFrames,
+                        maximumFramesPerChunk: chunkSize
+                    )
+                    report(
+                        "\(context) recovered with at most \(chunkSize) frames "
+                            + "per recurrence chunk"
+                    )
+                    return recovered
+                } catch {
+                    lastError = error
+                    report("\(context) also failed with \(chunkSize)-frame chunks (\(error))")
+                }
+            }
+            do {
+                let recovered = try restoreTileFramesIndependently(
+                    device: device,
+                    modelsURL: modelsURL,
+                    weightsURL: weightsURL,
+                    inputFrames: inputFrames
+                )
+                report("\(context) recovered with independent zero-motion frame triplets")
+                return recovered
+            } catch {
+                lastError = error
+                report("\(context) also failed independent frame recovery (\(error))")
+            }
+            guard inputFrames.joined().allSatisfy({ Float($0).isFinite }) else {
+                throw DeformConvError.commandFailed(
+                    "\(context) has non-finite input pixels after model failure: \(lastError)"
+                )
+            }
+            report(
+                "WARNING: \(context) is using finite input-pixel passthrough because all "
+                    + "Metal recurrence recovery modes failed (\(lastError))"
+            )
+            return (inputFrames, 0)
+        }
+    }
+
+    private static func restoreTileFramesIndependently(
+        device: MTLDevice,
+        modelsURL: URL,
+        weightsURL: URL,
+        inputFrames: [[Float16]]
+    ) throws -> (frames: [[Float16]], gpuMilliseconds: Double) {
+        var frames = [[Float16]]()
+        frames.reserveCapacity(inputFrames.count)
+        var gpuMilliseconds: Double = 0
+        for frame in inputFrames {
+            let recovered = try autoreleasepool {
+                try verifyFusedFourPassRecurrence(
+                    device: device,
+                    modelsURL: modelsURL,
+                    weightsURL: weightsURL,
+                    backwardFlows: [],
+                    forwardFlows: [],
+                    inputFrames: [frame, frame, frame],
+                    stagedBranchFrames: [],
+                    stagedRestoredFrames: [],
+                    warmupCount: 0,
+                    measurementCount: 1
+                )
+            }
+            guard recovered.restoredFrames.count == 3 else {
+                throw DeformConvError.commandFailed("Metal graph returned the wrong frame count")
+            }
+            frames.append(recovered.restoredFrames[1])
+            gpuMilliseconds += recovered.statistics.median
+        }
+        return (frames, gpuMilliseconds)
+    }
+
+    private static func restoreTileFrames(
+        device: MTLDevice,
+        modelsURL: URL,
+        weightsURL: URL,
+        inputFrames: [[Float16]],
+        maximumFramesPerChunk: Int
+    ) throws -> (frames: [[Float16]], gpuMilliseconds: Double) {
+        let ranges = try temporalChunkRanges(
+            frameCount: inputFrames.count,
+            maximumFramesPerChunk: maximumFramesPerChunk
+        )
+        var frames = [[Float16]]()
+        frames.reserveCapacity(inputFrames.count)
+        var gpuMilliseconds: Double = 0
+        for range in ranges {
+            let result = try autoreleasepool {
+                try verifyFusedFourPassRecurrence(
+                    device: device,
+                    modelsURL: modelsURL,
+                    weightsURL: weightsURL,
+                    backwardFlows: [],
+                    forwardFlows: [],
+                    inputFrames: Array(inputFrames[range]),
+                    stagedBranchFrames: [],
+                    stagedRestoredFrames: [],
+                    warmupCount: 0,
+                    measurementCount: 1
+                )
+            }
+            guard result.restoredFrames.count == range.count else {
+                throw DeformConvError.commandFailed("Metal graph returned the wrong frame count")
+            }
+            frames.append(contentsOf: result.restoredFrames)
+            gpuMilliseconds += result.statistics.median
+        }
+        return (frames, gpuMilliseconds)
+    }
+
+    static func temporalChunkRanges(
+        frameCount: Int, maximumFramesPerChunk: Int
+    ) throws -> [Range<Int>] {
+        guard frameCount >= 3, maximumFramesPerChunk >= 3 else {
+            throw DeformConvError.invalidShape
+        }
+        let requestedChunks = (frameCount + maximumFramesPerChunk - 1)
+            / maximumFramesPerChunk
+        let chunkCount = max(1, min(requestedChunks, frameCount / 3))
+        let baseSize = frameCount / chunkCount
+        let largerChunkCount = frameCount % chunkCount
+        var start = 0
+        return (0..<chunkCount).map { index in
+            let size = baseSize + (index < largerChunkCount ? 1 : 0)
+            defer { start += size }
+            return start..<(start + size)
         }
     }
 

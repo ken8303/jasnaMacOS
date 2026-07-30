@@ -172,6 +172,18 @@ during hundreds of 8K tiles. Because an unfinished HEVC writer cannot itself be
 continued, windows encoded before the interrupted window are rendered again;
 the expensive tiles in the preserved interrupted window are reused.
 
+If a real-content tile overflows FP16 in the 30-frame recurrence, restoration
+logs the exact eye, coordinates, branch, frame, and element, then retries that
+tile with balanced 10-, 5-, and 3-frame chunks. A tile that remains unstable is
+restored as independent zero-motion frame triplets. As a final safety measure,
+only if every Metal recovery mode fails, that tile uses an explicitly logged
+input-pixel passthrough instead of aborting the complete video. Diagnose one
+tile without creating an output movie with:
+
+```sh
+./script/build_and_run.sh --diagnose-sbs-tile input_30fps.mp4 90
+```
+
 Inspect the real four-pass temporal traversal, validate every converted package
 boundary, and allocate the complete buffer-backed clip arena:
 

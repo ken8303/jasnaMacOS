@@ -679,7 +679,10 @@ func verifyFusedFourPassRecurrence(
             for index in 0..<featureCount {
                 let value = Float(lastOutputs[branch][frame][index])
                 guard value.isFinite else {
-                    throw DeformConvError.commandFailed("fused recurrence produced a non-finite feature")
+                    throw DeformConvError.commandFailed(
+                        "fused recurrence produced a non-finite feature in "
+                            + "\(branchSpecs[branch].0), frame \(frame), element \(index)"
+                    )
                 }
                 propagationRepeatMaximumError = max(
                     propagationRepeatMaximumError,
@@ -712,7 +715,9 @@ func verifyFusedFourPassRecurrence(
         for index in 0..<frameElements {
             let value = Float(lastRestored[frame][index])
             guard value.isFinite else {
-                throw DeformConvError.commandFailed("fused graph produced a non-finite frame")
+                throw DeformConvError.commandFailed(
+                    "fused graph produced a non-finite output at frame \(frame), element \(index)"
+                )
             }
             restoredRepeatMaximumError = max(
                 restoredRepeatMaximumError,
@@ -739,7 +744,9 @@ func verifyFusedFourPassRecurrence(
         for index in 0..<(2 * plane) {
             let value = Float(lastFlows[flow][index])
             guard value.isFinite else {
-                throw DeformConvError.commandFailed("fused SPyNet produced a non-finite flow")
+                throw DeformConvError.commandFailed(
+                    "fused SPyNet produced a non-finite flow \(flow), element \(index)"
+                )
             }
             flowRepeatMaximumError = max(
                 flowRepeatMaximumError, abs(Float(firstFlows[flow][index]) - value)

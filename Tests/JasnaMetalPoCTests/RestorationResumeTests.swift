@@ -46,3 +46,27 @@ import Testing
 
     #expect(completed == 7)
 }
+
+@available(macOS 27.0, *)
+@Test func recurrenceFallbackMakesBalancedChunksWithoutShortTails() throws {
+    #expect(
+        try SideBySideRestoration.temporalChunkRanges(
+            frameCount: 30, maximumFramesPerChunk: 10
+        ) == [0..<10, 10..<20, 20..<30]
+    )
+    #expect(
+        try SideBySideRestoration.temporalChunkRanges(
+            frameCount: 29, maximumFramesPerChunk: 10
+        ) == [0..<10, 10..<20, 20..<29]
+    )
+    #expect(
+        try SideBySideRestoration.temporalChunkRanges(
+            frameCount: 11, maximumFramesPerChunk: 5
+        ) == [0..<4, 4..<8, 8..<11]
+    )
+    #expect(
+        try SideBySideRestoration.temporalChunkRanges(
+            frameCount: 5, maximumFramesPerChunk: 3
+        ) == [0..<5]
+    )
+}

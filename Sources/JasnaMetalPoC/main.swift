@@ -458,6 +458,26 @@ do {
         print("Tile cache:     \(String(format: "%.2f", Double(result.cacheBytes) / 1_048_576)) MiB")
         print("Output:         \(CommandLine.arguments[restoreIndex + 2])")
     }
+    if let diagnoseIndex = CommandLine.arguments.firstIndex(of: "--diagnose-sbs-tile") {
+        guard CommandLine.arguments.indices.contains(diagnoseIndex + 4),
+              let tileNumber = Int(CommandLine.arguments[diagnoseIndex + 2])
+        else {
+            throw DeformConvError.commandFailed(
+                "--diagnose-sbs-tile requires input, one-based tile number, MetalML, "
+                    + "and DeformConv paths"
+            )
+        }
+        guard #available(macOS 27.0, *) else {
+            throw DeformConvError.commandFailed("SBS tile diagnosis requires macOS 27")
+        }
+        try await SideBySideRestoration.diagnoseTile(
+            device: runner.device,
+            inputURL: URL(fileURLWithPath: CommandLine.arguments[diagnoseIndex + 1]),
+            tileNumber: tileNumber,
+            modelsURL: URL(fileURLWithPath: CommandLine.arguments[diagnoseIndex + 3]),
+            weightsURL: URL(fileURLWithPath: CommandLine.arguments[diagnoseIndex + 4])
+        )
+    }
     if let realBenchmarkIndex = CommandLine.arguments.firstIndex(of: "--benchmark-real-weights") {
         guard CommandLine.arguments.indices.contains(realBenchmarkIndex + 1) else {
             throw DeformConvError.commandFailed("--benchmark-real-weights requires a directory")
