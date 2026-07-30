@@ -50,9 +50,15 @@ func verifySPyNetPair(
     modelsURL: URL,
     oracleURL: URL,
     inputVariant: Int = 0,
-    validateOracle: Bool = true
+    validateOracle: Bool = true,
+    referenceInput: [Float16]? = nil,
+    supportInput: [Float16]? = nil
 ) throws -> SPyNetPairResult {
     let sizes = [2, 4, 8, 16, 32, 64]
+    guard (referenceInput == nil) == (supportInput == nil),
+          referenceInput?.count == nil || referenceInput?.count == 3 * 64 * 64,
+          supportInput?.count == nil || supportInput?.count == 3 * 64 * 64
+    else { throw DeformConvError.invalidShape }
 
     func makeBuffer(elements: Int) throws -> MTLBuffer {
         guard let buffer = device.makeBuffer(length: elements * 2, options: .storageModeShared) else {
@@ -240,6 +246,15 @@ func verifySPyNetPair(
         }
         let reference = referenceFrame.contents().bindMemory(to: Float16.self, capacity: 3 * 4096)
         let support = supportFrame.contents().bindMemory(to: Float16.self, capacity: 3 * 4096)
+        if let referenceInput, let supportInput {
+            referenceInput.withUnsafeBufferPointer { source in
+                reference.update(from: source.baseAddress!, count: source.count)
+            }
+            supportInput.withUnsafeBufferPointer { source in
+                support.update(from: source.baseAddress!, count: source.count)
+            }
+            return
+        }
         for index in 0..<(3 * 4096) {
             if inputVariant == 0 {
                 reference[index] = Float16(Float((index * 29 + 17) % 1021) / 1020)

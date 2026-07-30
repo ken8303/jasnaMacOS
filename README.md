@@ -195,15 +195,15 @@ records three feature extractions, all four recurrent branches, twelve backbone
 calls, eight offset/DCNv2 alignments, three reconstruction/upsampling networks,
 the input-frame residuals, and every dependency barrier in one Metal 4 command
 buffer. Over 20 samples the directly measured feature-to-restored graph took
-27.098 ms median, with a 24.876–27.991 ms P10–P90 interval and 1.125 ms standard
+24.804 ms median, with a 24.484–25.130 ms P10–P90 interval and 0.270 ms standard
 deviation. This timing starts with input frames and precomputed flows and ends
 with all three restored 256×256 RGB frames; SPyNet remains separately measured.
 
 All twelve fused propagation tensors and all three restored frames matched the
 separately submitted staged oracles bit-for-bit and had zero repeat error. The
-residual add had `0.000488` maximum error, and frame checksums were `389.915688`,
-`390.335297`, and `387.072357`. In the same run the four staged branch medians
-totaled 40.641 ms and the independent reconstruction oracle measured 3.394 ms.
+residual add had `0.000488` maximum error, and frame checksums were `389.891747`,
+`388.891373`, and `387.192463`. In the same run the four staged branch medians
+totaled 30.004 ms and the independent reconstruction oracle measured 3.341 ms.
 
 The bidirectional SPyNet probe now builds normalized 2/4/8/16/32/64 pyramids,
 uses padded row strides required by Metal ML at the small levels, runs twelve
@@ -218,7 +218,17 @@ it to the synthetic-flow frame time.
 The 64×64 SPyNet input is faithful to Jasna rather than a reduced-resolution
 shortcut: the original `BasicVSRPlusPlusNet.forward` bicubic-downsamples each
 256×256 LQ frame by 0.25 before calling `compute_flow`. The 256×256 path is used
-by `feat_extract`; flow is intentionally computed from the 64×64 copy.
+by `feat_extract`; flow is intentionally computed from the 64×64 copy. The
+three-frame probes now perform that exact quarter-scale bicubic operation on
+the same input frames used by feature extraction before evaluating both
+adjacent bidirectional SPyNet pairs. The Metal downsampler matches an independent
+CPU implementation with zero FP16 difference; the older deterministic 64×64
+inputs remain only for the checkpoint-oracle SPyNet unit probe.
+For the corrected synthetic three-frame clip, the two separately submitted
+bidirectional SPyNet pairs measured 2.494 ms and 2.784 ms median. Their backward
+checksums were `-21.818604` / `4.351471`, and their forward checksums were
+`0.474731` / `-8.876831`. These timings are reported separately and are not yet
+included in the directly sampled 24.804 ms feature-to-restored command buffer.
 
 The specialized tiled DCNv2 kernel now applies the shape's stride and dilation
 when forming sample coordinates, and the Swift dispatch path rejects unsupported

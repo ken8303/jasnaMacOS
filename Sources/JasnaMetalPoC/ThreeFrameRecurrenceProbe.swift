@@ -355,8 +355,9 @@ func verifyThreeFrameRecurrence(
         }
         for (frameIndex, buffer) in frameBuffers.enumerated() {
             let pointer = buffer.contents().bindMemory(to: Float16.self, capacity: frameElements)
-            for index in 0..<frameElements {
-                pointer[index] = Float16(Float((index * (29 + frameIndex * 6) + 17 + frameIndex * 23) % 1021) / 1020)
+            let values = makeJasnaSyntheticFrame(index: frameIndex)
+            values.withUnsafeBufferPointer { source in
+                pointer.update(from: source.baseAddress!, count: frameElements)
             }
         }
         if !inputSpatialFrames.isEmpty {

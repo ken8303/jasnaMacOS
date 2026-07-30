@@ -1,5 +1,34 @@
 import Foundation
 
+@available(macOS 27.0, *)
+private func verifySyntheticClipFlows(
+    runner: MetalDeformConv,
+    modelsURL: URL,
+    oracleURL: URL
+) throws -> (SPyNetPairResult, SPyNetPairResult) {
+    let flowFrames = try (0..<3).map { frameIndex in
+        try runner.runBicubicDownsampleQuarter(makeJasnaSyntheticFrame(index: frameIndex))
+    }
+    let first = try verifySPyNetPair(
+        device: runner.device,
+        modelsURL: modelsURL,
+        oracleURL: oracleURL,
+        validateOracle: false,
+        referenceInput: flowFrames[0],
+        supportInput: flowFrames[1]
+    )
+    let second = try verifySPyNetPair(
+        device: runner.device,
+        modelsURL: modelsURL,
+        oracleURL: oracleURL,
+        inputVariant: 1,
+        validateOracle: false,
+        referenceInput: flowFrames[1],
+        supportInput: flowFrames[2]
+    )
+    return (first, second)
+}
+
 private func correctnessTest(runner: MetalDeformConv) throws {
     let shape = DeformConvShape(
         batch: 1,
@@ -96,6 +125,18 @@ private func correctnessTest(runner: MetalDeformConv) throws {
         throw DeformConvError.commandFailed("SPyNet prepare error \(warpError) exceeds tolerance")
     }
     print("SPyNet warp/upsample: PASS (max abs \(String(format: "%.3g", warpError)))")
+
+    let fullFrame = makeJasnaSyntheticFrame(index: 0)
+    let downsampled = try runner.runBicubicDownsampleQuarter(fullFrame)
+    let downsampleReference = try bicubicDownsampleQuarterReference(fullFrame)
+    let downsampleError = zip(downsampled, downsampleReference)
+        .map { abs(Float($0) - Float($1)) }.max() ?? 0
+    guard downsampleError <= 0.0005 else {
+        throw DeformConvError.commandFailed(
+            "Jasna bicubic downsample error \(downsampleError) exceeds tolerance"
+        )
+    }
+    print("Jasna 256→64 bicubic flow input: PASS (max abs \(String(format: "%.3g", downsampleError)))")
 
     let transformPlane = 7
     let rawOffsets = (0..<(432 * transformPlane)).map {
@@ -683,15 +724,8 @@ do {
         let oracleURL = URL(
             fileURLWithPath: CommandLine.arguments[recurrenceIndex + 3], isDirectory: true
         )
-        let firstFlowResult = try verifySPyNetPair(
-            device: runner.device, modelsURL: modelsURL, oracleURL: oracleURL
-        )
-        let secondFlowResult = try verifySPyNetPair(
-            device: runner.device,
-            modelsURL: modelsURL,
-            oracleURL: oracleURL,
-            inputVariant: 1,
-            validateOracle: false
+        let (firstFlowResult, secondFlowResult) = try verifySyntheticClipFlows(
+            runner: runner, modelsURL: modelsURL, oracleURL: oracleURL
         )
         let result = try verifyThreeFrameRecurrence(
             device: runner.device,
@@ -729,12 +763,8 @@ do {
         let oracleURL = URL(
             fileURLWithPath: CommandLine.arguments[firstPassIndex + 3], isDirectory: true
         )
-        let firstFlow = try verifySPyNetPair(
-            device: runner.device, modelsURL: modelsURL, oracleURL: oracleURL
-        )
-        let secondFlow = try verifySPyNetPair(
-            device: runner.device, modelsURL: modelsURL, oracleURL: oracleURL,
-            inputVariant: 1, validateOracle: false
+        let (firstFlow, secondFlow) = try verifySyntheticClipFlows(
+            runner: runner, modelsURL: modelsURL, oracleURL: oracleURL
         )
         let backward = try verifyThreeFrameRecurrence(
             device: runner.device, modelsURL: modelsURL, weightsURL: weightsURL,
@@ -777,12 +807,8 @@ do {
         let oracleURL = URL(
             fileURLWithPath: CommandLine.arguments[fourPassIndex + 3], isDirectory: true
         )
-        let firstFlow = try verifySPyNetPair(
-            device: runner.device, modelsURL: modelsURL, oracleURL: oracleURL
-        )
-        let secondFlow = try verifySPyNetPair(
-            device: runner.device, modelsURL: modelsURL, oracleURL: oracleURL,
-            inputVariant: 1, validateOracle: false
+        let (firstFlow, secondFlow) = try verifySyntheticClipFlows(
+            runner: runner, modelsURL: modelsURL, oracleURL: oracleURL
         )
         let backwardFlows = [firstFlow.backwardFlow, secondFlow.backwardFlow]
         let forwardFlows = [firstFlow.forwardFlow, secondFlow.forwardFlow]
@@ -845,6 +871,9 @@ do {
         print("Restored staged/repeat/residual error: \(fused.restoredStagedMaximumError) / \(fused.restoredRepeatMaximumError) / \(fused.residualMaximumError)")
         print("Fused propagation checksums: \(fused.propagationChecksums.map { String(format: "%.6f", $0) }.joined(separator: " / "))")
         print("Fused frame checksums: \(fused.restoredChecksums.map { String(format: "%.6f", $0) }.joined(separator: " / "))")
+        print("SPyNet adjacent-pair medians: \(String(format: "%.3f / %.3f", firstFlow.medianMilliseconds, secondFlow.medianMilliseconds)) ms")
+        print("Backward flow checksums: \(String(format: "%.6f / %.6f", firstFlow.backwardChecksum, secondFlow.backwardChecksum))")
+        print("Forward flow checksums:  \(String(format: "%.6f / %.6f", firstFlow.forwardChecksum, secondFlow.forwardChecksum))")
         print("Separate 3-frame reconstruction oracle: \(String(format: "%.3f", reconstruction.medianMilliseconds)) ms")
         print("Reconstruction best/worst: \(String(format: "%.3f", reconstruction.minimumMilliseconds)) / \(String(format: "%.3f", reconstruction.maximumMilliseconds)) ms")
         print("Reconstruction P10–P90/stddev: \(String(format: "%.3f–%.3f / %.3f", reconstruction.statistics.percentile10, reconstruction.statistics.percentile90, reconstruction.statistics.standardDeviation)) ms")

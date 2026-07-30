@@ -392,6 +392,52 @@ struct SPyNetPrepareShape {
     uint firstLevel;
 };
 
+inline float cubic_weight(float distance) {
+    constexpr float a = -0.75f;
+    float x = abs(distance);
+    if (x <= 1.0f) {
+        return (a + 2.0f) * x * x * x - (a + 3.0f) * x * x + 1.0f;
+    }
+    if (x < 2.0f) {
+        return a * x * x * x - 5.0f * a * x * x + 8.0f * a * x - 4.0f * a;
+    }
+    return 0.0f;
+}
+
+// Matches torch.nn.functional.interpolate(scale_factor=0.25, mode="bicubic")
+// for Jasna's fixed 256×256 NCHW input. The half-pixel source positions are
+// 1.5, 5.5, ... 253.5, so every 4×4 footprint is inside the source image.
+kernel void jasna_bicubic_downsample_quarter_fp16(
+    device const half *input [[buffer(0)]],
+    device half *output [[buffer(1)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    constexpr uint inputSize = 256u;
+    constexpr uint outputSize = 64u;
+    constexpr uint inputPlane = inputSize * inputSize;
+    constexpr uint outputPlane = outputSize * outputSize;
+    if (gid >= 3u * outputPlane) return;
+    uint channel = gid / outputPlane;
+    uint spatial = gid % outputPlane;
+    uint outputY = spatial / outputSize;
+    uint outputX = spatial % outputSize;
+    float sourceY = (float(outputY) + 0.5f) * 4.0f - 0.5f;
+    float sourceX = (float(outputX) + 0.5f) * 4.0f - 0.5f;
+    int baseY = int(floor(sourceY));
+    int baseX = int(floor(sourceX));
+    float value = 0.0f;
+    for (int yy = -1; yy <= 2; ++yy) {
+        float wy = cubic_weight(sourceY - float(baseY + yy));
+        for (int xx = -1; xx <= 2; ++xx) {
+            float wx = cubic_weight(sourceX - float(baseX + xx));
+            uint source = channel * inputPlane
+                + uint(baseY + yy) * inputSize + uint(baseX + xx);
+            value += float(input[source]) * wy * wx;
+        }
+    }
+    output[gid] = half(value);
+}
+
 // Builds normalized 2/4/8/16/32/64 pyramids for a frame pair directly from
 // 64×64 RGB inputs. Averaging and normalization are linear, so direct box
 // averages are equivalent to the repeated 2×2 average-pool pyramid apart from

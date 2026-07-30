@@ -98,6 +98,7 @@ final class MetalDeformConv {
     private let fp16JasnaSIMDGroupGEMMPipeline: MTLComputePipelineState
     private let fp16JasnaFloatGEMMOutputPipeline: MTLComputePipelineState
     private let spynetPreparePipeline: MTLComputePipelineState
+    private let bicubicDownsamplePipeline: MTLComputePipelineState
     private let dcnOffsetPipeline: MTLComputePipelineState
     private let secondOrderFlowPipeline: MTLComputePipelineState
     private let temporalAlignmentPipeline: MTLComputePipelineState
@@ -120,6 +121,7 @@ final class MetalDeformConv {
               let fp16JasnaSIMDGroupGEMM = library.makeFunction(name: "deform_conv2d_fp16_jasna_simdgroup_gemm"),
               let fp16JasnaFloatGEMMOutput = library.makeFunction(name: "deform_conv2d_fp16_jasna_float_gemm_output"),
               let spynetPrepare = library.makeFunction(name: "spynet_prepare_fp16"),
+              let bicubicDownsample = library.makeFunction(name: "jasna_bicubic_downsample_quarter_fp16"),
               let dcnOffset = library.makeFunction(name: "prepare_dcn_offsets_fp16"),
               let secondOrderFlow = library.makeFunction(name: "accumulate_second_order_flow_fp16"),
               let temporalAlignment = library.makeFunction(name: "assemble_temporal_alignment_fp16")
@@ -132,6 +134,7 @@ final class MetalDeformConv {
         fp16JasnaSIMDGroupGEMMPipeline = try device.makeComputePipelineState(function: fp16JasnaSIMDGroupGEMM)
         fp16JasnaFloatGEMMOutputPipeline = try device.makeComputePipelineState(function: fp16JasnaFloatGEMMOutput)
         spynetPreparePipeline = try device.makeComputePipelineState(function: spynetPrepare)
+        bicubicDownsamplePipeline = try device.makeComputePipelineState(function: bicubicDownsample)
         dcnOffsetPipeline = try device.makeComputePipelineState(function: dcnOffset)
         secondOrderFlowPipeline = try device.makeComputePipelineState(function: secondOrderFlow)
         temporalAlignmentPipeline = try device.makeComputePipelineState(function: temporalAlignment)
@@ -416,6 +419,32 @@ final class MetalDeformConv {
             Array(UnsafeBufferPointer(start: featurePointer, count: 8 * plane)),
             Array(UnsafeBufferPointer(start: flowPointer, count: 2 * plane))
         )
+    }
+
+    func runBicubicDownsampleQuarter(_ input: [Float16]) throws -> [Float16] {
+        let inputCount = 3 * 256 * 256
+        let outputCount = 3 * 64 * 64
+        guard input.count == inputCount else { throw DeformConvError.invalidShape }
+        let inputBuffer = try makeBuffer(input)
+        guard let outputBuffer = device.makeBuffer(length: outputCount * 2, options: .storageModeShared),
+              let commandBuffer = queue.makeCommandBuffer(),
+              let encoder = commandBuffer.makeComputeCommandEncoder()
+        else { throw DeformConvError.metalUnavailable }
+        encoder.setComputePipelineState(bicubicDownsamplePipeline)
+        encoder.setBuffer(inputBuffer, offset: 0, index: 0)
+        encoder.setBuffer(outputBuffer, offset: 0, index: 1)
+        encoder.dispatchThreads(
+            MTLSize(width: outputCount, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(
+                width: bicubicDownsamplePipeline.threadExecutionWidth, height: 1, depth: 1
+            )
+        )
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        if let error = commandBuffer.error { throw error }
+        let pointer = outputBuffer.contents().bindMemory(to: Float16.self, capacity: outputCount)
+        return Array(UnsafeBufferPointer(start: pointer, count: outputCount))
     }
 
     func runDCNOffsetTransform(
