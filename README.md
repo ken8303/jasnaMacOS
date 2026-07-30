@@ -161,10 +161,16 @@ output named `restored.mov`, the launcher creates:
 The work directory is not under macOS temporary storage, so a system restart
 does not erase an interrupted window cache. Successfully encoded window caches
 are removed to reclaim space; a cache involved in a handled failure is
-preserved and its exact path is written to the log. Automatic resume from a
-preserved partial cache is not implemented yet, so retain the log and work
-directory for diagnosis rather than assuming a restarted command will reuse
-them.
+preserved and its exact path is written to the log. Re-running the same command
+automatically finds the most complete cache for each window, trims all frame
+files to their common completed-tile boundary, and continues at the next tile.
+Cache files are synchronized and checkpointed every eight tiles. An unfinished
+output movie is moved beside the output with an `interrupted-TIMESTAMP` name
+before a fresh writer starts, so it is not silently overwritten. Metal graph
+objects are scoped to a per-tile autorelease pool to prevent IOSurface buildup
+during hundreds of 8K tiles. Because an unfinished HEVC writer cannot itself be
+continued, windows encoded before the interrupted window are rendered again;
+the expensive tiles in the preserved interrupted window are reused.
 
 Inspect the real four-pass temporal traversal, validate every converted package
 boundary, and allocate the complete buffer-backed clip arena:

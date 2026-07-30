@@ -26,8 +26,12 @@ enum SideBySideRestoration {
         modelsURL: URL,
         weightsURL: URL
     ) async throws -> SideBySideRestorationResult {
-        guard !FileManager.default.fileExists(atPath: outputURL.path) else {
-            throw DeformConvError.commandFailed("output already exists: \(outputURL.path)")
+        if FileManager.default.fileExists(atPath: outputURL.path) {
+            guard try hasInterruptedWindowCache() else {
+                throw DeformConvError.commandFailed("output already exists: \(outputURL.path)")
+            }
+            let archivedURL = try archiveInterruptedOutput(outputURL)
+            report("Archived interrupted output at \(archivedURL.path)")
         }
         let inputInfo = try await SideBySideVideoIO.inspect(url: inputURL)
         let plan = try SideBySideVideoPlan(
@@ -114,6 +118,12 @@ enum SideBySideRestoration {
         let cacheBytes: Int
     }
 
+    private struct ResumableWindowCache {
+        let directory: URL
+        let urls: [URL]
+        let completedTiles: Int
+    }
+
     private static func processWindow(
         device: MTLDevice,
         plan: SideBySideVideoPlan,
@@ -141,19 +151,37 @@ enum SideBySideRestoration {
                     + "\(cacheBytes + 1_073_741_824) bytes, available \(available)"
             )
         }
-        let directory = temporaryURL.appendingPathComponent(
+        let resumed = configuredWorkPath == nil ? nil : try resumableWindowCache(
+            in: temporaryURL,
+            windowIndex: windowIndex,
+            outputCount: outputCount,
+            tileCount: plan.tiles.count
+        )
+        let directory = resumed?.directory ?? temporaryURL.appendingPathComponent(
             "window-\(windowIndex + 1)-\(UUID().uuidString)", isDirectory: true
         )
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        if resumed == nil {
+            try FileManager.default.createDirectory(
+                at: directory, withIntermediateDirectories: false
+            )
+        }
         do {
-            let urls = (0..<outputCount).map {
+            let urls = resumed?.urls ?? (0..<outputCount).map {
                 directory.appendingPathComponent("frame-\($0).fp16")
             }
             var handles = try urls.map { url -> FileHandle in
-                guard FileManager.default.createFile(atPath: url.path, contents: nil) else {
-                    throw DeformConvError.commandFailed("failed creating tile cache: \(url.path)")
+                if resumed == nil {
+                    guard FileManager.default.createFile(atPath: url.path, contents: nil) else {
+                        throw DeformConvError.commandFailed("failed creating tile cache: \(url.path)")
+                    }
                 }
-                return try FileHandle(forWritingTo: url)
+                let handle = try FileHandle(forUpdating: url)
+                if let resumed {
+                    let safeOffset = UInt64(resumed.completedTiles * tileBytes)
+                    try handle.truncate(atOffset: safeOffset)
+                    try handle.seek(toOffset: safeOffset)
+                }
+                return handle
             }
             defer { for handle in handles { try? handle.close() } }
             var gpuMilliseconds: Double = 0
@@ -162,30 +190,56 @@ enum SideBySideRestoration {
                 "Window \(windowIndex + 1)/\(windowCount): restoring \(plan.tiles.count) tiles; "
                     + "cache \(String(format: "%.2f", Double(cacheBytes) / 1_073_741_824)) GiB"
             )
-            for (tileIndex, tile) in plan.tiles.enumerated() {
-                let tileFrames = try decodedFrames.map {
-                    try TilePixelPipeline.extractPlanarRGB(from: $0, tile: tile)
-                }
-                let restored = try verifyFusedFourPassRecurrence(
-                    device: device,
-                    modelsURL: modelsURL,
-                    weightsURL: weightsURL,
-                    backwardFlows: [],
-                    forwardFlows: [],
-                    inputFrames: tileFrames,
-                    stagedBranchFrames: [],
-                    stagedRestoredFrames: [],
-                    warmupCount: 0,
-                    measurementCount: 1
+            let completedTiles = resumed?.completedTiles ?? 0
+            if completedTiles == plan.tiles.count {
+                report(
+                    "Window \(windowIndex + 1)/\(windowCount): all tiles recovered from "
+                        + directory.path
                 )
-                guard restored.restoredFrames.count == decodedFrames.count else {
-                    throw DeformConvError.commandFailed("Metal graph returned the wrong frame count")
-                }
-                gpuMilliseconds += restored.statistics.median
-                for frame in 0..<outputCount {
-                    try restored.restoredFrames[frame].withUnsafeBytes { bytes in
-                        try handles[frame].write(contentsOf: Data(bytes))
+            } else if completedTiles > 0 {
+                report(
+                    "Window \(windowIndex + 1)/\(windowCount): resuming at tile "
+                        + "\(completedTiles + 1)/\(plan.tiles.count) from \(directory.path)"
+                )
+            }
+            for tileIndex in completedTiles..<plan.tiles.count {
+                let tile = plan.tiles[tileIndex]
+                let tileGPU = try autoreleasepool { () throws -> Double in
+                    let tileFrames = try decodedFrames.map {
+                        try TilePixelPipeline.extractPlanarRGB(from: $0, tile: tile)
                     }
+                    let restored = try verifyFusedFourPassRecurrence(
+                        device: device,
+                        modelsURL: modelsURL,
+                        weightsURL: weightsURL,
+                        backwardFlows: [],
+                        forwardFlows: [],
+                        inputFrames: tileFrames,
+                        stagedBranchFrames: [],
+                        stagedRestoredFrames: [],
+                        warmupCount: 0,
+                        measurementCount: 1
+                    )
+                    guard restored.restoredFrames.count == decodedFrames.count else {
+                        throw DeformConvError.commandFailed(
+                            "Metal graph returned the wrong frame count"
+                        )
+                    }
+                    for frame in 0..<outputCount {
+                        try restored.restoredFrames[frame].withUnsafeBytes { bytes in
+                            try handles[frame].write(contentsOf: Data(bytes))
+                        }
+                    }
+                    return restored.statistics.median
+                }
+                gpuMilliseconds += tileGPU
+                let completed = tileIndex + 1
+                if completed.isMultiple(of: 8) || completed == plan.tiles.count {
+                    for handle in handles { try handle.synchronize() }
+                    try Data("\(completed)\n".utf8).write(
+                        to: directory.appendingPathComponent("completed-tiles.txt"),
+                        options: .atomic
+                    )
                 }
                 if tileIndex == 0
                     || tileIndex + 1 == plan.tiles.count
@@ -213,6 +267,83 @@ enum SideBySideRestoration {
             }
             throw error
         }
+    }
+
+    private static func hasInterruptedWindowCache() throws -> Bool {
+        guard let configuredWorkPath = ProcessInfo.processInfo.environment["JASNA_WORK_DIR"] else {
+            return false
+        }
+        let workURL = URL(fileURLWithPath: configuredWorkPath, isDirectory: true)
+        guard FileManager.default.fileExists(atPath: workURL.path) else { return false }
+        return try FileManager.default.contentsOfDirectory(
+            at: workURL,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ).contains { $0.lastPathComponent.hasPrefix("window-") }
+    }
+
+    private static func archiveInterruptedOutput(_ outputURL: URL) throws -> URL {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyyMMdd-HHmmss-SSS"
+        let stem = outputURL.deletingPathExtension().lastPathComponent
+        let suffix = outputURL.pathExtension
+        let archivedName = "\(stem).interrupted-\(formatter.string(from: Date()))"
+            + (suffix.isEmpty ? "" : ".\(suffix)")
+        let archivedURL = outputURL.deletingLastPathComponent()
+            .appendingPathComponent(archivedName)
+        try FileManager.default.moveItem(at: outputURL, to: archivedURL)
+        return archivedURL
+    }
+
+    private static func resumableWindowCache(
+        in workDirectory: URL,
+        windowIndex: Int,
+        outputCount: Int,
+        tileCount: Int
+    ) throws -> ResumableWindowCache? {
+        let prefix = "window-\(windowIndex + 1)-"
+        let candidates = try FileManager.default.contentsOfDirectory(
+            at: workDirectory,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ).filter { url in
+            url.lastPathComponent.hasPrefix(prefix)
+                && (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
+        }
+        var best: ResumableWindowCache?
+        for directory in candidates {
+            let urls = (0..<outputCount).map {
+                directory.appendingPathComponent("frame-\($0).fp16")
+            }
+            guard urls.allSatisfy({ FileManager.default.fileExists(atPath: $0.path) }) else {
+                continue
+            }
+            let completed = try recoverableTileCount(
+                cacheURLs: urls,
+                bytesPerTile: tileBytes,
+                tileCount: tileCount
+            )
+            guard completed > 0 else { continue }
+            if best == nil || completed > best!.completedTiles {
+                best = ResumableWindowCache(
+                    directory: directory,
+                    urls: urls,
+                    completedTiles: completed
+                )
+            }
+        }
+        return best
+    }
+
+    static func recoverableTileCount(
+        cacheURLs: [URL], bytesPerTile: Int, tileCount: Int
+    ) throws -> Int {
+        guard !cacheURLs.isEmpty, bytesPerTile > 0, tileCount >= 0 else { return 0 }
+        let sizes = try cacheURLs.map {
+            try $0.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
+        }
+        return min(tileCount, (sizes.min() ?? 0) / bytesPerTile)
     }
 
     private static func report(_ message: String) {
