@@ -18,7 +18,7 @@ struct ThreeFrameRecurrenceResult {
 }
 
 @available(macOS 27.0, *)
-private struct ThreeFramePrepareShape {
+struct ThreeFramePrepareShape {
     var width: UInt32 = 64
     var height: UInt32 = 64
     var hasSecondOrder: UInt32

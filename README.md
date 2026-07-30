@@ -189,23 +189,21 @@ for `forward_1`, or 17.403 ms staged, with zero repeat error and stable
 buffers while validating the branch boundary; `forward_1` reuses the three
 spatial tensors extracted by `backward_1`.
 
-The four-pass staged probe adds `backward_2` and `forward_2`, preserving the
-per-frame prefix order and real 128/192/256/320-channel backbone widths. With
-the cooperative-gather SIMD-group GEMM DCNv2 path, a 20-sample run measured
-9.311 / 8.909 / 9.419 / 8.415 ms branch medians, for a 36.054 ms staged total.
-The branch P10–P90 intervals were 7.378–10.050 / 8.093–10.448 /
-8.043–10.925 / 7.418–12.746 ms, with 1.018 / 1.026 / 1.165 / 2.111 ms standard
-deviations. All twelve propagated frame features were deterministic, with zero
-repeat error. This
-total intentionally includes four separate branch command buffers and
-CPU-visible boundaries; spatial features are extracted once and reused. It is
-a correctness baseline, not the expected fused runtime. The graph now also
-feeds all three sets of spatial and propagation features through the real
-reconstruction/upsampling package and input-frame residual. The three
-reconstruction paths share one Metal 4 command buffer and measured 3.363 ms in
-the same run, with a 3.324–3.885 ms P10–P90 interval and 0.526 ms standard
-deviation. The staged medians sum to 39.416 ms. This is not a directly sampled
-end-to-end latency distribution. Outputs had zero repeat error,
+The four-pass probe adds `backward_2` and `forward_2`, preserving the per-frame
+prefix order and real 128/192/256/320-channel backbone widths. Its fused path
+records three feature extractions, all four recurrent branches, twelve backbone
+calls, eight offset/DCNv2 alignments, and every dependency barrier in one
+Metal 4 command buffer. Over 20 samples it measured 22.828 ms median, with a
+22.434–23.033 ms P10–P90 interval and 0.303 ms standard deviation. The same
+work measured 29.101 ms as four separately submitted branch medians in that
+run. All twelve fused propagation tensors matched the staged oracle bit-for-bit
+and had zero repeat error.
+
+The graph also feeds all three sets of spatial and propagation features through
+the real reconstruction/upsampling package and input-frame residual. The three
+reconstruction paths share one Metal 4 command buffer and measured 3.558 ms
+median. Fused propagation plus reconstruction medians sum to 26.386 ms; this
+sum is not yet a directly sampled combined command buffer. Outputs had zero repeat error,
 `0.000488` maximum residual-add error, and frame checksums `389.915688`,
 `390.335297`, and `387.072357`.
 
