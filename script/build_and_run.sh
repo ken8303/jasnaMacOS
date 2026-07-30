@@ -86,6 +86,12 @@ case "$MODE" in
   --plan-sbs-video|plan-sbs-video)
     "$APP_BINARY" --plan-sbs-video "${2:-7680}" "${3:-4320}" "${4:-60}" "${5:-1}"
     ;;
+  --inspect-sbs-video|inspect-sbs-video)
+    "$APP_BINARY" --inspect-sbs-video "${2:?input video path required}"
+    ;;
+  --transcode-sbs-30|transcode-sbs-30)
+    "$APP_BINARY" --transcode-sbs-30 "${2:?input video path required}" "${3:?output .mov path required}"
+    ;;
   --single-run-clip|single-run-clip)
     "$APP_BINARY" --single-run-clip "${2:-30}" "$ROOT_DIR/Models/MetalML" "$ROOT_DIR/Models/DeformConv"
     ;;
@@ -113,7 +119,7 @@ case "$MODE" in
     done
     ;;
   *)
-    echo "usage: $0 [run|--debug|--logs|--telemetry|--verify|--metal-ml-probe|--metal-ml-benchmark|--metal-ml-interop|--propagation-smoke|--propagation-suite|--reconstruct-frame|--zero-copy-frame|--zero-copy-frame-grouped|--zero-copy-frame-staged|--zero-copy-frame-fused|--spynet-pair|--frame-with-spynet|--temporal-inputs|--three-frame-recurrence|--three-frame-first-pass|--three-frame-four-pass|--variable-clip [frames]|--single-run-clip [frames]|--plan-sbs-video [width height source-fps duration]|--metal-ml-suite|--schedule [frames]|--validate-package-graph|--allocate-frame-graph [frames]|--validate-deform-weights|--benchmark-real-weights]" >&2
+    echo "usage: $0 [run|--debug|--logs|--telemetry|--verify|--metal-ml-probe|--metal-ml-benchmark|--metal-ml-interop|--propagation-smoke|--propagation-suite|--reconstruct-frame|--zero-copy-frame|--zero-copy-frame-grouped|--zero-copy-frame-staged|--zero-copy-frame-fused|--spynet-pair|--frame-with-spynet|--temporal-inputs|--three-frame-recurrence|--three-frame-first-pass|--three-frame-four-pass|--variable-clip [frames]|--single-run-clip [frames]|--plan-sbs-video [width height source-fps duration]|--inspect-sbs-video input|--transcode-sbs-30 input output.mov|--metal-ml-suite|--schedule [frames]|--validate-package-graph|--allocate-frame-graph [frames]|--validate-deform-weights|--benchmark-real-weights]" >&2
     exit 2
     ;;
 esac

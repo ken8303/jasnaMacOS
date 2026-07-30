@@ -376,6 +376,42 @@ do {
         print("Model graph runs:     \(plan.modelGraphExecutions)")
         print("Output BGRA frame:    \(String(format: "%.2f", Double(plan.outputBGRABytesPerFrame) / 1_048_576)) MiB")
     }
+    if let inspectIndex = CommandLine.arguments.firstIndex(of: "--inspect-sbs-video") {
+        guard CommandLine.arguments.indices.contains(inspectIndex + 1) else {
+            throw DeformConvError.commandFailed("--inspect-sbs-video requires an input path")
+        }
+        let inputURL = URL(fileURLWithPath: CommandLine.arguments[inspectIndex + 1])
+        let info = try await SideBySideVideoIO.inspect(url: inputURL)
+        let plan = try SideBySideVideoPlan(
+            width: info.dimensions.width,
+            height: info.dimensions.height,
+            sourceFramesPerSecond: info.nominalFramesPerSecond,
+            durationSeconds: info.durationSeconds
+        )
+        print("Side-by-side video inspection: PASS")
+        print("Input:          \(info.dimensions.width)×\(info.dimensions.height) at \(String(format: "%.3f", info.nominalFramesPerSecond)) FPS")
+        print("Duration:       \(String(format: "%.3f", info.durationSeconds)) seconds")
+        print("Output:         \(plan.frameRate.outputFrameCount) frames at 30 FPS")
+        print("Tiles/frame:    \(plan.tiles.count) (\(plan.tilesPerEye) per eye)")
+        print("Temporal clips: \(plan.temporalWindowCount)")
+    }
+    if let transcodeIndex = CommandLine.arguments.firstIndex(of: "--transcode-sbs-30") {
+        guard CommandLine.arguments.indices.contains(transcodeIndex + 2) else {
+            throw DeformConvError.commandFailed(
+                "--transcode-sbs-30 requires input and output .mov paths"
+            )
+        }
+        let inputURL = URL(fileURLWithPath: CommandLine.arguments[transcodeIndex + 1])
+        let outputURL = URL(fileURLWithPath: CommandLine.arguments[transcodeIndex + 2])
+        let result = try await SideBySideVideoIO.transcodeTo30FPS(
+            inputURL: inputURL, outputURL: outputURL
+        )
+        print("Side-by-side 30 FPS video I/O: PASS")
+        print("Input:          \(result.input.dimensions.width)×\(result.input.dimensions.height) at \(String(format: "%.3f", result.input.nominalFramesPerSecond)) FPS")
+        print("Output:         \(result.output.dimensions.width)×\(result.output.dimensions.height) at \(String(format: "%.3f", result.output.nominalFramesPerSecond)) FPS")
+        print("Frames written: \(result.writtenFrameCount)")
+        print("Output file:    \(outputURL.path)")
+    }
     if let realBenchmarkIndex = CommandLine.arguments.firstIndex(of: "--benchmark-real-weights") {
         guard CommandLine.arguments.indices.contains(realBenchmarkIndex + 1) else {
             throw DeformConvError.commandFailed("--benchmark-real-weights requires a directory")

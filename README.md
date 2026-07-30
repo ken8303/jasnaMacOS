@@ -65,6 +65,8 @@ real offset and backbone packages plus the checkpoint DCNv2 weights:
 ./script/build_and_run.sh --variable-clip 30
 ./script/build_and_run.sh --single-run-clip 30
 ./script/build_and_run.sh --plan-sbs-video 7680 4320 60 1
+./script/build_and_run.sh --inspect-sbs-video /path/to/input.mov
+./script/build_and_run.sh --transcode-sbs-30 /path/to/input.mov /path/to/output.mov
 ```
 
 The side-by-side planner takes `width height source-fps duration-seconds`.
@@ -72,6 +74,16 @@ It always produces a constant 30 fps timeline, dropping or duplicating source
 frames as necessary without changing the duration. The dimensions are not
 restricted to one 8K container shape, so both `7680×4320` and shorter SBS
 layouts such as `7680×2160` can be planned.
+
+The AVFoundation video harness now reads real file dimensions, duration, and
+nominal frame rate, validates the SBS plan, decodes sequentially with
+Metal-compatible pixel buffers, selects the nearest source frame for every
+exact `n/30` output timestamp, and writes HEVC. A generated 512×256 SBS smoke
+video converted from 60 fps to 30 fps with 30 frames written and the output
+metadata re-opened and validated. Existing output files are never overwritten.
+This first path is video-only and BGRA/SDR: audio copying, HDR/10-bit color
+preservation, rotated tracks, and Metal restoration insertion remain explicit
+follow-up work.
 
 Inspect the real four-pass temporal traversal, validate every converted package
 boundary, and allocate the complete buffer-backed clip arena:
