@@ -15,8 +15,13 @@ import Testing
     #expect(plan.tiles.filter { $0.eyeIndex == 0 }.allSatisfy { $0.x + $0.width <= 3_840 })
     #expect(plan.tiles.filter { $0.eyeIndex == 1 }.allSatisfy { $0.x >= 3_840 })
     #expect(plan.tiles.allSatisfy { $0.y + $0.height <= 4_320 })
-    #expect(plan.tiles.contains(VideoTile(eyeIndex: 0, x: 3_584, y: 4_064, width: 256, height: 256)))
-    #expect(plan.tiles.contains(VideoTile(eyeIndex: 1, x: 7_424, y: 4_064, width: 256, height: 256)))
+    #expect(plan.tiles.contains { $0.eyeIndex == 0 && $0.x == 3_584 && $0.y == 4_064 })
+    #expect(plan.tiles.contains { $0.eyeIndex == 1 && $0.x == 7_424 && $0.y == 4_064 })
+    let positiveOverlaps = plan.tiles.flatMap {
+        [$0.leftOverlap, $0.rightOverlap, $0.topOverlap, $0.bottomOverlap]
+    }.filter { $0 > 0 }
+    #expect(positiveOverlaps.min() == 32)
+    #expect(positiveOverlaps.max() == 43)
 }
 
 @Test func frameRatePlanConvertsSixtyToThirtyWithoutChangingDuration() throws {

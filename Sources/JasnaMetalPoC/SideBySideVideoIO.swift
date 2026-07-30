@@ -38,7 +38,9 @@ enum SideBySideVideoIO {
     }
 
     static func transcodeTo30FPS(
-        inputURL: URL, outputURL: URL
+        inputURL: URL,
+        outputURL: URL,
+        verifyTiledPixelPath: Bool = false
     ) async throws -> VideoTranscodeResult {
         guard inputURL.standardizedFileURL != outputURL.standardizedFileURL else {
             throw DeformConvError.commandFailed("input and output video paths must differ")
@@ -127,7 +129,7 @@ enum SideBySideVideoIO {
                 next = readerOutput.copyNextSampleBuffer()
             }
             guard let selected = closestSample(previous: previous, next: next, to: outputTime),
-                  let imageBuffer = CMSampleBufferGetImageBuffer(selected)
+                  let decodedBuffer = CMSampleBufferGetImageBuffer(selected)
             else {
                 throw reader.error
                     ?? DeformConvError.commandFailed("decoder ended before output frame \(outputIndex)")
@@ -138,7 +140,32 @@ enum SideBySideVideoIO {
                 }
                 try await Task.sleep(for: .milliseconds(1))
             }
-            guard adaptor.append(imageBuffer, withPresentationTime: outputTime) else {
+            let outputBuffer: CVPixelBuffer
+            if verifyTiledPixelPath {
+                var accumulator = try TileFrameAccumulator(dimensions: plan.dimensions)
+                for tile in plan.tiles {
+                    let planar = try TilePixelPipeline.extractPlanarRGB(
+                        from: decodedBuffer, tile: tile
+                    )
+                    try accumulator.accumulate(tile: tile, planarRGB: planar)
+                }
+                guard let pool = adaptor.pixelBufferPool else {
+                    throw DeformConvError.commandFailed("video writer has no pixel-buffer pool")
+                }
+                var optionalOutput: CVPixelBuffer?
+                let status = CVPixelBufferPoolCreatePixelBuffer(nil, pool, &optionalOutput)
+                guard status == kCVReturnSuccess, let created = optionalOutput else {
+                    throw DeformConvError.commandFailed(
+                        "failed allocating output pixel buffer (CoreVideo \(status))"
+                    )
+                }
+                CVBufferPropagateAttachments(decodedBuffer, created)
+                try accumulator.writeBGRA(to: created)
+                outputBuffer = created
+            } else {
+                outputBuffer = decodedBuffer
+            }
+            guard adaptor.append(outputBuffer, withPresentationTime: outputTime) else {
                 throw writer.error
                     ?? DeformConvError.commandFailed("failed writing output frame \(outputIndex)")
             }

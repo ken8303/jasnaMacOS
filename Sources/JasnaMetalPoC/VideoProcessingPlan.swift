@@ -13,6 +13,38 @@ struct VideoTile: Equatable, Sendable {
     let y: Int
     let width: Int
     let height: Int
+    let leftOverlap: Int
+    let rightOverlap: Int
+    let topOverlap: Int
+    let bottomOverlap: Int
+
+    init(
+        eyeIndex: Int,
+        x: Int,
+        y: Int,
+        width: Int,
+        height: Int,
+        leftOverlap: Int = 0,
+        rightOverlap: Int = 0,
+        topOverlap: Int = 0,
+        bottomOverlap: Int = 0
+    ) {
+        self.eyeIndex = eyeIndex
+        self.x = x
+        self.y = y
+        self.width = width
+        self.height = height
+        self.leftOverlap = leftOverlap
+        self.rightOverlap = rightOverlap
+        self.topOverlap = topOverlap
+        self.bottomOverlap = bottomOverlap
+    }
+}
+
+private struct TileAxisPlacement: Sendable {
+    let origin: Int
+    let leadingOverlap: Int
+    let trailingOverlap: Int
 }
 
 struct ConstantFrameRatePlan: Sendable {
@@ -89,20 +121,24 @@ struct SideBySideVideoPlan: Sendable {
             durationSeconds: durationSeconds
         )
 
-        let xOrigins = try Self.axisOrigins(length: eyeDimensions.width, overlap: overlap)
-        let yOrigins = try Self.axisOrigins(length: eyeDimensions.height, overlap: overlap)
+        let xPlacements = try Self.axisPlacements(length: eyeDimensions.width, overlap: overlap)
+        let yPlacements = try Self.axisPlacements(length: eyeDimensions.height, overlap: overlap)
         var generated = [VideoTile]()
-        generated.reserveCapacity(2 * xOrigins.count * yOrigins.count)
+        generated.reserveCapacity(2 * xPlacements.count * yPlacements.count)
         for eye in 0..<2 {
             let eyeOffset = eye * eyeDimensions.width
-            for y in yOrigins {
-                for localX in xOrigins {
+            for vertical in yPlacements {
+                for horizontal in xPlacements {
                     generated.append(VideoTile(
                         eyeIndex: eye,
-                        x: eyeOffset + localX,
-                        y: y,
+                        x: eyeOffset + horizontal.origin,
+                        y: vertical.origin,
                         width: tileSize,
-                        height: tileSize
+                        height: tileSize,
+                        leftOverlap: horizontal.leadingOverlap,
+                        rightOverlap: horizontal.trailingOverlap,
+                        topOverlap: vertical.leadingOverlap,
+                        bottomOverlap: vertical.trailingOverlap
                     ))
                 }
             }
@@ -121,15 +157,30 @@ struct SideBySideVideoPlan: Sendable {
 
     var outputBGRABytesPerFrame: Int { dimensions.pixelCount * 4 }
 
-    private static func axisOrigins(length: Int, overlap: Int) throws -> [Int] {
+    private static func axisPlacements(
+        length: Int, overlap: Int
+    ) throws -> [TileAxisPlacement] {
         let tileSize = modelTileSize
         guard length >= tileSize else { throw DeformConvError.invalidShape }
-        if length == tileSize { return [0] }
+        if length == tileSize {
+            return [TileAxisPlacement(origin: 0, leadingOverlap: 0, trailingOverlap: 0)]
+        }
 
         let step = tileSize - overlap
-        var origins = Array(Swift.stride(from: 0, through: length - tileSize, by: step))
         let finalOrigin = length - tileSize
-        if origins.last != finalOrigin { origins.append(finalOrigin) }
-        return origins
+        let intervalCount = Int(ceil(Double(finalOrigin) / Double(step)))
+        let origins = (0...intervalCount).map { index in
+            Int((Double(index) * Double(finalOrigin) / Double(intervalCount)).rounded())
+        }
+        return origins.indices.map { index in
+            let leading = index == 0 ? 0 : origins[index - 1] + tileSize - origins[index]
+            let trailing = index == origins.count - 1
+                ? 0 : origins[index] + tileSize - origins[index + 1]
+            return TileAxisPlacement(
+                origin: origins[index],
+                leadingOverlap: leading,
+                trailingOverlap: trailing
+            )
+        }
     }
 }

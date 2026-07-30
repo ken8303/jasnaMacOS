@@ -67,6 +67,7 @@ real offset and backbone packages plus the checkpoint DCNv2 weights:
 ./script/build_and_run.sh --plan-sbs-video 7680 4320 60 1
 ./script/build_and_run.sh --inspect-sbs-video /path/to/input.mov
 ./script/build_and_run.sh --transcode-sbs-30 /path/to/input.mov /path/to/output.mov
+./script/build_and_run.sh --transcode-sbs-30-tiled /path/to/input.mov /path/to/output.mov
 ```
 
 The side-by-side planner takes `width height source-fps duration-seconds`.
@@ -84,6 +85,16 @@ metadata re-opened and validated. Existing output files are never overwritten.
 This first path is video-only and BGRA/SDR: audio copying, HDR/10-bit color
 preservation, rotated tracks, and Metal restoration insertion remain explicit
 follow-up work.
+
+The tiled I/O path now converts decoded BGRA pixels to the model's planar FP16
+RGB layout, reconstructs the frame with separable feather weights, propagates
+the decoder's color attachments, and then encodes. Tile positions are evenly
+distributed across each eye, so the 4320-pixel axis uses 42–43-pixel overlaps
+instead of concentrating a 224-pixel overlap in the last row. Every tile stores
+its actual four overlap widths. A 960×256 unit test round-trips every pixel
+through overlapping FP16 tiles within one byte and proves the accumulated
+weight is exactly one everywhere. The end-to-end 60→30 fps tiled smoke output
+decoded identically to the direct output across all 30 frames (`inf` PSNR).
 
 Inspect the real four-pass temporal traversal, validate every converted package
 boundary, and allocate the complete buffer-backed clip arena:
