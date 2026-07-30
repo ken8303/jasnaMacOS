@@ -58,6 +58,14 @@ else
   exit 1
 fi
 
+if command -v ffprobe >/dev/null 2>&1; then
+  FFPROBE_PATH="$(command -v ffprobe)"
+elif [[ -x /opt/homebrew/bin/ffprobe ]]; then
+  FFPROBE_PATH="/opt/homebrew/bin/ffprobe"
+else
+  FFPROBE_PATH=""
+fi
+
 START_SECONDS="$(time_to_seconds "$START_TIME")" || {
   echo "error: invalid start time: $START_TIME" >&2
   exit 1
@@ -71,6 +79,20 @@ DURATION_SECONDS="$((END_SECONDS - START_SECONDS))"
   echo "error: end time must be after start time" >&2
   exit 1
 }
+
+if [[ -n "$FFPROBE_PATH" ]]; then
+  INPUT_DURATION="$($FFPROBE_PATH \
+    -v error \
+    -show_entries format=duration \
+    -of default=noprint_wrappers=1:nokey=1 \
+    "$INPUT_PATH")"
+  if /usr/bin/awk -v start="$START_SECONDS" -v duration="$INPUT_DURATION" \
+    'BEGIN { exit !(start >= duration) }'; then
+    echo "error: requested start ${START_TIME} is beyond the input duration (${INPUT_DURATION}s)" >&2
+    echo "this file appears to have already been cut" >&2
+    exit 1
+  fi
+fi
 
 echo "Fast cutting $INPUT_PATH"
 echo "Requested range: $START_TIME → $END_TIME ($DURATION_SECONDS seconds)"
@@ -91,14 +113,6 @@ echo "Output: $OUTPUT_PATH"
 
 echo "Done. Video streams were copied without re-encoding."
 echo "Note: fast cuts align to nearby keyframes, so the result may start slightly early."
-
-if command -v ffprobe >/dev/null 2>&1; then
-  FFPROBE_PATH="$(command -v ffprobe)"
-elif [[ -x /opt/homebrew/bin/ffprobe ]]; then
-  FFPROBE_PATH="/opt/homebrew/bin/ffprobe"
-else
-  FFPROBE_PATH=""
-fi
 
 if [[ -n "$FFPROBE_PATH" ]]; then
   ACTUAL_DURATION="$($FFPROBE_PATH \
