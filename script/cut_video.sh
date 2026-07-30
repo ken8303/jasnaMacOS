@@ -30,6 +30,16 @@ OUTPUT_PATH="$2"
 START_TIME="${3:-12:00}"
 END_TIME="${4:-13:00}"
 
+[[ "$INPUT_PATH" != *[[:space:]] ]] || {
+  echo "error: input path ends with whitespace: '$INPUT_PATH'" >&2
+  exit 1
+}
+[[ "$OUTPUT_PATH" != *[[:space:]] ]] || {
+  echo "error: output path ends with whitespace: '$OUTPUT_PATH'" >&2
+  echo "remove the space after the filename extension" >&2
+  exit 1
+}
+
 [[ -f "$INPUT_PATH" ]] || {
   echo "error: input video not found: $INPUT_PATH" >&2
   exit 1
