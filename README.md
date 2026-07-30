@@ -63,6 +63,7 @@ real offset and backbone packages plus the checkpoint DCNv2 weights:
 ./script/build_and_run.sh --three-frame-four-pass
 ./script/build_and_run.sh --variable-clip 5
 ./script/build_and_run.sh --variable-clip 30
+./script/build_and_run.sh --single-run-clip 30
 ./script/build_and_run.sh --plan-sbs-video 7680 4320 60 1
 ```
 
@@ -258,11 +259,20 @@ covered by deterministic tests for eye isolation, edge coverage, 60→30 frame
 selection, slower-source frame duplication, and temporal-window counts.
 
 This is the scheduling and memory contract for the upcoming video reader,
-tile blending, and encoder. It does not yet claim end-to-end 8K file conversion:
-the existing fused executor still needs a production single-run mode (without
-benchmark repeats), followed by pixel-buffer conversion and a 30 fps
-`AVAssetWriter` path. Independent 30-frame windows will also need a small
-temporal overlap to hide recurrence resets at clip boundaries.
+tile blending, and encoder. The fused executor now has a production mode that
+submits one graph execution with no benchmark warmups or repeats. It does not
+yet claim end-to-end 8K file conversion: pixel-buffer conversion and a 30 fps
+`AVAssetWriter` path still need to be connected, and independent 30-frame
+windows will need a small temporal overlap to hide recurrence resets at clip
+boundaries.
+
+On the same M4, the first production-mode submission restored thirty 256×256
+frames in `370.904 ms`. At 680 overlapping tiles, that is approximately 252
+seconds of graph time for one second of `7680×4320` / 30 fps output, before
+decode, blending, and encode. Therefore “30 fps output” currently means the
+encoded timeline rate, not real-time processing. The present architecture is
+an offline converter target; reaching real-time 8K would require a fundamental
+throughput change rather than only video-I/O tuning.
 
 The bidirectional SPyNet probe now builds normalized 2/4/8/16/32/64 pyramids,
 uses padded row strides required by Metal ML at the small levels, runs twelve

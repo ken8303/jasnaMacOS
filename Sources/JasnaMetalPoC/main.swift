@@ -1064,6 +1064,44 @@ do {
         }
         print("Frame checksums: \(fused.restoredChecksums.map { String(format: "%.6f", $0) }.joined(separator: " / "))")
     }
+    if let productionIndex = CommandLine.arguments.firstIndex(of: "--single-run-clip") {
+        guard CommandLine.arguments.indices.contains(productionIndex + 3),
+              let frameCount = Int(CommandLine.arguments[productionIndex + 1]),
+              frameCount >= 3
+        else {
+            throw DeformConvError.commandFailed(
+                "--single-run-clip requires frame count, MetalML, and DeformConv directories"
+            )
+        }
+        guard #available(macOS 27.0, *) else {
+            throw DeformConvError.commandFailed("single-run clip graph requires macOS 27")
+        }
+        let modelsURL = URL(
+            fileURLWithPath: CommandLine.arguments[productionIndex + 2], isDirectory: true
+        )
+        let weightsURL = URL(
+            fileURLWithPath: CommandLine.arguments[productionIndex + 3], isDirectory: true
+        )
+        let fused = try verifyFusedFourPassRecurrence(
+            device: runner.device,
+            modelsURL: modelsURL,
+            weightsURL: weightsURL,
+            backwardFlows: [],
+            forwardFlows: [],
+            inputFrames: (0..<frameCount).map(makeJasnaSyntheticFrame),
+            stagedBranchFrames: [],
+            stagedRestoredFrames: [],
+            warmupCount: 0,
+            measurementCount: 1
+        )
+        print("Production single-run \(frameCount)-frame graph: PASS")
+        print("GPU timeline:       \(String(format: "%.3f", fused.statistics.median)) ms")
+        print("Executions:         \(fused.statistics.samples.count)")
+        print("Restored frames:    \(fused.restoredFrames.count)")
+        print("Output elements:    \(fused.restoredFrames.reduce(0) { $0 + $1.count })")
+        print("Flow/frame repeat:  \(fused.flowRepeatMaximumError) / \(fused.restoredRepeatMaximumError)")
+        print("Frame checksums:    \(fused.restoredChecksums.map { String(format: "%.6f", $0) }.joined(separator: " / "))")
+    }
     if let scheduleIndex = CommandLine.arguments.firstIndex(of: "--schedule") {
         let frameCount = CommandLine.arguments.indices.contains(scheduleIndex + 1)
             ? Int(CommandLine.arguments[scheduleIndex + 1]) ?? 5

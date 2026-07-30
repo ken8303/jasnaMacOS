@@ -53,7 +53,9 @@ func verifyFusedFourPassRecurrence(
     forwardFlows: [[Float16]],
     inputFrames: [[Float16]],
     stagedBranchFrames: [[[Float16]]],
-    stagedRestoredFrames: [[Float16]]
+    stagedRestoredFrames: [[Float16]],
+    warmupCount: Int = 3,
+    measurementCount: Int = 20
 ) throws -> FusedFourPassRecurrenceResult {
     typealias Support = Metal4GraphSupport
     let plane = 64 * 64
@@ -69,6 +71,8 @@ func verifyFusedFourPassRecurrence(
         ("backward_2", .backward), ("forward_2", .forward),
     ]
     guard frameCount >= 3,
+          warmupCount >= 0,
+          measurementCount > 0,
           (!hasFlowOracle || (
               backwardFlows.count == flowCount
                   && forwardFlows.count == flowCount
@@ -649,10 +653,7 @@ func verifyFusedFourPassRecurrence(
         return (milliseconds, outputs, restored, flows)
     }
 
-    let measurementCount = 20
-    _ = try execute()
-    _ = try execute()
-    _ = try execute()
+    for _ in 0..<warmupCount { _ = try execute() }
     let (firstMilliseconds, firstOutputs, firstRestored, firstFlows) = try execute()
     var samples = [firstMilliseconds]
     var lastOutputs = firstOutputs
