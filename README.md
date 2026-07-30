@@ -19,6 +19,19 @@ Run:
 ./script/build_and_run.sh
 ```
 
+Fast-cut a video from 12:00 to 13:00 without re-encoding:
+
+```sh
+./script/cut_video.sh /path/to/input.mov /path/to/clip.mov
+```
+
+The optional third and fourth arguments select another start and end time, for
+example `./script/cut_video.sh input.mov clip.mov 05:30 06:15`. The script uses
+FFmpeg stream copy, preserves all mapped streams and metadata, refuses to
+overwrite an existing output, and reports the resulting duration. This is the
+fastest method for an 8K source, but cuts align to nearby keyframes and may
+start slightly early; use a re-encoded path when frame-exact boundaries matter.
+
 Run only the correctness gate:
 
 ```sh
