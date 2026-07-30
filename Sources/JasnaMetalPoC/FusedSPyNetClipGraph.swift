@@ -51,7 +51,8 @@ final class FusedSPyNetClipGraph {
         sourceFrames: [MTLBuffer]
     ) throws {
         let sizes = [2, 4, 8, 16, 32, 64]
-        guard sourceFrames.count == 3 else { throw DeformConvError.invalidShape }
+        guard sourceFrames.count >= 2 else { throw DeformConvError.invalidShape }
+        let frameCount = sourceFrames.count
         guard let downsampleFunction = library.makeFunction(
                   name: "jasna_bicubic_downsample_quarter_fp16"
               ),
@@ -86,10 +87,10 @@ final class FusedSPyNetClipGraph {
             return (try device.makeTensor(descriptor: descriptor, attachments: attachments), buffer)
         }
 
-        let downsampledFrames = try (0..<3).map { _ in
+        let downsampledFrames = try (0..<frameCount).map { _ in
             try Support.makeSharedFP16Buffer(device: device, elements: 3 * 64 * 64)
         }
-        downsampleArguments = try (0..<3).map { frame in
+        downsampleArguments = try (0..<frameCount).map { frame in
             try Support.makeComputeArguments(
                 device: device, buffers: [sourceFrames[frame], downsampledFrames[frame]]
             )
@@ -108,7 +109,7 @@ final class FusedSPyNetClipGraph {
         var mutableTransient = downsampledFrames + [zeroFlow]
         var mutableHeaps = [MTLHeap]()
         var tensors = [any MTLTensor]()
-        for pairIndex in 0..<2 {
+        for pairIndex in 0..<(frameCount - 1) {
             let referencePyramid = try sizes.map {
                 try Support.makeSharedFP16Buffer(device: device, elements: 3 * $0 * $0)
             }

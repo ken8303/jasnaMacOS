@@ -61,6 +61,7 @@ real offset and backbone packages plus the checkpoint DCNv2 weights:
 ./script/build_and_run.sh --three-frame-recurrence
 ./script/build_and_run.sh --three-frame-first-pass
 ./script/build_and_run.sh --three-frame-four-pass
+./script/build_and_run.sh --variable-clip 5
 ```
 
 Inspect the real four-pass temporal traversal, validate every converted package
@@ -214,6 +215,17 @@ RMSE `0.000299`, for 70.49 dB PSNR. The command fails unless maximum error is at
 most `0.02`, mean error at most `0.0005`, P99 error at most `0.002`, and PSNR at
 least 60 dB.
 
+The same executor is no longer restricted to three frames. A five-frame run
+creates four adjacent bidirectional SPyNet pairs, follows the generated
+backward/forward traversal for every branch, uses second-order history from the
+third position onward, and reconstructs all five outputs. Two 20-sample runs
+measured 56.349 ms and 58.364 ms medians, with 54.935–61.335 ms and
+55.938–62.518 ms P10–P90 intervals. That is 85.7–88.7 restored frames/s within
+the measured clip and uses 14.50 MiB of persistent clip tensors. All flow and
+repeated-output errors were zero. Against 983,040
+independent PyTorch output values, maximum error was `0.004133`, mean error
+`0.000183`, P99 error `0.000773`, and PSNR 72.08 dB.
+
 The bidirectional SPyNet probe now builds normalized 2/4/8/16/32/64 pyramids,
 uses padded row strides required by Metal ML at the small levels, runs twelve
 real checkpoint convolution blocks, and performs custom border warp, flow
@@ -279,7 +291,8 @@ environment, Jasna checkout, and checkpoint used for conversion:
 python tools/export_full_model_oracle.py \
   --jasna-source /path/to/jasna \
   --weights /path/to/lada_mosaic_restoration_model_generic_v1.2.pth \
-  --output Models/FullModelOracle
+  --frames 5 \
+  --output Models/FullModelOracle/5
 ```
 
 The exporter reproduces the Metal probe's deterministic FP16 input

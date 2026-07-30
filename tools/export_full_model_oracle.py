@@ -27,6 +27,7 @@ def main() -> None:
     parser.add_argument("--jasna-source", type=Path, required=True)
     parser.add_argument("--weights", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--frames", type=int, default=3)
     args = parser.parse_args()
 
     sys.path.insert(0, str(args.jasna_source.resolve()))
@@ -35,11 +36,15 @@ def main() -> None:
     model = load_model(None, str(args.weights), torch.device("cpu"), False)
     generator = model.generator_ema if model.generator_ema is not None else model.generator
     generator = generator.cpu().eval()
-    frames = torch.from_numpy(np.stack([synthetic_frame(index) for index in range(3)]))[None]
+    if args.frames < 3:
+        raise SystemExit("--frames must be at least 3")
+    frames = torch.from_numpy(
+        np.stack([synthetic_frame(index) for index in range(args.frames)])
+    )[None]
     with torch.inference_mode():
         restored = generator(frames).detach().cpu().numpy()[0]
 
-    if restored.shape != (3, 3, 256, 256):
+    if restored.shape != (args.frames, 3, 256, 256):
         raise SystemExit(f"unexpected restored shape: {restored.shape}")
     args.output.mkdir(parents=True, exist_ok=True)
     fp32 = restored.astype("<f4", copy=False)

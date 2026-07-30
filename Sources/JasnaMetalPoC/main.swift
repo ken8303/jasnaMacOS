@@ -29,6 +29,42 @@ private func verifySyntheticClipFlows(
     return (first, second)
 }
 
+private struct VariableSyntheticClipFlows {
+    let pairs: [SPyNetPairResult]
+    let backward: [[Float16]]
+    let forward: [[Float16]]
+}
+
+@available(macOS 27.0, *)
+private func verifyVariableSyntheticClipFlows(
+    runner: MetalDeformConv,
+    modelsURL: URL,
+    oracleURL: URL,
+    frameCount: Int
+) throws -> VariableSyntheticClipFlows {
+    guard frameCount >= 3 else { throw DeformConvError.invalidShape }
+    let flowFrames = try (0..<frameCount).map { frameIndex in
+        try runner.runBicubicDownsampleQuarter(makeJasnaSyntheticFrame(index: frameIndex))
+    }
+    var pairs = [SPyNetPairResult]()
+    for pair in 0..<(frameCount - 1) {
+        pairs.append(try verifySPyNetPair(
+            device: runner.device,
+            modelsURL: modelsURL,
+            oracleURL: oracleURL,
+            inputVariant: pair,
+            validateOracle: false,
+            referenceInput: flowFrames[pair],
+            supportInput: flowFrames[pair + 1]
+        ))
+    }
+    return VariableSyntheticClipFlows(
+        pairs: pairs,
+        backward: pairs.map(\.backwardFlow),
+        forward: pairs.map(\.forwardFlow)
+    )
+}
+
 private func correctnessTest(runner: MetalDeformConv) throws {
     let shape = DeformConvShape(
         batch: 1,
@@ -906,6 +942,78 @@ do {
         print("Checksums:      \(branches.map { String(format: "%.6f", $0.checksum) }.joined(separator: " / "))")
         print("Frame checksums: \(reconstruction.checksums.map { String(format: "%.6f", $0) }.joined(separator: " / "))")
         print("Frame repeat/residual error: \(reconstruction.repeatMaximumError) / \(reconstruction.residualMaximumError)")
+    }
+    if let variableIndex = CommandLine.arguments.firstIndex(of: "--variable-clip") {
+        guard CommandLine.arguments.indices.contains(variableIndex + 5),
+              let frameCount = Int(CommandLine.arguments[variableIndex + 1]),
+              frameCount >= 3
+        else {
+            throw DeformConvError.commandFailed(
+                "--variable-clip requires frame count, MetalML, DeformConv, SPyNetOracle, and FullModelOracle"
+            )
+        }
+        guard #available(macOS 27.0, *) else {
+            throw DeformConvError.commandFailed("variable clip graph requires macOS 27")
+        }
+        let modelsURL = URL(
+            fileURLWithPath: CommandLine.arguments[variableIndex + 2], isDirectory: true
+        )
+        let weightsURL = URL(
+            fileURLWithPath: CommandLine.arguments[variableIndex + 3], isDirectory: true
+        )
+        let spynetOracleURL = URL(
+            fileURLWithPath: CommandLine.arguments[variableIndex + 4], isDirectory: true
+        )
+        let fullOracleURL = URL(
+            fileURLWithPath: CommandLine.arguments[variableIndex + 5], isDirectory: true
+        )
+        let inputFrames = (0..<frameCount).map(makeJasnaSyntheticFrame)
+        let flowOracle = try verifyVariableSyntheticClipFlows(
+            runner: runner,
+            modelsURL: modelsURL,
+            oracleURL: spynetOracleURL,
+            frameCount: frameCount
+        )
+        let fused = try verifyFusedFourPassRecurrence(
+            device: runner.device,
+            modelsURL: modelsURL,
+            weightsURL: weightsURL,
+            backwardFlows: flowOracle.backward,
+            forwardFlows: flowOracle.forward,
+            inputFrames: inputFrames,
+            stagedBranchFrames: [],
+            stagedRestoredFrames: []
+        )
+        let fullOracle = try compareFullModelOracle(
+            restoredFrames: fused.restoredFrames, oracleURL: fullOracleURL
+        )
+        guard fullOracle.maximumAbsoluteError <= 0.02,
+              fullOracle.meanAbsoluteError <= 0.0005,
+              fullOracle.percentile99AbsoluteError <= 0.002,
+              fullOracle.psnr >= 60
+        else {
+            throw DeformConvError.commandFailed(
+                "variable full-model oracle mismatch (max=\(fullOracle.maximumAbsoluteError), "
+                    + "mean=\(fullOracle.meanAbsoluteError), "
+                    + "p99=\(fullOracle.percentile99AbsoluteError), psnr=\(fullOracle.psnr))"
+            )
+        }
+        let schedule = try TemporalSchedule(frameCount: frameCount)
+        let framesPerSecond = Double(frameCount) * 1_000 / fused.statistics.median
+        print("Variable \(frameCount)-frame input-to-restored graph: PASS")
+        print("Fused median: \(String(format: "%.3f", fused.statistics.median)) ms")
+        print("Fused P10–P90/stddev: \(String(format: "%.3f–%.3f / %.3f", fused.statistics.percentile10, fused.statistics.percentile90, fused.statistics.standardDeviation)) ms")
+        print("Fused best/worst/samples: \(String(format: "%.3f / %.3f / %d", fused.statistics.minimum, fused.statistics.maximum, fused.statistics.samples.count))")
+        print("In-clip restored-frame rate: \(String(format: "%.1f", framesPerSecond)) FPS")
+        print("Persistent clip tensors: \(String(format: "%.2f", Double(schedule.persistentTensorBytes) / 1_048_576)) MiB")
+        print("Flow oracle/repeat error: \(fused.flowOracleMaximumError) / \(fused.flowRepeatMaximumError)")
+        print("Propagation/frame repeat error: \(fused.propagationRepeatMaximumError) / \(fused.restoredRepeatMaximumError)")
+        print("Residual maximum error: \(fused.residualMaximumError)")
+        print("PyTorch values: \(fullOracle.elementCount)")
+        print("PyTorch max/mean/P99 error: \(String(format: "%.7f / %.7f / %.7f", fullOracle.maximumAbsoluteError, fullOracle.meanAbsoluteError, fullOracle.percentile99AbsoluteError))")
+        print("PyTorch RMSE/PSNR: \(String(format: "%.7f / %.2f dB", fullOracle.rootMeanSquaredError, fullOracle.psnr))")
+        print("Separate SPyNet pair medians: \(flowOracle.pairs.map { String(format: "%.3f", $0.medianMilliseconds) }.joined(separator: " / ")) ms")
+        print("Frame checksums: \(fused.restoredChecksums.map { String(format: "%.6f", $0) }.joined(separator: " / "))")
     }
     if let scheduleIndex = CommandLine.arguments.firstIndex(of: "--schedule") {
         let frameCount = CommandLine.arguments.indices.contains(scheduleIndex + 1)

@@ -58,20 +58,29 @@ func verifyFusedFourPassRecurrence(
     let plane = 64 * 64
     let featureCount = 64 * plane
     let frameElements = 3 * 256 * 256
+    let frameCount = inputFrames.count
+    let flowCount = frameCount - 1
+    let hasStagedPropagation = !stagedBranchFrames.isEmpty
+    let hasStagedRestoration = !stagedRestoredFrames.isEmpty
     let branchSpecs: [(String, PropagationDirection)] = [
         ("backward_1", .backward), ("forward_1", .forward),
         ("backward_2", .backward), ("forward_2", .forward),
     ]
-    guard backwardFlows.count == 2, forwardFlows.count == 2,
+    guard frameCount >= 3,
+          backwardFlows.count == flowCount, forwardFlows.count == flowCount,
           (backwardFlows + forwardFlows).allSatisfy({ $0.count == 2 * plane }),
-          inputFrames.count == 3,
           inputFrames.allSatisfy({ $0.count == frameElements }),
-          stagedBranchFrames.count == 4,
-          stagedBranchFrames.allSatisfy({ branch in
-              branch.count == 3 && branch.allSatisfy({ $0.count == featureCount })
-          }),
-          stagedRestoredFrames.count == 3,
-          stagedRestoredFrames.allSatisfy({ $0.count == frameElements })
+          (!hasStagedPropagation || (
+              stagedBranchFrames.count == 4
+                  && stagedBranchFrames.allSatisfy({ branch in
+                      branch.count == frameCount
+                          && branch.allSatisfy({ $0.count == featureCount })
+                  })
+          )),
+          (!hasStagedRestoration || (
+              stagedRestoredFrames.count == frameCount
+                  && stagedRestoredFrames.allSatisfy({ $0.count == frameElements })
+          ))
     else { throw DeformConvError.invalidShape }
 
     let featurePipeline = try makeMetalMLPipeline(
@@ -82,17 +91,17 @@ func verifyFusedFourPassRecurrence(
         device: device,
         packageURL: modelsURL.appendingPathComponent("upsample.mtlpackage")
     )
-    let featureHeaps = try (0..<3).map { _ in
+    let featureHeaps = try (0..<frameCount).map { _ in
         try Support.makeHeap(device: device, size: featurePipeline.intermediatesHeapSize)
     }
-    let upsampleHeaps = try (0..<3).map { _ in
+    let upsampleHeaps = try (0..<frameCount).map { _ in
         try Support.makeHeap(device: device, size: upsamplePipeline.intermediatesHeapSize)
     }
     var heldTensors = [any MTLTensor]()
     var frameBuffers = [MTLBuffer]()
     var spatialBuffers = [MTLBuffer]()
     var featureArguments = [any MTL4ArgumentTable]()
-    for _ in 0..<3 {
+    for _ in 0..<frameCount {
         let (frameTensor, frameBuffer) = try Support.makeTensor(
             device: device, dimensions: [256, 256, 3, 1]
         )
@@ -129,7 +138,7 @@ func verifyFusedFourPassRecurrence(
     let gatheredBuffer = try Support.makePrivateBuffer(device: device, bytes: plane * 128 * 9 * 2)
     let matrixOutputBuffer = try Support.makePrivateBuffer(device: device, bytes: plane * 64 * 4)
     let propagationBuffers = try (0..<4).map { _ in
-        try (0..<3).map { _ in
+        try (0..<frameCount).map { _ in
             try Support.makeSharedFP16Buffer(device: device, elements: featureCount)
         }
     }
@@ -221,7 +230,8 @@ func verifyFusedFourPassRecurrence(
                 "output": backboneOutputTensor.gpuResourceID,
             ]
         )
-        let traversal = direction == .backward ? [2, 1, 0] : [0, 1, 2]
+        let traversal = direction == .backward
+            ? Array((0..<frameCount).reversed()) : Array(0..<frameCount)
         func prior(_ index: Int, _ frame: Int) -> MTLBuffer {
             index < branchIndex ? propagationBuffers[index][frame] : zeroFeatureBuffer
         }
@@ -246,16 +256,16 @@ func verifyFusedFourPassRecurrence(
         var assemblyArguments = [any MTL4ArgumentTable]()
         var residualArguments = [any MTL4ArgumentTable]()
         let flowBuffers = direction == .backward ? backwardFlowBuffers : forwardFlowBuffers
-        for step in 1...2 {
+        for step in 1..<frameCount {
             let frame = traversal[step]
             let previousFrame = traversal[step - 1]
             let flowIndex = direction == .backward ? frame : frame - 1
-            let previousFlowIndex = step == 2
+            let previousFlowIndex = step >= 2
                 ? (direction == .backward ? previousFrame : previousFrame - 1)
                 : flowIndex
-            let shapeBuffer = step == 2 ? secondShapeBuffer : firstShapeBuffer
-            let featN2 = step == 2
-                ? propagationBuffers[branchIndex][traversal[0]] : zeroFeatureBuffer
+            let shapeBuffer = step >= 2 ? secondShapeBuffer : firstShapeBuffer
+            let featN2 = step >= 2
+                ? propagationBuffers[branchIndex][traversal[step - 2]] : zeroFeatureBuffer
             accumulateArguments.append(try Support.makeComputeArguments(
                 device: device,
                 buffers: [flowBuffers[flowIndex], flowBuffers[previousFlowIndex],
@@ -320,7 +330,7 @@ func verifyFusedFourPassRecurrence(
     var reconstructionAssemblyArguments = [any MTL4ArgumentTable]()
     var upsampleArguments = [any MTL4ArgumentTable]()
     var frameResidualArguments = [any MTL4ArgumentTable]()
-    for frame in 0..<3 {
+    for frame in 0..<frameCount {
         let (reconstructionTensor, reconstructionBuffer) = try Support.makeTensor(
             device: device, dimensions: [64, 64, 320, 1]
         )
@@ -390,7 +400,7 @@ func verifyFusedFourPassRecurrence(
         for buffer in transientBuffers {
             buffer.contents().initializeMemory(as: UInt8.self, repeating: 0, count: buffer.length)
         }
-        for frame in 0..<3 {
+        for frame in 0..<frameCount {
             inputFrames[frame].withUnsafeBufferPointer { source in
                 frameBuffers[frame].contents().bindMemory(to: Float16.self, capacity: frameElements)
                     .update(from: source.baseAddress!, count: frameElements)
@@ -405,7 +415,7 @@ func verifyFusedFourPassRecurrence(
         else { throw DeformConvError.metalUnavailable }
         commandBuffer.beginCommandBuffer(allocator: allocator)
         commandBuffer.useResidencySet(residencySet)
-        for index in 0..<3 {
+        for index in 0..<frameCount {
             guard let encoder = commandBuffer.makeMachineLearningCommandEncoder() else {
                 throw DeformConvError.metalUnavailable
             }
@@ -454,7 +464,7 @@ func verifyFusedFourPassRecurrence(
             )
             initialResidual.endEncoding()
 
-            for step in 0..<2 {
+            for step in 0..<flowCount {
                 guard let preparation = commandBuffer.makeComputeCommandEncoder() else {
                     throw DeformConvError.metalUnavailable
                 }
@@ -577,7 +587,7 @@ func verifyFusedFourPassRecurrence(
             visibilityOptions: .device
         )
         reconstructionAssembly.endEncoding()
-        for frame in 0..<3 {
+        for frame in 0..<frameCount {
             guard let upsample = commandBuffer.makeMachineLearningCommandEncoder() else {
                 throw DeformConvError.metalUnavailable
             }
@@ -658,8 +668,8 @@ func verifyFusedFourPassRecurrence(
     var stagedBranchErrors = [Float](repeating: 0, count: 4)
     var checksums = [Double](repeating: 0, count: 4)
     for branch in 0..<4 {
-        let finalFrame = branchSpecs[branch].1 == .backward ? 0 : 2
-        for frame in 0..<3 {
+        let finalFrame = branchSpecs[branch].1 == .backward ? 0 : frameCount - 1
+        for frame in 0..<frameCount {
             for index in 0..<featureCount {
                 let value = Float(lastOutputs[branch][frame][index])
                 guard value.isFinite else {
@@ -669,14 +679,16 @@ func verifyFusedFourPassRecurrence(
                     propagationRepeatMaximumError,
                     abs(Float(firstOutputs[branch][frame][index]) - value)
                 )
-                propagationStagedMaximumError = max(
-                    propagationStagedMaximumError,
-                    abs(Float(stagedBranchFrames[branch][frame][index]) - value)
-                )
-                stagedBranchErrors[branch] = max(
-                    stagedBranchErrors[branch],
-                    abs(Float(stagedBranchFrames[branch][frame][index]) - value)
-                )
+                if hasStagedPropagation {
+                    propagationStagedMaximumError = max(
+                        propagationStagedMaximumError,
+                        abs(Float(stagedBranchFrames[branch][frame][index]) - value)
+                    )
+                    stagedBranchErrors[branch] = max(
+                        stagedBranchErrors[branch],
+                        abs(Float(stagedBranchFrames[branch][frame][index]) - value)
+                    )
+                }
                 if frame == finalFrame, index.isMultiple(of: 257) {
                     checksums[branch] += Double(value)
                 }
@@ -686,8 +698,8 @@ func verifyFusedFourPassRecurrence(
     var restoredRepeatMaximumError: Float = 0
     var restoredStagedMaximumError: Float = 0
     var residualMaximumError: Float = 0
-    var restoredChecksums = [Double](repeating: 0, count: 3)
-    for frame in 0..<3 {
+    var restoredChecksums = [Double](repeating: 0, count: frameCount)
+    for frame in 0..<frameCount {
         let predicted = predictedBuffers[frame].contents().bindMemory(
             to: Float16.self, capacity: frameElements
         )
@@ -700,10 +712,12 @@ func verifyFusedFourPassRecurrence(
                 restoredRepeatMaximumError,
                 abs(Float(firstRestored[frame][index]) - value)
             )
-            restoredStagedMaximumError = max(
-                restoredStagedMaximumError,
-                abs(Float(stagedRestoredFrames[frame][index]) - value)
-            )
+            if hasStagedRestoration {
+                restoredStagedMaximumError = max(
+                    restoredStagedMaximumError,
+                    abs(Float(stagedRestoredFrames[frame][index]) - value)
+                )
+            }
             residualMaximumError = max(
                 residualMaximumError,
                 abs(Float(predicted[index]) + Float(inputFrames[frame][index]) - value)
@@ -714,8 +728,8 @@ func verifyFusedFourPassRecurrence(
     let flowOracles = backwardFlows + forwardFlows
     var flowRepeatMaximumError: Float = 0
     var flowOracleMaximumError: Float = 0
-    var flowChecksums = [Double](repeating: 0, count: 4)
-    for flow in 0..<4 {
+    var flowChecksums = [Double](repeating: 0, count: 2 * flowCount)
+    for flow in 0..<(2 * flowCount) {
         for index in 0..<(2 * plane) {
             let value = Float(lastFlows[flow][index])
             guard value.isFinite else {

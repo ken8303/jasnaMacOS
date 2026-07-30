@@ -63,8 +63,8 @@ func compareFullModelOracle(
     oracleURL: URL
 ) throws -> FullModelOracleMetrics {
     let frameElements = 3 * 256 * 256
-    let elementCount = 3 * frameElements
-    guard restoredFrames.count == 3,
+    let elementCount = restoredFrames.count * frameElements
+    guard restoredFrames.count >= 3,
           restoredFrames.allSatisfy({ $0.count == frameElements })
     else { throw DeformConvError.invalidShape }
 
