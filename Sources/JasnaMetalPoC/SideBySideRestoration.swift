@@ -221,6 +221,15 @@ enum SideBySideRestoration {
             guard let sample = Self.closest(previous: previous, next: next, to: target),
                   let source = CMSampleBufferGetImageBuffer(sample)
             else {
+                if let error = reader.error as NSError?,
+                   error.domain == AVFoundationErrorDomain,
+                   error.code == AVError.Code.decoderNotFound.rawValue {
+                    throw DeformConvError.commandFailed(
+                        "Apple VideoToolbox cannot decode this source. For 8K Main 10 at "
+                            + "59.94 fps, first run script/prepare_8k_30fps.sh, then restore "
+                            + "the prepared 30 fps file. Underlying error: \(error)"
+                    )
+                }
                 throw reader.error
                     ?? DeformConvError.commandFailed("decoder ended before frame \(outputIndex)")
             }

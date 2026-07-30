@@ -135,6 +135,22 @@ headroom is checked before every window. The remaining quality limitation is
 the hard recurrence reset every thirty frames; temporal window overlap is the
 next refinement.
 
+Some Apple Silicon VideoToolbox configurations cannot create a decoder for
+`8192×4096`, HEVC Main 10 Level 6.1 at 59.94 fps (`-12906`, decoder not found),
+even though FFmpeg's software HEVC decoder can read it. Prepare that source
+before restoration while preserving its full resolution and Main 10 format:
+
+```sh
+./script/prepare_8k_30fps.sh input.mp4 input_30fps.mp4
+./script/build_and_run.sh --restore-sbs-video input_30fps.mp4 restored.mov
+```
+
+Preparation decodes HEVC in software, selects 30 fps, copies audio, and uses
+Apple VideoToolbox to encode 40 Mbit/s HEVC Main 10. A one-second 8192×4096
+sample prepared this way decoded and re-encoded successfully through the
+AVFoundation video path. The original 8192×4096 spatial resolution is not
+reduced.
+
 Inspect the real four-pass temporal traversal, validate every converted package
 boundary, and allocate the complete buffer-backed clip arena:
 
