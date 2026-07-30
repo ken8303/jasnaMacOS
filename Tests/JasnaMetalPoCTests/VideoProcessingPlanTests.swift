@@ -63,3 +63,16 @@ import Testing
     #expect(plan.modelGraphExecutions == 680)
     #expect(plan.outputBGRABytesPerFrame == 132_710_400)
 }
+
+@Test func partialFinalTemporalWindowKeepsOnlyRealOutputFrames() throws {
+    let plan = try SideBySideVideoPlan(
+        width: 512,
+        height: 256,
+        sourceFramesPerSecond: 60,
+        durationSeconds: 31.0 / 30.0
+    )
+
+    #expect(plan.frameRate.outputFrameCount == 31)
+    #expect(plan.temporalWindowFrameCounts == [30, 1])
+    #expect(plan.modelGraphExecutions == 4)
+}

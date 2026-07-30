@@ -432,26 +432,28 @@ do {
         print("Frames written:  \(result.writtenFrameCount)")
         print("Output file:     \(outputURL.path)")
     }
-    if let restoreIndex = CommandLine.arguments.firstIndex(of: "--restore-sbs-window") {
+    if let restoreIndex = CommandLine.arguments.firstIndex(of: "--restore-sbs-video")
+        ?? CommandLine.arguments.firstIndex(of: "--restore-sbs-window") {
         guard CommandLine.arguments.indices.contains(restoreIndex + 4) else {
             throw DeformConvError.commandFailed(
-                "--restore-sbs-window requires input, output, MetalML, and DeformConv paths"
+                "--restore-sbs-video requires input, output, MetalML, and DeformConv paths"
             )
         }
         guard #available(macOS 27.0, *) else {
             throw DeformConvError.commandFailed("restored SBS video requires macOS 27")
         }
-        let result = try await SideBySideRestoration.restoreSingleWindow(
+        let result = try await SideBySideRestoration.restoreVideo(
             device: runner.device,
             inputURL: URL(fileURLWithPath: CommandLine.arguments[restoreIndex + 1]),
             outputURL: URL(fileURLWithPath: CommandLine.arguments[restoreIndex + 2]),
             modelsURL: URL(fileURLWithPath: CommandLine.arguments[restoreIndex + 3]),
             weightsURL: URL(fileURLWithPath: CommandLine.arguments[restoreIndex + 4])
         )
-        print("Metal-restored side-by-side video window: PASS")
-        print("Chain:          decode 30 FPS → per-eye FP16 tiles → Metal restoration → disk cache → feather blend → HEVC")
+        print("Metal-restored side-by-side video: PASS")
+        print("Chain:          sequential 30 FPS windows → per-eye FP16 tiles → Metal restoration → disk cache → feather blend → HEVC")
         print("Canvas:         \(result.output.dimensions.width)×\(result.output.dimensions.height)")
-        print("Frames/tiles:   \(result.frameCount) / \(result.tileCount)")
+        print("Frames/windows: \(result.frameCount) / \(result.windowCount)")
+        print("Tiles/window:   \(result.tileCount)")
         print("GPU graph time: \(String(format: "%.3f", result.gpuMilliseconds)) ms")
         print("Tile cache:     \(String(format: "%.2f", Double(result.cacheBytes) / 1_048_576)) MiB")
         print("Output:         \(CommandLine.arguments[restoreIndex + 2])")

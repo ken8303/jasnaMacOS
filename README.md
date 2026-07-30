@@ -68,7 +68,7 @@ real offset and backbone packages plus the checkpoint DCNv2 weights:
 ./script/build_and_run.sh --inspect-sbs-video /path/to/input.mov
 ./script/build_and_run.sh --transcode-sbs-30 /path/to/input.mov /path/to/output.mov
 ./script/build_and_run.sh --transcode-sbs-30-tiled /path/to/input.mov /path/to/output.mov
-./script/build_and_run.sh --restore-sbs-window /path/to/input.mov /path/to/output.mov
+./script/build_and_run.sh --restore-sbs-video /path/to/input.mov /path/to/output.mov
 ```
 
 The side-by-side planner takes `width height source-fps duration-seconds`.
@@ -106,12 +106,21 @@ eye tiles and thirty restored HEVC frames. The two graph submissions took
 512×256, exactly 30 fps, 30 frames, and 1.000 second; its 38.53 dB PSNR versus
 passthrough confirms that actual model output reached the encoder.
 
-This command currently accepts exactly one 30-output-frame window. It retains
-the decoded BGRA window, but writes restored FP16 tiles to temporary storage
-and composites only one full frame at a time. At 7680×4320 the tile cache is
-about 7.47 GiB, so the command checks temporary-disk headroom before starting.
-Supporting arbitrary durations requires a sequential multi-window driver and
-temporal overlap at each 30-frame boundary.
+The restored-video command now supports arbitrary duration using one decoder
+and one HEVC writer across sequential windows of up to thirty output frames.
+A two-second smoke run produced 60 frames in two windows at exactly 30 fps and
+2.000 seconds, with `1471.042 ms` total GPU graph time. A 31-frame run also
+passed: its final one-frame window was padded internally to the graph's
+three-frame minimum, while only the real frame was encoded, yielding exactly
+31 frames and 1.033333 seconds.
+
+Each window retains its decoded BGRA frames, writes restored FP16 tiles to
+temporary storage, composites only one full frame at a time, and removes the
+window cache before decoding the next one. At 7680×4320 the peak tile cache is
+about 7.47 GiB rather than growing with video duration, and temporary-disk
+headroom is checked before every window. The remaining quality limitation is
+the hard recurrence reset every thirty frames; temporal window overlap is the
+next refinement.
 
 Inspect the real four-pass temporal traversal, validate every converted package
 boundary, and allocate the complete buffer-backed clip arena:

@@ -153,6 +153,15 @@ struct SideBySideVideoPlan: Sendable {
             / Self.temporalWindowFrames
     }
 
+    var temporalWindowFrameCounts: [Int] {
+        (0..<temporalWindowCount).map { window in
+            min(
+                Self.temporalWindowFrames,
+                frameRate.outputFrameCount - window * Self.temporalWindowFrames
+            )
+        }
+    }
+
     var modelGraphExecutions: Int { tiles.count * temporalWindowCount }
 
     var outputBGRABytesPerFrame: Int { dimensions.pixelCount * 4 }
