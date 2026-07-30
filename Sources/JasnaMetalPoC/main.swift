@@ -347,6 +347,35 @@ do {
     if arguments.isEmpty || arguments.contains("--benchmark") {
         try benchmark(runner: runner)
     }
+    if let planIndex = CommandLine.arguments.firstIndex(of: "--plan-sbs-video") {
+        guard CommandLine.arguments.indices.contains(planIndex + 4),
+              let width = Int(CommandLine.arguments[planIndex + 1]),
+              let height = Int(CommandLine.arguments[planIndex + 2]),
+              let sourceFPS = Double(CommandLine.arguments[planIndex + 3]),
+              let duration = Double(CommandLine.arguments[planIndex + 4])
+        else {
+            throw DeformConvError.commandFailed(
+                "--plan-sbs-video requires width, height, source FPS, and duration seconds"
+            )
+        }
+        let plan = try SideBySideVideoPlan(
+            width: width,
+            height: height,
+            sourceFramesPerSecond: sourceFPS,
+            durationSeconds: duration
+        )
+        print("Side-by-side video plan: PASS")
+        print("Input canvas:       \(plan.dimensions.width)×\(plan.dimensions.height)")
+        print("Per-eye canvas:     \(plan.eyeDimensions.width)×\(plan.eyeDimensions.height)")
+        print("Model tile/overlap: \(SideBySideVideoPlan.modelTileSize) / \(plan.overlap) pixels")
+        print("Tiles per eye/frame: \(plan.tilesPerEye)")
+        print("Total tiles/frame:   \(plan.tiles.count)")
+        print("Output rate:          \(String(format: "%.0f", plan.frameRate.outputFramesPerSecond)) FPS")
+        print("Output frames:        \(plan.frameRate.outputFrameCount)")
+        print("30-frame windows:     \(plan.temporalWindowCount)")
+        print("Model graph runs:     \(plan.modelGraphExecutions)")
+        print("Output BGRA frame:    \(String(format: "%.2f", Double(plan.outputBGRABytesPerFrame) / 1_048_576)) MiB")
+    }
     if let realBenchmarkIndex = CommandLine.arguments.firstIndex(of: "--benchmark-real-weights") {
         guard CommandLine.arguments.indices.contains(realBenchmarkIndex + 1) else {
             throw DeformConvError.commandFailed("--benchmark-real-weights requires a directory")

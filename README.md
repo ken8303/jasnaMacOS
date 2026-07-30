@@ -63,7 +63,14 @@ real offset and backbone packages plus the checkpoint DCNv2 weights:
 ./script/build_and_run.sh --three-frame-four-pass
 ./script/build_and_run.sh --variable-clip 5
 ./script/build_and_run.sh --variable-clip 30
+./script/build_and_run.sh --plan-sbs-video 7680 4320 60 1
 ```
+
+The side-by-side planner takes `width height source-fps duration-seconds`.
+It always produces a constant 30 fps timeline, dropping or duplicating source
+frames as necessary without changing the duration. The dimensions are not
+restricted to one 8K container shape, so both `7680×4320` and shorter SBS
+layouts such as `7680×2160` can be planned.
 
 Inspect the real four-pass temporal traversal, validate every converted package
 boundary, and allocate the complete buffer-backed clip arena:
@@ -239,6 +246,23 @@ the end of the recurrent sequence. For clips longer than five frames the gate
 allows maximum/P99 errors of `0.03` / `0.003`, while retaining the `0.0005` mean
 error and 60 dB PSNR requirements. This explicitly accounts for repeated FP16
 rounding without weakening the distribution-wide accuracy checks.
+
+The production target is now 8K side-by-side input with constant 30 fps output.
+Because the converted model is fixed at 256×256, the full-resolution path uses
+32-pixel-overlapped tiles and plans each eye independently; no model tile can
+cross the stereo boundary. A `7680×4320` frame produces 340 tiles per eye, or
+680 tiles total, and one second of 30 fps output maps to 680 executions of the
+validated 30-frame temporal graph. The planner covers the right and bottom
+edges exactly and reports the 126.56 MiB BGRA output-frame footprint. It is now
+covered by deterministic tests for eye isolation, edge coverage, 60→30 frame
+selection, slower-source frame duplication, and temporal-window counts.
+
+This is the scheduling and memory contract for the upcoming video reader,
+tile blending, and encoder. It does not yet claim end-to-end 8K file conversion:
+the existing fused executor still needs a production single-run mode (without
+benchmark repeats), followed by pixel-buffer conversion and a 30 fps
+`AVAssetWriter` path. Independent 30-frame windows will also need a small
+temporal overlap to hide recurrence resets at clip boundaries.
 
 The bidirectional SPyNet probe now builds normalized 2/4/8/16/32/64 pyramids,
 uses padded row strides required by Metal ML at the small levels, runs twelve
