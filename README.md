@@ -83,6 +83,8 @@ real offset and backbone packages plus the checkpoint DCNv2 weights:
 ./script/build_and_run.sh --transcode-sbs-30-tiled /path/to/input.mov /path/to/output.mov
 ./script/build_and_run.sh --restore-sbs-video /path/to/input.mov /path/to/output.mov
 ./script/build_and_run.sh --restore-sbs-eye /path/to/input.mov left /path/to/left.mov
+./script/build_and_run.sh --restore-eye-video /path/to/one-eye.mov /path/to/restored-eye.mov
+./script/restore_vr_eye_segments.sh /path/to/input.mov left /path/to/restored-left.mov
 ./script/restore_vr_sbs.sh /path/to/input.mov /path/to/restored-vr.mp4
 ```
 
@@ -155,6 +157,30 @@ The final merge copies audio and ordinary container metadata. Injection of
 Spherical Video `st3d`/`sv3d` atoms is not implemented yet, so players may need
 the output manually identified as left-right SBS VR. Sparse mosaic detection
 and region-only restoration remain the next performance step.
+
+For the lower-risk physical-file workflow, test one eye first with
+`restore_vr_eye_segments.sh`. It decodes and crops the selected SBS half into
+real, persistent 30 fps HEVC source files of 60 seconds each, restores each
+file independently, and joins the completed restored segments without another
+encode. Every source segment, restored segment, completion marker, model cache,
+and log stays beside the requested output. Re-running the same command skips
+completed segments and resumes only the incomplete segment:
+
+```sh
+./script/restore_vr_eye_segments.sh \
+  /path/to/input_30fps.mp4 left /path/to/restored-left.mov
+```
+
+The segment length defaults to 60 seconds and can be changed to 120 seconds:
+
+```sh
+JASNA_SEGMENT_SECONDS=120 ./script/restore_vr_eye_segments.sh \
+  /path/to/input_30fps.mp4 left /path/to/restored-left.mov
+```
+
+After the left-eye result has been inspected, run the same command with
+`right` and a different output name. Combining those two eye outputs back into
+SBS is intentionally left for the next validation step.
 
 Each window retains its decoded BGRA frames, writes restored FP16 tiles to
 temporary storage, composites only one full frame at a time, and removes the

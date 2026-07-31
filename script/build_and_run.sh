@@ -20,10 +20,17 @@ case "$MODE" in
     }
     RESTORE_OUTPUT_PATH="$4"
     ;;
+  --restore-eye-video|restore-eye-video)
+    [[ $# -ge 3 ]] || {
+      echo "error: restore-eye-video mode requires input and output paths" >&2
+      exit 2
+    }
+    RESTORE_OUTPUT_PATH="$3"
+    ;;
 esac
 
 case "$MODE" in
-  --restore-sbs-video|restore-sbs-video|--restore-sbs-window|restore-sbs-window|--restore-sbs-eye|restore-sbs-eye)
+  --restore-sbs-video|restore-sbs-video|--restore-sbs-window|restore-sbs-window|--restore-sbs-eye|restore-sbs-eye|--restore-eye-video|restore-eye-video)
     RESTORE_OUTPUT_DIR="$(cd "$(dirname "$RESTORE_OUTPUT_PATH")" && pwd)"
     RESTORE_OUTPUT_NAME="$(basename "$RESTORE_OUTPUT_PATH")"
     RESTORE_OUTPUT_STEM="${RESTORE_OUTPUT_NAME%.*}"
@@ -135,6 +142,9 @@ case "$MODE" in
   --restore-sbs-eye|restore-sbs-eye)
     "$APP_BINARY" --restore-sbs-eye "${2:?input video path required}" "${3:?left or right required}" "${4:?output .mov path required}" "$ROOT_DIR/Models/MetalML" "$ROOT_DIR/Models/DeformConv"
     ;;
+  --restore-eye-video|restore-eye-video)
+    "$APP_BINARY" --restore-eye-video "${2:?input video path required}" "${3:?output .mov path required}" "$ROOT_DIR/Models/MetalML" "$ROOT_DIR/Models/DeformConv"
+    ;;
   --diagnose-sbs-tile|diagnose-sbs-tile)
     "$APP_BINARY" --diagnose-sbs-tile "${2:?input video path required}" "${3:?one-based tile number required}" "$ROOT_DIR/Models/MetalML" "$ROOT_DIR/Models/DeformConv"
     ;;
@@ -165,7 +175,7 @@ case "$MODE" in
     done
     ;;
   *)
-    echo "usage: $0 [run|--debug|--logs|--telemetry|--verify|--metal-ml-probe|--metal-ml-benchmark|--metal-ml-interop|--propagation-smoke|--propagation-suite|--reconstruct-frame|--zero-copy-frame|--zero-copy-frame-grouped|--zero-copy-frame-staged|--zero-copy-frame-fused|--spynet-pair|--frame-with-spynet|--temporal-inputs|--three-frame-recurrence|--three-frame-first-pass|--three-frame-four-pass|--variable-clip [frames]|--single-run-clip [frames]|--plan-sbs-video [width height source-fps duration]|--inspect-sbs-video input|--transcode-sbs-30 input output.mov|--transcode-sbs-30-tiled input output.mov|--restore-sbs-video input output.mov|--restore-sbs-eye input left|right output.mov|--diagnose-sbs-tile input tile-number|--metal-ml-suite|--schedule [frames]|--validate-package-graph|--allocate-frame-graph [frames]|--validate-deform-weights|--benchmark-real-weights]" >&2
+    echo "usage: $0 [run|--debug|--logs|--telemetry|--verify|--metal-ml-probe|--metal-ml-benchmark|--metal-ml-interop|--propagation-smoke|--propagation-suite|--reconstruct-frame|--zero-copy-frame|--zero-copy-frame-grouped|--zero-copy-frame-staged|--zero-copy-frame-fused|--spynet-pair|--frame-with-spynet|--temporal-inputs|--three-frame-recurrence|--three-frame-first-pass|--three-frame-four-pass|--variable-clip [frames]|--single-run-clip [frames]|--plan-sbs-video [width height source-fps duration]|--inspect-sbs-video input|--transcode-sbs-30 input output.mov|--transcode-sbs-30-tiled input output.mov|--restore-sbs-video input output.mov|--restore-sbs-eye input left|right output.mov|--restore-eye-video input output.mov|--diagnose-sbs-tile input tile-number|--metal-ml-suite|--schedule [frames]|--validate-package-graph|--allocate-frame-graph [frames]|--validate-deform-weights|--benchmark-real-weights]" >&2
     exit 2
     ;;
 esac

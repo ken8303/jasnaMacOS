@@ -486,6 +486,30 @@ do {
         print("Tile cache:     \(String(format: "%.2f", Double(result.cacheBytes) / 1_048_576)) MiB")
         print("Output:         \(CommandLine.arguments[restoreEyeIndex + 3])")
     }
+    if let restoreSingleEyeIndex = CommandLine.arguments.firstIndex(of: "--restore-eye-video") {
+        guard CommandLine.arguments.indices.contains(restoreSingleEyeIndex + 4) else {
+            throw DeformConvError.commandFailed(
+                "--restore-eye-video requires input, output, MetalML, and DeformConv paths"
+            )
+        }
+        guard #available(macOS 27.0, *) else {
+            throw DeformConvError.commandFailed("single-eye restoration requires macOS 27")
+        }
+        let result = try await SideBySideRestoration.restoreSingleEyeVideo(
+            device: runner.device,
+            inputURL: URL(fileURLWithPath: CommandLine.arguments[restoreSingleEyeIndex + 1]),
+            outputURL: URL(fileURLWithPath: CommandLine.arguments[restoreSingleEyeIndex + 2]),
+            modelsURL: URL(fileURLWithPath: CommandLine.arguments[restoreSingleEyeIndex + 3]),
+            weightsURL: URL(fileURLWithPath: CommandLine.arguments[restoreSingleEyeIndex + 4])
+        )
+        print("Metal-restored single-eye video: PASS")
+        print("Canvas:         \(result.output.dimensions.width)×\(result.output.dimensions.height)")
+        print("Frames/windows: \(result.frameCount) / \(result.windowCount)")
+        print("Tiles/window:   \(result.tileCount)")
+        print("GPU graph time: \(String(format: "%.3f", result.gpuMilliseconds)) ms")
+        print("Tile cache:     \(String(format: "%.2f", Double(result.cacheBytes) / 1_048_576)) MiB")
+        print("Output:         \(CommandLine.arguments[restoreSingleEyeIndex + 2])")
+    }
     if let diagnoseIndex = CommandLine.arguments.firstIndex(of: "--diagnose-sbs-tile") {
         guard CommandLine.arguments.indices.contains(diagnoseIndex + 4),
               let tileNumber = Int(CommandLine.arguments[diagnoseIndex + 2])

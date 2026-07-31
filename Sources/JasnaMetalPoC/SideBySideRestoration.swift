@@ -84,6 +84,34 @@ enum SideBySideRestoration {
         )
     }
 
+    static func restoreSingleEyeVideo(
+        device: MTLDevice,
+        inputURL: URL,
+        outputURL: URL,
+        modelsURL: URL,
+        weightsURL: URL
+    ) async throws -> SideBySideRestorationResult {
+        let inputInfo = try await SideBySideVideoIO.inspect(url: inputURL)
+        let plan = try SideBySideVideoPlan(
+            width: inputInfo.dimensions.width,
+            height: inputInfo.dimensions.height,
+            sourceFramesPerSecond: inputInfo.nominalFramesPerSecond,
+            durationSeconds: inputInfo.durationSeconds,
+            eyeLayout: .singleEye
+        )
+        return try await restorePlannedVideo(
+            device: device,
+            inputURL: inputURL,
+            outputURL: outputURL,
+            modelsURL: modelsURL,
+            weightsURL: weightsURL,
+            inputInfo: inputInfo,
+            plan: plan,
+            cropX: 0,
+            description: "single eye"
+        )
+    }
+
     private static func restorePlannedVideo(
         device: MTLDevice,
         inputURL: URL,
