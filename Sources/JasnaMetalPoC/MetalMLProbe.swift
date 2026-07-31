@@ -109,24 +109,28 @@ func makeMetalMLPipeline(
     device: MTLDevice,
     packageURL: URL
 ) throws -> any MTL4MachineLearningPipelineState {
-    let library = try device.makeLibrary(URL: packageURL)
+    try MetalResourceCache.shared.machineLearningPipeline(
+        device: device, packageURL: packageURL
+    ) {
+        let library = try device.makeLibrary(URL: packageURL)
 
-    let function = MTL4LibraryFunctionDescriptor()
-    function.name = "main"
-    function.library = library
+        let function = MTL4LibraryFunctionDescriptor()
+        function.name = "main"
+        function.library = library
 
-    let options = MTL4PipelineOptions()
-    options.shaderReflection = [.bindingInfo, .bufferTypeInfo]
+        let options = MTL4PipelineOptions()
+        options.shaderReflection = [.bindingInfo, .bufferTypeInfo]
 
-    let descriptor = MTL4MachineLearningPipelineDescriptor()
-    descriptor.label = packageURL.deletingPathExtension().lastPathComponent
-    descriptor.machineLearningFunctionDescriptor = function
-    descriptor.options = options
+        let descriptor = MTL4MachineLearningPipelineDescriptor()
+        descriptor.label = packageURL.deletingPathExtension().lastPathComponent
+        descriptor.machineLearningFunctionDescriptor = function
+        descriptor.options = options
 
-    let compilerDescriptor = MTL4CompilerDescriptor()
-    compilerDescriptor.label = "Jasna Metal ML probe"
-    let compiler = try device.makeCompiler(descriptor: compilerDescriptor)
-    return try compiler.makeMachineLearningPipelineState(descriptor: descriptor)
+        let compilerDescriptor = MTL4CompilerDescriptor()
+        compilerDescriptor.label = "Jasna Metal ML probe"
+        let compiler = try device.makeCompiler(descriptor: compilerDescriptor)
+        return try compiler.makeMachineLearningPipelineState(descriptor: descriptor)
+    }
 }
 
 @available(macOS 26.0, *)

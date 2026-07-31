@@ -52,6 +52,7 @@ struct TileFrameAccumulator {
 
     mutating func accumulate(tile: VideoTile, planarRGB: [Float16]) throws {
         let tilePlane = tile.width * tile.height
+        let outputPlane = dimensions.pixelCount
         guard planarRGB.count == 3 * tilePlane,
               tile.x >= 0,
               tile.y >= 0,
@@ -59,38 +60,44 @@ struct TileFrameAccumulator {
               tile.y + tile.height <= dimensions.height
         else { throw DeformConvError.invalidShape }
 
-        for localY in 0..<tile.height {
-            let vertical = Self.axisWeight(
-                position: localY,
+        let horizontalWeights = (0..<tile.width).map {
+            Self.axisWeight(
+                position: $0,
+                length: tile.width,
+                leadingOverlap: tile.leftOverlap,
+                trailingOverlap: tile.rightOverlap
+            )
+        }
+        let verticalWeights = (0..<tile.height).map {
+            Self.axisWeight(
+                position: $0,
                 length: tile.height,
                 leadingOverlap: tile.topOverlap,
                 trailingOverlap: tile.bottomOverlap
             )
+        }
+        for localY in 0..<tile.height {
+            let vertical = verticalWeights[localY]
             for localX in 0..<tile.width {
-                let horizontal = Self.axisWeight(
-                    position: localX,
-                    length: tile.width,
-                    leadingOverlap: tile.leftOverlap,
-                    trailingOverlap: tile.rightOverlap
-                )
-                let weight = horizontal * vertical
+                let weight = horizontalWeights[localX] * vertical
                 let source = localY * tile.width + localX
                 let destination = (tile.y + localY) * dimensions.width + tile.x + localX
                 weights[destination] += weight
-                for channel in 0..<3 {
-                    colors[channel * dimensions.pixelCount + destination]
-                        += Float(planarRGB[channel * tilePlane + source]) * weight
-                }
+                colors[destination] += Float(planarRGB[source]) * weight
+                colors[outputPlane + destination]
+                    += Float(planarRGB[tilePlane + source]) * weight
+                colors[2 * outputPlane + destination]
+                    += Float(planarRGB[2 * tilePlane + source]) * weight
             }
         }
     }
 
     func makeBGRABytes() throws -> [UInt8] {
-        guard weights.allSatisfy({ $0 > 0 }) else {
-            throw DeformConvError.commandFailed("tile blend left uncovered output pixels")
-        }
         var output = [UInt8](repeating: 255, count: dimensions.pixelCount * 4)
         for pixel in 0..<dimensions.pixelCount {
+            guard weights[pixel] > 0 else {
+                throw DeformConvError.commandFailed("tile blend left uncovered output pixels")
+            }
             let inverseWeight = 1 / weights[pixel]
             let red = colors[pixel] * inverseWeight
             let green = colors[dimensions.pixelCount + pixel] * inverseWeight

@@ -161,10 +161,11 @@ and region-only restoration remain the next performance step.
 For the lower-risk physical-file workflow, test one eye first with
 `restore_vr_eye_segments.sh`. It decodes and crops the selected SBS half into
 real, persistent 30 fps HEVC source files of 60 seconds each, restores each
-file independently, and joins the completed restored segments without another
-encode. Every source segment, restored segment, completion marker, model cache,
-and log stays beside the requested output. Re-running the same command skips
-completed segments and resumes only the incomplete segment:
+file as independently validated one-second model-window movies, and joins the
+completed windows and restored segments without another encode. Every source
+segment, one-second restored window, restored segment, completion marker, model
+cache, and log stays beside the requested output. Re-running the same command
+skips completed one-second windows and resumes only the incomplete window:
 
 ```sh
 ./script/restore_vr_eye_segments.sh \
@@ -181,6 +182,16 @@ JASNA_SEGMENT_SECONDS=120 ./script/restore_vr_eye_segments.sh \
 After the left-eye result has been inspected, run the same command with
 `right` and a different output name. Combining those two eye outputs back into
 SBS is intentionally left for the next validation step.
+
+Restoration commands use an optimized Swift release binary. Metal ML pipeline
+states, the compiled Metal shader library, and DCNv2 weight buffers are cached
+inside the process and reused across tiles. A four-tile 768×256 production
+smoke test reduced warm per-tile wall time from about six seconds to about one
+second while retaining approximately 0.37-second GPU graph time. The same test
+encoded 30 composited frames in about 0.07 seconds. The encoder disables frame
+reordering so independently completed windows concatenate at exactly 30 fps;
+a 33-frame partial-window test produced exactly 1.100000 seconds and resumed by
+skipping both validated window files.
 
 Each window retains its decoded BGRA frames, writes restored FP16 tiles to
 temporary storage, composites only one full frame at a time, and removes the

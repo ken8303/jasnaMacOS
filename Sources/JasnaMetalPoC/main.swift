@@ -510,6 +510,30 @@ do {
         print("Tile cache:     \(String(format: "%.2f", Double(result.cacheBytes) / 1_048_576)) MiB")
         print("Output:         \(CommandLine.arguments[restoreSingleEyeIndex + 2])")
     }
+    if let restoreWindowsIndex = CommandLine.arguments.firstIndex(of: "--restore-eye-windows") {
+        guard CommandLine.arguments.indices.contains(restoreWindowsIndex + 4) else {
+            throw DeformConvError.commandFailed(
+                "--restore-eye-windows requires input, output directory, MetalML, "
+                    + "and DeformConv paths"
+            )
+        }
+        guard #available(macOS 27.0, *) else {
+            throw DeformConvError.commandFailed("windowed eye restoration requires macOS 27")
+        }
+        let count = try await SideBySideRestoration.restoreSingleEyeVideoWindows(
+            device: runner.device,
+            inputURL: URL(fileURLWithPath: CommandLine.arguments[restoreWindowsIndex + 1]),
+            windowsDirectoryURL: URL(
+                fileURLWithPath: CommandLine.arguments[restoreWindowsIndex + 2],
+                isDirectory: true
+            ),
+            modelsURL: URL(fileURLWithPath: CommandLine.arguments[restoreWindowsIndex + 3]),
+            weightsURL: URL(fileURLWithPath: CommandLine.arguments[restoreWindowsIndex + 4])
+        )
+        print("Restartable single-eye windows: PASS")
+        print("Completed windows: \(count)")
+        print("Output directory:  \(CommandLine.arguments[restoreWindowsIndex + 2])")
+    }
     if let diagnoseIndex = CommandLine.arguments.firstIndex(of: "--diagnose-sbs-tile") {
         guard CommandLine.arguments.indices.contains(diagnoseIndex + 4),
               let tileNumber = Int(CommandLine.arguments[diagnoseIndex + 2])

@@ -126,7 +126,7 @@ video_duration_matches() {
   local candidate_duration
   candidate_duration="$(video_duration "$candidate")" || return 1
   /usr/bin/awk -v expected="$expected" -v candidate="$candidate_duration" \
-    'BEGIN { delta = expected - candidate; if (delta < 0) delta = -delta; exit !(delta <= 0.05) }'
+    'BEGIN { delta = expected - candidate; if (delta < 0) delta = -delta; exit !(delta <= 0.01) }'
 }
 
 completed_eye_output() {
@@ -187,6 +187,9 @@ for SOURCE_SEGMENT in "${SOURCE_SEGMENTS[@]}"; do
   RESTORED_SEGMENT="$RESTORED_DIR/${SEGMENT_STEM}-restored.mov"
   SEGMENT_DONE="$RESTORED_DIR/${SEGMENT_STEM}.done"
   SEGMENT_CACHE="$CACHE_DIR/$SEGMENT_STEM.jasna-work"
+  SEGMENT_WINDOWS="$RESTORED_DIR/${SEGMENT_STEM}.windows"
+  SEGMENT_MANIFEST="$RESTORED_DIR/${SEGMENT_STEM}-windows.txt"
+  TEMP_RESTORED_SEGMENT="$RESTORED_DIR/.${SEGMENT_STEM}-joining.mov"
   SEGMENT_DURATION="$(video_duration "$SOURCE_SEGMENT")"
 
   if [[ ! -f "$SEGMENT_DONE" ]] && video_duration_matches "$RESTORED_SEGMENT" "$SEGMENT_DURATION"; then
@@ -196,14 +199,45 @@ for SOURCE_SEGMENT in "${SOURCE_SEGMENTS[@]}"; do
 
   if [[ ! -f "$SEGMENT_DONE" ]]; then
     echo "Restoring $SEGMENT_NAME (${SEGMENT_DURATION}s)"
-    mkdir -p "$SEGMENT_CACHE"
+    mkdir -p "$SEGMENT_CACHE" "$SEGMENT_WINDOWS"
     JASNA_WORK_DIR="$SEGMENT_CACHE" \
-      "$ROOT_DIR/script/build_and_run.sh" --restore-eye-video \
-        "$SOURCE_SEGMENT" "$RESTORED_SEGMENT"
-    video_duration_matches "$RESTORED_SEGMENT" "$SEGMENT_DURATION" || {
+      "$ROOT_DIR/script/build_and_run.sh" --restore-eye-windows \
+        "$SOURCE_SEGMENT" "$SEGMENT_WINDOWS"
+
+    WINDOW_OUTPUTS=("$SEGMENT_WINDOWS"/window-[0-9][0-9][0-9][0-9][0-9].mov)
+    [[ -e "${WINDOW_OUTPUTS[0]}" ]] || {
+      echo "error: no restored windows were produced for $SEGMENT_NAME" >&2
+      exit 1
+    }
+    : > "$SEGMENT_MANIFEST"
+    for WINDOW_OUTPUT in "${WINDOW_OUTPUTS[@]}"; do
+      ESCAPED_WINDOW="${WINDOW_OUTPUT//\'/\'\\\'\'}"
+      printf "file '%s'\n" "$ESCAPED_WINDOW" >> "$SEGMENT_MANIFEST"
+    done
+    if [[ -e "$TEMP_RESTORED_SEGMENT" ]]; then
+      TEMP_SEGMENT_ARCHIVE="$RESTORED_DIR/${SEGMENT_STEM}-joining.interrupted-$(date '+%Y%m%d-%H%M%S').mov"
+      mv "$TEMP_RESTORED_SEGMENT" "$TEMP_SEGMENT_ARCHIVE"
+    fi
+    "$FFMPEG_PATH" \
+      -hide_banner \
+      -f concat \
+      -safe 0 \
+      -i "$SEGMENT_MANIFEST" \
+      -map '0:v:0' \
+      -c copy \
+      -movflags +faststart \
+      -n \
+      "$TEMP_RESTORED_SEGMENT"
+    video_duration_matches "$TEMP_RESTORED_SEGMENT" "$SEGMENT_DURATION" || {
       echo "error: restored duration does not match $SEGMENT_NAME" >&2
       exit 1
     }
+    if [[ -e "$RESTORED_SEGMENT" ]]; then
+      PREVIOUS_SEGMENT="$RESTORED_DIR/${SEGMENT_STEM}-restored.previous-$(date '+%Y%m%d-%H%M%S').mov"
+      mv "$RESTORED_SEGMENT" "$PREVIOUS_SEGMENT"
+      echo "Archived previous restored segment: $PREVIOUS_SEGMENT"
+    fi
+    mv "$TEMP_RESTORED_SEGMENT" "$RESTORED_SEGMENT"
     /usr/bin/touch "$SEGMENT_DONE"
   else
     echo "Skipping completed segment: $SEGMENT_NAME"

@@ -112,6 +112,129 @@ enum SideBySideRestoration {
         )
     }
 
+    static func restoreSingleEyeVideoWindows(
+        device: MTLDevice,
+        inputURL: URL,
+        windowsDirectoryURL: URL,
+        modelsURL: URL,
+        weightsURL: URL
+    ) async throws -> Int {
+        let inputInfo = try await SideBySideVideoIO.inspect(url: inputURL)
+        let plan = try SideBySideVideoPlan(
+            width: inputInfo.dimensions.width,
+            height: inputInfo.dimensions.height,
+            sourceFramesPerSecond: inputInfo.nominalFramesPerSecond,
+            durationSeconds: inputInfo.durationSeconds,
+            eyeLayout: .singleEye
+        )
+        try FileManager.default.createDirectory(
+            at: windowsDirectoryURL, withIntermediateDirectories: true
+        )
+        report(
+            "Restartable single-eye plan: \(plan.dimensions.width)×\(plan.dimensions.height), "
+                + "\(plan.frameRate.outputFrameCount) frames, "
+                + "\(plan.temporalWindowCount) independently encoded windows"
+        )
+        let decoder = try await FrameDecoder(
+            inputURL: inputURL,
+            plan: plan,
+            sourceDimensions: inputInfo.dimensions,
+            cropX: 0
+        )
+        var completedWindows = 0
+        for (windowIndex, outputCount) in plan.temporalWindowFrameCounts.enumerated() {
+            let windowStart = windowIndex * SideBySideVideoPlan.temporalWindowFrames
+            let outputURL = windowsDirectoryURL.appendingPathComponent(
+                String(format: "window-%05d.mov", windowIndex + 1)
+            )
+            if await validWindowOutput(
+                outputURL,
+                dimensions: plan.dimensions,
+                frameCount: outputCount
+            ) {
+                report(
+                    "Window \(windowIndex + 1)/\(plan.temporalWindowCount): "
+                        + "encoded output already complete"
+                )
+                completedWindows += 1
+                continue
+            }
+            if FileManager.default.fileExists(atPath: outputURL.path) {
+                let archived = try archiveInterruptedOutput(outputURL)
+                report(
+                    "Window \(windowIndex + 1)/\(plan.temporalWindowCount): "
+                        + "archived incomplete output at \(archived.path)"
+                )
+            }
+
+            report(
+                "Window \(windowIndex + 1)/\(plan.temporalWindowCount): decoding "
+                    + "\(outputCount) output frames from frame \(windowStart)"
+            )
+            var decoded = try (0..<outputCount).map {
+                try decoder.copyFrame(outputIndex: windowStart + $0)
+            }
+            let attachments = decoded.map { CVBufferCopyAttachments($0, .shouldPropagate) }
+            while decoded.count < 3 {
+                guard let last = decoded.last else { throw DeformConvError.invalidShape }
+                decoded.append(last)
+            }
+            let window = try processWindow(
+                device: device,
+                plan: plan,
+                decodedFrames: decoded,
+                outputCount: outputCount,
+                windowIndex: windowIndex,
+                windowCount: plan.temporalWindowCount,
+                modelsURL: modelsURL,
+                weightsURL: weightsURL
+            )
+            let writer = try RestoredFrameWriter(outputURL: outputURL, plan: plan)
+            try await writer.appendCachedFrames(
+                cacheURLs: window.cacheURLs,
+                attachments: attachments,
+                startFrame: 0,
+                progressStartFrame: windowStart,
+                plan: plan
+            )
+            try await writer.finish()
+            guard await validWindowOutput(
+                outputURL,
+                dimensions: plan.dimensions,
+                frameCount: outputCount
+            ) else {
+                throw DeformConvError.commandFailed(
+                    "encoded window \(windowIndex + 1) failed validation"
+                )
+            }
+            try FileManager.default.removeItem(at: window.cacheDirectory)
+            completedWindows += 1
+            report(
+                "Window \(windowIndex + 1)/\(plan.temporalWindowCount): "
+                    + "encoded, validated, and cache removed"
+            )
+        }
+        return completedWindows
+    }
+
+    private static func validWindowOutput(
+        _ url: URL,
+        dimensions: VideoDimensions,
+        frameCount: Int
+    ) async -> Bool {
+        guard FileManager.default.fileExists(atPath: url.path), frameCount > 0 else {
+            return false
+        }
+        do {
+            let info = try await SideBySideVideoIO.inspect(url: url)
+            return info.dimensions == dimensions
+                && abs(info.nominalFramesPerSecond - 30) < 0.01
+                && abs(info.durationSeconds - Double(frameCount) / 30) < 0.01
+        } catch {
+            return false
+        }
+    }
+
     private static func restorePlannedVideo(
         device: MTLDevice,
         inputURL: URL,
@@ -795,6 +918,7 @@ enum SideBySideRestoration {
                         AVVideoAverageBitRateKey: bitRate,
                         AVVideoExpectedSourceFrameRateKey: 30,
                         AVVideoMaxKeyFrameIntervalKey: 60,
+                        AVVideoAllowFrameReorderingKey: false,
                     ],
                 ]
             )
@@ -821,9 +945,20 @@ enum SideBySideRestoration {
             cacheURLs: [URL],
             attachments: [CFDictionary?],
             startFrame: Int,
+            progressStartFrame: Int? = nil,
             plan: SideBySideVideoPlan
         ) async throws {
+            report(
+                "Compositing and encoding \(cacheURLs.count) cached frame(s) "
+                    + "starting at output frame \(startFrame)"
+            )
             for localFrame in cacheURLs.indices {
+                let frameStarted = Date()
+                let progressFrame = (progressStartFrame ?? startFrame) + localFrame
+                report(
+                    "Compositing output frame \(progressFrame + 1)/"
+                        + "\(plan.frameRate.outputFrameCount)"
+                )
                 let cache = try FileHandle(forReadingFrom: cacheURLs[localFrame])
                 var accumulator = try TileFrameAccumulator(dimensions: plan.dimensions)
                 for tile in plan.tiles {
@@ -860,6 +995,11 @@ enum SideBySideRestoration {
                     throw writer.error
                         ?? DeformConvError.commandFailed("failed encoding frame \(outputFrame)")
                 }
+                report(
+                    "Queued output frame \(progressFrame + 1)/"
+                        + "\(plan.frameRate.outputFrameCount) in "
+                        + "\(String(format: "%.3f", Date().timeIntervalSince(frameStarted))) s"
+                )
             }
         }
 

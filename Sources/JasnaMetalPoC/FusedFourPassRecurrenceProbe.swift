@@ -166,7 +166,9 @@ func verifyFusedFourPassRecurrence(
     let frameElementsBuffer = try Support.makeConstant(device: device, value: &frameElementsValue)
     let deformShapeBuffer = try Support.makeConstant(device: device, value: &deformShape)
 
-    let library = try device.makeLibrary(source: MetalShader.source, options: nil)
+    let library = try MetalResourceCache.shared.shaderLibrary(device: device) {
+        try device.makeLibrary(source: MetalShader.source, options: nil)
+    }
     guard let accumulateFunction = library.makeFunction(name: "accumulate_second_order_flow_fp16"),
           let prepareFunction = library.makeFunction(name: "assemble_temporal_alignment_fp16"),
           let transformFunction = library.makeFunction(name: "prepare_dcn_offsets_fp16"),
@@ -219,10 +221,11 @@ func verifyFusedFourPassRecurrence(
             device: device, dimensions: [64, 64, backboneInputChannels, 1]
         )
         heldTensors.append(backboneInputTensor)
-        let checkpoint = try DeformConvWeightSet(
+        let checkpoint = try MetalResourceCache.shared.deformConvWeightBuffers(
+            device: device,
             direction: name,
             url: weightsURL.appendingPathComponent("\(name).dcnfp16")
-        ).makeBuffers(device: device)
+        )
         var branchIndexValue = UInt32(branchIndex)
         let branchIndexBuffer = try Support.makeConstant(device: device, value: &branchIndexValue)
         branchIndexBuffers.append(branchIndexBuffer)
