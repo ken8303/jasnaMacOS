@@ -82,6 +82,8 @@ real offset and backbone packages plus the checkpoint DCNv2 weights:
 ./script/build_and_run.sh --transcode-sbs-30 /path/to/input.mov /path/to/output.mov
 ./script/build_and_run.sh --transcode-sbs-30-tiled /path/to/input.mov /path/to/output.mov
 ./script/build_and_run.sh --restore-sbs-video /path/to/input.mov /path/to/output.mov
+./script/build_and_run.sh --restore-sbs-eye /path/to/input.mov left /path/to/left.mov
+./script/restore_vr_sbs.sh /path/to/input.mov /path/to/restored-vr.mp4
 ```
 
 The side-by-side planner takes `width height source-fps duration-seconds`.
@@ -126,6 +128,33 @@ A two-second smoke run produced 60 frames in two windows at exactly 30 fps and
 passed: its final one-frame window was padded internally to the graph's
 three-frame minimum, while only the real frame was encoded, yielding exactly
 31 frames and 1.033333 seconds.
+
+For full SBS VR, `restore_vr_sbs.sh` now runs a restartable sequential-eye
+workflow. It decodes the source directly but retains only one cropped eye's
+30-frame window, restores and encodes the complete left-eye movie, releases
+that work, then does the right eye. Finally it stacks the two restored eye
+streams and copies the original audio into one SBS HEVC output. It does not
+create lossy raw-eye intermediates before restoration. For an 8192×4096 input,
+each active eye plan is 4096×4096 with 361 tiles and about 3.96 GiB of FP16
+cache, instead of 722 tiles and about 7.93 GiB in one window. Total model work
+is unchanged; this phase reduces peak memory and storage pressure rather than
+runtime.
+
+The orchestrator keeps `left-restored.mov`, `right-restored.mov`, stage markers,
+logs, and independent resumable caches under `<output>.vr-work/`. A stopped run
+continues the incomplete eye and skips an eye already marked complete. If a
+compatible older full-SBS cache is still available, its left-eye tile prefix
+can be reused explicitly:
+
+```sh
+JASNA_LEFT_WORK_DIR=/path/to/old.jasna-work \
+  ./script/restore_vr_sbs.sh input_30fps.mp4 restored-vr.mp4
+```
+
+The final merge copies audio and ordinary container metadata. Injection of
+Spherical Video `st3d`/`sv3d` atoms is not implemented yet, so players may need
+the output manually identified as left-right SBS VR. Sparse mosaic detection
+and region-only restoration remain the next performance step.
 
 Each window retains its decoded BGRA frames, writes restored FP16 tiles to
 temporary storage, composites only one full frame at a time, and removes the

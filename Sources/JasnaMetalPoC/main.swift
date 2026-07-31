@@ -458,6 +458,34 @@ do {
         print("Tile cache:     \(String(format: "%.2f", Double(result.cacheBytes) / 1_048_576)) MiB")
         print("Output:         \(CommandLine.arguments[restoreIndex + 2])")
     }
+    if let restoreEyeIndex = CommandLine.arguments.firstIndex(of: "--restore-sbs-eye") {
+        guard CommandLine.arguments.indices.contains(restoreEyeIndex + 5),
+              let eye = SideBySideEye(rawValue: CommandLine.arguments[restoreEyeIndex + 2])
+        else {
+            throw DeformConvError.commandFailed(
+                "--restore-sbs-eye requires input, left|right, output, MetalML, "
+                    + "and DeformConv paths"
+            )
+        }
+        guard #available(macOS 27.0, *) else {
+            throw DeformConvError.commandFailed("restored SBS eye video requires macOS 27")
+        }
+        let result = try await SideBySideRestoration.restoreEyeVideo(
+            device: runner.device,
+            inputURL: URL(fileURLWithPath: CommandLine.arguments[restoreEyeIndex + 1]),
+            eye: eye,
+            outputURL: URL(fileURLWithPath: CommandLine.arguments[restoreEyeIndex + 3]),
+            modelsURL: URL(fileURLWithPath: CommandLine.arguments[restoreEyeIndex + 4]),
+            weightsURL: URL(fileURLWithPath: CommandLine.arguments[restoreEyeIndex + 5])
+        )
+        print("Metal-restored SBS \(eye.rawValue) eye: PASS")
+        print("Canvas:         \(result.output.dimensions.width)×\(result.output.dimensions.height)")
+        print("Frames/windows: \(result.frameCount) / \(result.windowCount)")
+        print("Tiles/window:   \(result.tileCount)")
+        print("GPU graph time: \(String(format: "%.3f", result.gpuMilliseconds)) ms")
+        print("Tile cache:     \(String(format: "%.2f", Double(result.cacheBytes) / 1_048_576)) MiB")
+        print("Output:         \(CommandLine.arguments[restoreEyeIndex + 3])")
+    }
     if let diagnoseIndex = CommandLine.arguments.firstIndex(of: "--diagnose-sbs-tile") {
         guard CommandLine.arguments.indices.contains(diagnoseIndex + 4),
               let tileNumber = Int(CommandLine.arguments[diagnoseIndex + 2])

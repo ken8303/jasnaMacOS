@@ -13,6 +13,11 @@ struct SideBySideRestorationResult: Sendable {
     let cacheBytes: Int
 }
 
+enum SideBySideEye: String, Sendable {
+    case left
+    case right
+}
+
 @available(macOS 27.0, *)
 enum SideBySideRestoration {
     private static let tileElements = 3 * SideBySideVideoPlan.modelTileSize
@@ -26,13 +31,6 @@ enum SideBySideRestoration {
         modelsURL: URL,
         weightsURL: URL
     ) async throws -> SideBySideRestorationResult {
-        if FileManager.default.fileExists(atPath: outputURL.path) {
-            guard try hasInterruptedWindowCache() else {
-                throw DeformConvError.commandFailed("output already exists: \(outputURL.path)")
-            }
-            let archivedURL = try archiveInterruptedOutput(outputURL)
-            report("Archived interrupted output at \(archivedURL.path)")
-        }
         let inputInfo = try await SideBySideVideoIO.inspect(url: inputURL)
         let plan = try SideBySideVideoPlan(
             width: inputInfo.dimensions.width,
@@ -40,15 +38,85 @@ enum SideBySideRestoration {
             sourceFramesPerSecond: inputInfo.nominalFramesPerSecond,
             durationSeconds: inputInfo.durationSeconds
         )
+        return try await restorePlannedVideo(
+            device: device,
+            inputURL: inputURL,
+            outputURL: outputURL,
+            modelsURL: modelsURL,
+            weightsURL: weightsURL,
+            inputInfo: inputInfo,
+            plan: plan,
+            cropX: 0,
+            description: "side-by-side"
+        )
+    }
+
+    static func restoreEyeVideo(
+        device: MTLDevice,
+        inputURL: URL,
+        eye: SideBySideEye,
+        outputURL: URL,
+        modelsURL: URL,
+        weightsURL: URL
+    ) async throws -> SideBySideRestorationResult {
+        let inputInfo = try await SideBySideVideoIO.inspect(url: inputURL)
+        guard inputInfo.dimensions.width.isMultiple(of: 2) else {
+            throw DeformConvError.commandFailed("SBS input width must be even")
+        }
+        let eyeWidth = inputInfo.dimensions.width / 2
+        let plan = try SideBySideVideoPlan(
+            width: eyeWidth,
+            height: inputInfo.dimensions.height,
+            sourceFramesPerSecond: inputInfo.nominalFramesPerSecond,
+            durationSeconds: inputInfo.durationSeconds,
+            eyeLayout: .singleEye
+        )
+        return try await restorePlannedVideo(
+            device: device,
+            inputURL: inputURL,
+            outputURL: outputURL,
+            modelsURL: modelsURL,
+            weightsURL: weightsURL,
+            inputInfo: inputInfo,
+            plan: plan,
+            cropX: eye == .left ? 0 : eyeWidth,
+            description: "\(eye.rawValue) eye"
+        )
+    }
+
+    private static func restorePlannedVideo(
+        device: MTLDevice,
+        inputURL: URL,
+        outputURL: URL,
+        modelsURL: URL,
+        weightsURL: URL,
+        inputInfo: VideoAssetInfo,
+        plan: SideBySideVideoPlan,
+        cropX: Int,
+        description: String
+    ) async throws -> SideBySideRestorationResult {
+        if FileManager.default.fileExists(atPath: outputURL.path) {
+            guard try hasInterruptedWindowCache() else {
+                throw DeformConvError.commandFailed("output already exists: \(outputURL.path)")
+            }
+            let archivedURL = try archiveInterruptedOutput(outputURL)
+            report("Archived interrupted output at \(archivedURL.path)")
+        }
         report(
-            "Restoration plan: \(plan.dimensions.width)×\(plan.dimensions.height), "
+            "Restoration plan (\(description)): "
+                + "\(plan.dimensions.width)×\(plan.dimensions.height), "
                 + "\(plan.frameRate.outputFrameCount) frames, "
                 + "\(plan.temporalWindowCount) windows, \(plan.tiles.count) tiles/window"
         )
         if let workDirectory = ProcessInfo.processInfo.environment["JASNA_WORK_DIR"] {
             report("Persistent work directory: \(workDirectory)")
         }
-        let decoder = try await FrameDecoder(inputURL: inputURL, plan: plan)
+        let decoder = try await FrameDecoder(
+            inputURL: inputURL,
+            plan: plan,
+            sourceDimensions: inputInfo.dimensions,
+            cropX: cropX
+        )
         let writer = try RestoredFrameWriter(outputURL: outputURL, plan: plan)
         var totalGPU: Double = 0
         var peakCacheBytes = 0
@@ -95,7 +163,7 @@ enum SideBySideRestoration {
         report("Restoration writer completed \(plan.frameRate.outputFrameCount) frames")
 
         let outputInfo = try await SideBySideVideoIO.inspect(url: outputURL)
-        guard outputInfo.dimensions == inputInfo.dimensions,
+        guard outputInfo.dimensions == plan.dimensions,
               abs(outputInfo.nominalFramesPerSecond - 30) < 0.01
         else {
             throw DeformConvError.commandFailed("restored video metadata validation failed")
@@ -551,18 +619,33 @@ enum SideBySideRestoration {
         private let reader: AVAssetReader
         private let output: AVAssetReaderTrackOutput
         private let dimensions: VideoDimensions
+        private let cropX: Int
         private var previous: CMSampleBuffer?
         private var next: CMSampleBuffer?
 
-        init(inputURL: URL, plan: SideBySideVideoPlan) async throws {
+        init(
+            inputURL: URL,
+            plan: SideBySideVideoPlan,
+            sourceDimensions: VideoDimensions? = nil,
+            cropX: Int = 0
+        ) async throws {
             let asset = AVURLAsset(url: inputURL)
             guard let track = try await asset.loadTracks(withMediaType: .video).first else {
                 throw DeformConvError.commandFailed("video has no video track")
             }
             let naturalSize = try await track.load(.naturalSize)
-            guard Int(abs(naturalSize.width).rounded()) == plan.dimensions.width,
-                  Int(abs(naturalSize.height).rounded()) == plan.dimensions.height
-            else { throw DeformConvError.commandFailed("rotated video tracks are not supported yet") }
+            let expectedSource = sourceDimensions ?? plan.dimensions
+            guard Int(abs(naturalSize.width).rounded()) == expectedSource.width,
+                  Int(abs(naturalSize.height).rounded()) == expectedSource.height,
+                  cropX >= 0,
+                  cropX + plan.dimensions.width <= expectedSource.width,
+                  plan.dimensions.height == expectedSource.height
+            else {
+                throw DeformConvError.commandFailed(
+                    "video dimensions/crop do not match the restoration plan; "
+                        + "rotated tracks are not supported yet"
+                )
+            }
             reader = try AVAssetReader(asset: asset)
             output = AVAssetReaderTrackOutput(
                 track: track,
@@ -572,6 +655,7 @@ enum SideBySideRestoration {
                 ]
             )
             dimensions = plan.dimensions
+            self.cropX = cropX
             output.alwaysCopiesSampleData = false
             guard reader.canAdd(output) else {
                 throw DeformConvError.commandFailed("video reader rejected BGRA output")
@@ -607,7 +691,7 @@ enum SideBySideRestoration {
                 throw reader.error
                     ?? DeformConvError.commandFailed("decoder ended before frame \(outputIndex)")
             }
-            return try Self.copyBGRA(source, dimensions: dimensions)
+            return try Self.copyBGRA(source, dimensions: dimensions, cropX: cropX)
         }
 
         private static func closest(
@@ -625,7 +709,7 @@ enum SideBySideRestoration {
         }
 
         private static func copyBGRA(
-            _ source: CVPixelBuffer, dimensions: VideoDimensions
+            _ source: CVPixelBuffer, dimensions: VideoDimensions, cropX: Int
         ) throws -> CVPixelBuffer {
             var optionalDestination: CVPixelBuffer?
             let status = CVPixelBufferCreate(
@@ -654,7 +738,9 @@ enum SideBySideRestoration {
             for row in 0..<dimensions.height {
                 memcpy(
                     destinationBase.advanced(by: row * CVPixelBufferGetBytesPerRow(destination)),
-                    sourceBase.advanced(by: row * CVPixelBufferGetBytesPerRow(source)),
+                    sourceBase.advanced(
+                        by: row * CVPixelBufferGetBytesPerRow(source) + cropX * 4
+                    ),
                     dimensions.width * 4
                 )
             }

@@ -47,6 +47,13 @@ private struct TileAxisPlacement: Sendable {
     let trailingOverlap: Int
 }
 
+enum VideoEyeLayout: Equatable, Sendable {
+    case sideBySide
+    case singleEye
+
+    var eyeCount: Int { self == .sideBySide ? 2 : 1 }
+}
+
 struct ConstantFrameRatePlan: Sendable {
     let sourceFramesPerSecond: Double
     let outputFramesPerSecond: Double
@@ -91,6 +98,7 @@ struct SideBySideVideoPlan: Sendable {
 
     let dimensions: VideoDimensions
     let eyeDimensions: VideoDimensions
+    let eyeLayout: VideoEyeLayout
     let overlap: Int
     let tiles: [VideoTile]
     let frameRate: ConstantFrameRatePlan
@@ -100,20 +108,23 @@ struct SideBySideVideoPlan: Sendable {
         height: Int,
         sourceFramesPerSecond: Double,
         durationSeconds: Double,
-        overlap: Int = defaultOverlap
+        overlap: Int = defaultOverlap,
+        eyeLayout: VideoEyeLayout = .sideBySide
     ) throws {
         let tileSize = Self.modelTileSize
+        let eyeWidth = eyeLayout == .sideBySide ? width / 2 : width
         guard width > 0,
               height > 0,
-              width.isMultiple(of: 2),
-              width / 2 >= tileSize,
+              (eyeLayout != .sideBySide || width.isMultiple(of: 2)),
+              eyeWidth >= tileSize,
               height >= tileSize,
               overlap >= 0,
               overlap < tileSize
         else { throw DeformConvError.invalidShape }
 
         dimensions = VideoDimensions(width: width, height: height)
-        eyeDimensions = VideoDimensions(width: width / 2, height: height)
+        eyeDimensions = VideoDimensions(width: eyeWidth, height: height)
+        self.eyeLayout = eyeLayout
         self.overlap = overlap
         frameRate = try ConstantFrameRatePlan(
             sourceFramesPerSecond: sourceFramesPerSecond,
@@ -124,8 +135,8 @@ struct SideBySideVideoPlan: Sendable {
         let xPlacements = try Self.axisPlacements(length: eyeDimensions.width, overlap: overlap)
         let yPlacements = try Self.axisPlacements(length: eyeDimensions.height, overlap: overlap)
         var generated = [VideoTile]()
-        generated.reserveCapacity(2 * xPlacements.count * yPlacements.count)
-        for eye in 0..<2 {
+        generated.reserveCapacity(eyeLayout.eyeCount * xPlacements.count * yPlacements.count)
+        for eye in 0..<eyeLayout.eyeCount {
             let eyeOffset = eye * eyeDimensions.width
             for vertical in yPlacements {
                 for horizontal in xPlacements {
@@ -146,7 +157,7 @@ struct SideBySideVideoPlan: Sendable {
         tiles = generated
     }
 
-    var tilesPerEye: Int { tiles.count / 2 }
+    var tilesPerEye: Int { tiles.count / eyeLayout.eyeCount }
 
     var temporalWindowCount: Int {
         (frameRate.outputFrameCount + Self.temporalWindowFrames - 1)

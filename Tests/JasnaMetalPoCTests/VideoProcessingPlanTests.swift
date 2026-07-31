@@ -76,3 +76,40 @@ import Testing
     #expect(plan.temporalWindowFrameCounts == [30, 1])
     #expect(plan.modelGraphExecutions == 4)
 }
+
+@Test func singleEyeFourKPlanUsesHalfTheSBSWorkingSet() throws {
+    let plan = try SideBySideVideoPlan(
+        width: 4_096,
+        height: 4_096,
+        sourceFramesPerSecond: 30,
+        durationSeconds: 1,
+        eyeLayout: .singleEye
+    )
+
+    #expect(plan.eyeDimensions == VideoDimensions(width: 4_096, height: 4_096))
+    #expect(plan.eyeLayout == .singleEye)
+    #expect(plan.tilesPerEye == 361)
+    #expect(plan.tiles.count == 361)
+    #expect(plan.tiles.allSatisfy { $0.eyeIndex == 0 })
+    #expect(plan.tiles.allSatisfy { $0.x + $0.width <= 4_096 })
+    #expect(plan.tiles.contains { $0.x == 3_840 && $0.y == 3_840 })
+    #expect(plan.modelGraphExecutions == 361)
+}
+
+@Test func singleEyeTilesMatchTheLeftHalfOfAnEightKSBSPlan() throws {
+    let sbs = try SideBySideVideoPlan(
+        width: 8_192,
+        height: 4_096,
+        sourceFramesPerSecond: 30,
+        durationSeconds: 1
+    )
+    let eye = try SideBySideVideoPlan(
+        width: 4_096,
+        height: 4_096,
+        sourceFramesPerSecond: 30,
+        durationSeconds: 1,
+        eyeLayout: .singleEye
+    )
+
+    #expect(Array(sbs.tiles.prefix(eye.tiles.count)) == eye.tiles)
+}
