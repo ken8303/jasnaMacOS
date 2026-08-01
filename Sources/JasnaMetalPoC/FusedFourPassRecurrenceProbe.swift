@@ -695,7 +695,7 @@ func verifyFusedFourPassRecurrence(
                 for index in 0..<featureCount {
                     let value = Float(lastOutputs[branch][frame][index])
                     guard value.isFinite else {
-                        throw DeformConvError.commandFailed(
+                        throw DeformConvError.nonFiniteOutput(
                             "fused recurrence produced a non-finite feature in "
                                 + "\(branchSpecs[branch].0), frame \(frame), element \(index)"
                         )
@@ -732,7 +732,7 @@ func verifyFusedFourPassRecurrence(
         for index in 0..<frameElements {
             let value = Float(lastRestored[frame][index])
             guard value.isFinite else {
-                throw DeformConvError.commandFailed(
+                throw DeformConvError.nonFiniteOutput(
                     "fused graph produced a non-finite output at frame \(frame), element \(index)"
                 )
             }
@@ -762,7 +762,7 @@ func verifyFusedFourPassRecurrence(
             for index in 0..<(2 * plane) {
                 let value = Float(lastFlows[flow][index])
                 guard value.isFinite else {
-                    throw DeformConvError.commandFailed(
+                    throw DeformConvError.nonFiniteOutput(
                         "fused SPyNet produced a non-finite flow \(flow), element \(index)"
                     )
                 }

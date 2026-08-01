@@ -31,3 +31,11 @@ import Testing
     )
     #expect(output == [2, 3, 4, 5])
 }
+
+@Test func onlyNonFiniteModelOutputIsRecoverable() {
+    #expect(DeformConvError.nonFiniteOutput("overflow").isRecoverableNumericalFailure)
+    #expect(!DeformConvError.invalidShape.isRecoverableNumericalFailure)
+    #expect(!DeformConvError.metalUnavailable.isRecoverableNumericalFailure)
+    #expect(!DeformConvError.shaderResourceMissing.isRecoverableNumericalFailure)
+    #expect(!DeformConvError.commandFailed("device lost").isRecoverableNumericalFailure)
+}

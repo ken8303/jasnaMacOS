@@ -966,6 +966,9 @@ enum SideBySideRestoration {
                 maximumFramesPerChunk: inputFrames.count
             )
         } catch {
+            guard let modelError = error as? DeformConvError,
+                  modelError.isRecoverableNumericalFailure
+            else { throw error }
             report(
                 "\(context) failed its full temporal window (\(error)); "
                     + "retrying shorter recurrence chunks"
@@ -986,6 +989,9 @@ enum SideBySideRestoration {
                     )
                     return recovered
                 } catch {
+                    guard let modelError = error as? DeformConvError,
+                          modelError.isRecoverableNumericalFailure
+                    else { throw error }
                     lastError = error
                     report("\(context) also failed with \(chunkSize)-frame chunks (\(error))")
                 }
@@ -1000,6 +1006,9 @@ enum SideBySideRestoration {
                 report("\(context) recovered with independent zero-motion frame triplets")
                 return recovered
             } catch {
+                guard let modelError = error as? DeformConvError,
+                      modelError.isRecoverableNumericalFailure
+                else { throw error }
                 lastError = error
                 report("\(context) also failed independent frame recovery (\(error))")
             }

@@ -167,6 +167,9 @@ sparse wrapper defaults to fisheye projection: each region is flattened before
 restoration, only the restored delta is inverse-projected, and a feathered mask
 places that delta onto the untouched source frame. Set
 `JASNA_VR_PROJECTION=raw` only when comparing against the older flat-crop path.
+The current sparse VR path decodes and encodes 8-bit BGRA/SDR. A Main 10 or HDR
+source therefore does not retain its original bit depth or HDR transfer
+characteristics; do not use this path when HDR preservation is required.
 Detector setup is isolated from Swift:
 
 ```sh
@@ -615,3 +618,9 @@ The exporter reproduces the Metal probe's deterministic FP16 input
 quantization, then saves both FP32 and FP16 restored tensors. Oracle data and
 model weights remain excluded from version control. Replace `--frames` and the
 final output-directory component with `30` or another desired clip length.
+
+## License
+
+This Jasna-derived project is distributed under the GNU Affero General Public
+License version 3. See [LICENSE](LICENSE) and [NOTICE](NOTICE). Downloaded model
+weights and third-party assets remain subject to their respective terms.
