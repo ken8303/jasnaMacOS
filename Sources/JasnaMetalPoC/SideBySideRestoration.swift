@@ -304,7 +304,8 @@ enum SideBySideRestoration {
         manifestURL: URL,
         modelsURL: URL,
         weightsURL: URL,
-        projection: VRMosaicProjection = .raw
+        projection: VRMosaicProjection = .raw,
+        workDirectoryURL: URL? = nil
     ) async throws -> Int {
         let inputInfo = try await SideBySideVideoIO.inspect(url: inputURL)
         let plan = try SideBySideVideoPlan(
@@ -404,7 +405,8 @@ enum SideBySideRestoration {
                 weightsURL: weightsURL,
                 cacheVariant: cacheVariant,
                 projection: projection,
-                samplingMaps: samplingMaps
+                samplingMaps: samplingMaps,
+                workDirectoryURL: workDirectoryURL
             )
             let writer = try RestoredFrameWriter(device: device, outputURL: outputURL, plan: plan)
             try await writer.appendRegionCachedFrames(
@@ -778,13 +780,15 @@ enum SideBySideRestoration {
         weightsURL: URL,
         cacheVariant: String,
         projection: VRMosaicProjection,
-        samplingMaps: [MosaicCropSamplingMap]
+        samplingMaps: [MosaicCropSamplingMap],
+        workDirectoryURL: URL? = nil
     ) throws -> WindowResult {
         guard samplingMaps.count == regions.count else {
             throw DeformConvError.invalidShape
         }
         let cacheBytes = regions.count * outputCount * tileBytes
-        let configuredWorkPath = ProcessInfo.processInfo.environment["JASNA_WORK_DIR"]
+        let configuredWorkPath = workDirectoryURL?.path
+            ?? ProcessInfo.processInfo.environment["JASNA_WORK_DIR"]
         let workURL = configuredWorkPath.map {
             URL(fileURLWithPath: $0, isDirectory: true)
         } ?? FileManager.default.temporaryDirectory

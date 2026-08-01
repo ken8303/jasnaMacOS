@@ -219,6 +219,41 @@ SOURCE_SEGMENTS=("$SOURCE_DIR"/"$EYE"-*.mov)
 
 echo "Stage 2/3: restoring ${#SOURCE_SEGMENTS[@]} $EYE-eye segment(s)"
 RESTORED_SEGMENTS=()
+SPARSE_BATCH_ARGS=()
+if [[ "$SPARSE_MOSAIC" == "1" ]]; then
+  for SOURCE_SEGMENT in "${SOURCE_SEGMENTS[@]}"; do
+    SEGMENT_NAME="$(basename "$SOURCE_SEGMENT")"
+    SEGMENT_STEM="${SEGMENT_NAME%.*}"
+    RESTORED_SEGMENT="$RESTORED_DIR/${SEGMENT_STEM}-restored.mov"
+    SEGMENT_DONE="$RESTORED_DIR/${SEGMENT_STEM}.done"
+    SEGMENT_CACHE="$CACHE_DIR/$SEGMENT_STEM.jasna-work"
+    SEGMENT_WINDOWS="$RESTORED_DIR/${SEGMENT_STEM}.windows"
+    MOSAIC_MANIFEST="$RESTORED_DIR/${SEGMENT_STEM}-mosaic-regions.json"
+    SEGMENT_DURATION="$(video_duration "$SOURCE_SEGMENT")"
+
+    if [[ ! -f "$SEGMENT_DONE" ]] && video_duration_matches "$RESTORED_SEGMENT" "$SEGMENT_DURATION"; then
+      echo "Recovered completed marker for $SEGMENT_NAME"
+      /usr/bin/touch "$SEGMENT_DONE"
+    fi
+    if [[ ! -f "$SEGMENT_DONE" ]]; then
+      mkdir -p "$SEGMENT_CACHE" "$SEGMENT_WINDOWS"
+      if [[ ! -s "$MOSAIC_MANIFEST" ]]; then
+        "$ROOT_DIR/script/scan_mosaic_regions.sh" "$SOURCE_SEGMENT" "$MOSAIC_MANIFEST"
+      else
+        echo "Reusing mosaic-region manifest: $MOSAIC_MANIFEST"
+      fi
+      SPARSE_BATCH_ARGS+=(
+        "$SOURCE_SEGMENT" "$SEGMENT_WINDOWS" "$MOSAIC_MANIFEST" "$SEGMENT_CACHE"
+      )
+    fi
+  done
+  if (( ${#SPARSE_BATCH_ARGS[@]} > 0 )); then
+    echo "Restoring $((${#SPARSE_BATCH_ARGS[@]} / 4)) pending segment(s) with one retained Metal ML graph"
+    "$ROOT_DIR/script/build_and_run.sh" --restore-eye-windows-sparse-batch \
+      "${SPARSE_BATCH_ARGS[@]}"
+  fi
+fi
+
 for SOURCE_SEGMENT in "${SOURCE_SEGMENTS[@]}"; do
   SEGMENT_NAME="$(basename "$SOURCE_SEGMENT")"
   SEGMENT_STEM="${SEGMENT_NAME%.*}"
@@ -240,14 +275,7 @@ for SOURCE_SEGMENT in "${SOURCE_SEGMENTS[@]}"; do
     echo "Restoring $SEGMENT_NAME (${SEGMENT_DURATION}s)"
     mkdir -p "$SEGMENT_CACHE" "$SEGMENT_WINDOWS"
     if [[ "$SPARSE_MOSAIC" == "1" ]]; then
-      if [[ ! -s "$MOSAIC_MANIFEST" ]]; then
-        "$ROOT_DIR/script/scan_mosaic_regions.sh" "$SOURCE_SEGMENT" "$MOSAIC_MANIFEST"
-      else
-        echo "Reusing mosaic-region manifest: $MOSAIC_MANIFEST"
-      fi
-      JASNA_WORK_DIR="$SEGMENT_CACHE" \
-        "$ROOT_DIR/script/build_and_run.sh" --restore-eye-windows-sparse \
-          "$SOURCE_SEGMENT" "$SEGMENT_WINDOWS" "$MOSAIC_MANIFEST"
+      echo "Using sparse windows completed by the retained-graph batch"
     else
       JASNA_WORK_DIR="$SEGMENT_CACHE" \
         "$ROOT_DIR/script/build_and_run.sh" --restore-eye-windows \

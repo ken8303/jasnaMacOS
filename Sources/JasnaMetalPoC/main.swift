@@ -536,6 +536,53 @@ do {
         print("Completed windows: \(count)")
         print("Output directory:  \(CommandLine.arguments[restoreWindowsIndex + 2])")
     }
+    if let batchIndex = CommandLine.arguments.firstIndex(
+        of: "--restore-eye-windows-sparse-batch"
+    ) {
+        let values = Array(CommandLine.arguments[(batchIndex + 1)...])
+        guard values.count >= 7, (values.count - 3).isMultiple(of: 4) else {
+            throw DeformConvError.commandFailed(
+                "--restore-eye-windows-sparse-batch requires one or more groups of "
+                    + "input, output directory, region manifest, and work directory, "
+                    + "followed by MetalML, DeformConv, and projection"
+            )
+        }
+        guard #available(macOS 27.0, *) else {
+            throw DeformConvError.commandFailed("sparse eye restoration requires macOS 27")
+        }
+        let fixedArgumentStart = values.count - 3
+        let modelsURL = URL(fileURLWithPath: values[fixedArgumentStart])
+        let weightsURL = URL(fileURLWithPath: values[fixedArgumentStart + 1])
+        guard let projection = VRMosaicProjection(rawValue: values[fixedArgumentStart + 2]) else {
+            throw DeformConvError.commandFailed(
+                "unknown sparse VR projection '\(values[fixedArgumentStart + 2])'; "
+                    + "use raw or fisheye"
+            )
+        }
+        let jobCount = fixedArgumentStart / 4
+        for jobIndex in 0..<jobCount {
+            let offset = jobIndex * 4
+            print("Sparse batch job \(jobIndex + 1)/\(jobCount): \(values[offset])")
+            let count = try await SideBySideRestoration.restoreSparseSingleEyeVideoWindows(
+                device: runner.device,
+                inputURL: URL(fileURLWithPath: values[offset]),
+                windowsDirectoryURL: URL(
+                    fileURLWithPath: values[offset + 1], isDirectory: true
+                ),
+                manifestURL: URL(fileURLWithPath: values[offset + 2]),
+                modelsURL: modelsURL,
+                weightsURL: weightsURL,
+                projection: projection,
+                workDirectoryURL: URL(
+                    fileURLWithPath: values[offset + 3], isDirectory: true
+                )
+            )
+            print("Sparse batch job \(jobIndex + 1)/\(jobCount): PASS, \(count) windows")
+        }
+        print("Sparse single-eye batch: PASS")
+        print("VR projection: \(projection.rawValue)")
+        print("Completed jobs: \(jobCount)")
+    }
     if let sparseWindowsIndex = CommandLine.arguments.firstIndex(
         of: "--restore-eye-windows-sparse"
     ) {

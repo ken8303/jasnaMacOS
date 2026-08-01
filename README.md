@@ -217,6 +217,14 @@ measured about 1.10 seconds for the initial graph build and execution, then
 about 0.45 seconds per reused 30-frame crop including roughly 0.38 seconds of
 GPU work. Decoded frame hashes matched the pre-cache output exactly.
 
+Long sparse eye restorations also submit every pending 30–120 second physical
+segment to one sequential app process. This keeps that retained graph alive
+across segment boundaries while each segment continues to use its own output,
+resume cache, and completion marker. A two-job production fixture reduced the
+second job's first-crop wall time from 786 ms to 101 ms; both decoded 30-frame
+outputs had identical frame hashes. Restarting still skips validated windows
+and resumes an interrupted crop from its segment-specific persistent cache.
+
 Sparse fisheye compositing runs the delta sampling and feather blending on
 Metal. Its default zero-copy path wraps the decoder and encoder pixel buffers
 as Metal textures, avoiding two 64 MiB CPU frame copies for every 4096×4096

@@ -35,10 +35,18 @@ case "$MODE" in
     mkdir -p "$3"
     RESTORE_OUTPUT_PATH="$3/windowed-output.mov"
     ;;
+  --restore-eye-windows-sparse-batch|restore-eye-windows-sparse-batch)
+    [[ $# -ge 5 ]] || {
+      echo "error: sparse batch mode requires at least one restoration job" >&2
+      exit 2
+    }
+    mkdir -p "$3"
+    RESTORE_OUTPUT_PATH="$3/batched-windowed-output.mov"
+    ;;
 esac
 
 case "$MODE" in
-  --restore-sbs-video|restore-sbs-video|--restore-sbs-window|restore-sbs-window|--restore-sbs-eye|restore-sbs-eye|--restore-eye-video|restore-eye-video|--restore-eye-windows|restore-eye-windows|--restore-eye-windows-sparse|restore-eye-windows-sparse)
+  --restore-sbs-video|restore-sbs-video|--restore-sbs-window|restore-sbs-window|--restore-sbs-eye|restore-sbs-eye|--restore-eye-video|restore-eye-video|--restore-eye-windows|restore-eye-windows|--restore-eye-windows-sparse|restore-eye-windows-sparse|--restore-eye-windows-sparse-batch|restore-eye-windows-sparse-batch)
     RESTORE_OUTPUT_DIR="$(cd "$(dirname "$RESTORE_OUTPUT_PATH")" && pwd)"
     RESTORE_OUTPUT_NAME="$(basename "$RESTORE_OUTPUT_PATH")"
     RESTORE_OUTPUT_STEM="${RESTORE_OUTPUT_NAME%.*}"
@@ -61,7 +69,7 @@ export CLANG_MODULE_CACHE_PATH="$ROOT_DIR/.build/ModuleCache"
 export SWIFTPM_MODULECACHE_OVERRIDE="$ROOT_DIR/.build/ModuleCache"
 BUILD_ARGUMENTS=(--disable-sandbox)
 case "$MODE" in
-  --restore-sbs-video|restore-sbs-video|--restore-sbs-window|restore-sbs-window|--restore-sbs-eye|restore-sbs-eye|--restore-eye-video|restore-eye-video|--restore-eye-windows|restore-eye-windows|--restore-eye-windows-sparse|restore-eye-windows-sparse)
+  --restore-sbs-video|restore-sbs-video|--restore-sbs-window|restore-sbs-window|--restore-sbs-eye|restore-sbs-eye|--restore-eye-video|restore-eye-video|--restore-eye-windows|restore-eye-windows|--restore-eye-windows-sparse|restore-eye-windows-sparse|--restore-eye-windows-sparse-batch|restore-eye-windows-sparse-batch)
     BUILD_ARGUMENTS+=(-c release)
     echo "Building optimized restoration binary..."
     ;;
@@ -174,6 +182,9 @@ case "$MODE" in
     ;;
   --restore-eye-windows-sparse|restore-eye-windows-sparse)
     "$APP_BINARY" --restore-eye-windows-sparse "${2:?input video path required}" "${3:?output directory required}" "${4:?mosaic region manifest required}" "$ROOT_DIR/Models/MetalML" "$ROOT_DIR/Models/DeformConv" "${JASNA_VR_PROJECTION:-raw}"
+    ;;
+  --restore-eye-windows-sparse-batch|restore-eye-windows-sparse-batch)
+    "$APP_BINARY" --restore-eye-windows-sparse-batch "${@:2}" "$ROOT_DIR/Models/MetalML" "$ROOT_DIR/Models/DeformConv" "${JASNA_VR_PROJECTION:-raw}"
     ;;
   --diagnose-sbs-tile|diagnose-sbs-tile)
     "$APP_BINARY" --diagnose-sbs-tile "${2:?input video path required}" "${3:?one-based tile number required}" "$ROOT_DIR/Models/MetalML" "$ROOT_DIR/Models/DeformConv"
