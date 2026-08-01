@@ -20,9 +20,24 @@ private struct MetalMosaicCompositeParams {
 
 @available(macOS 27.0, *)
 final class MetalMosaicCompositor: @unchecked Sendable {
+    private struct SampleBufferKey: Hashable {
+        let frameWidth: Int
+        let frameHeight: Int
+        let regionX: Int
+        let regionY: Int
+        let regionWidth: Int
+        let regionHeight: Int
+        let blendX: Int
+        let blendY: Int
+        let blendWidth: Int
+        let blendHeight: Int
+    }
+
     private let device: MTLDevice
     private let queue: MTLCommandQueue
     private let pipeline: MTLComputePipelineState
+    private let sampleBufferLock = NSLock()
+    private var sampleBuffers = [SampleBufferKey: MTLBuffer]()
 
     init(device: MTLDevice) throws {
         self.device = device
@@ -86,13 +101,13 @@ final class MetalMosaicCompositor: @unchecked Sendable {
             let originalBuffer = input.original.withUnsafeBytes {
                 device.makeBuffer(bytes: $0.baseAddress!, length: $0.count, options: .storageModeShared)
             }
-            let sampleBuffer = input.samples.withUnsafeBytes {
-                device.makeBuffer(bytes: $0.baseAddress!, length: $0.count, options: .storageModeShared)
-            }
-            guard let restoredBuffer, let originalBuffer, let sampleBuffer else {
+            let sampleBuffer = try cachedSampleBuffer(
+                input: input, dimensions: dimensions
+            )
+            guard let restoredBuffer, let originalBuffer else {
                 throw DeformConvError.metalUnavailable
             }
-            heldBuffers += [restoredBuffer, originalBuffer, sampleBuffer]
+            heldBuffers += [restoredBuffer, originalBuffer]
             var params = MetalMosaicCompositeParams(
                 frameWidth: UInt32(dimensions.width),
                 regionX: UInt32(input.region.x),
@@ -134,5 +149,35 @@ final class MetalMosaicCompositor: @unchecked Sendable {
                     byteCount: packedRowBytes
                 )
         }
+    }
+
+    private func cachedSampleBuffer(
+        input: MetalMosaicCompositeInput,
+        dimensions: VideoDimensions
+    ) throws -> MTLBuffer {
+        let key = SampleBufferKey(
+            frameWidth: dimensions.width,
+            frameHeight: dimensions.height,
+            regionX: input.region.x,
+            regionY: input.region.y,
+            regionWidth: input.region.width,
+            regionHeight: input.region.height,
+            blendX: input.region.effectiveBlendX,
+            blendY: input.region.effectiveBlendY,
+            blendWidth: input.region.effectiveBlendWidth,
+            blendHeight: input.region.effectiveBlendHeight
+        )
+        sampleBufferLock.lock()
+        defer { sampleBufferLock.unlock() }
+        if let buffer = sampleBuffers[key] { return buffer }
+        guard let buffer = input.samples.withUnsafeBytes({ bytes in
+            device.makeBuffer(
+                bytes: bytes.baseAddress!,
+                length: bytes.count,
+                options: .storageModeShared
+            )
+        }) else { throw DeformConvError.metalUnavailable }
+        sampleBuffers[key] = buffer
+        return buffer
     }
 }
