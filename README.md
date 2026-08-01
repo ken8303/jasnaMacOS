@@ -218,6 +218,14 @@ measured about 1.10 seconds for the initial graph build and execution, then
 about 0.45 seconds per reused 30-frame crop including roughly 0.38 seconds of
 GPU work. Decoded frame hashes matched the pre-cache output exactly.
 
+Sparse fisheye compositing prepares two independent output frames in parallel
+on Macs with at least 16 GB of memory, then submits them to AVFoundation in
+presentation order. This overlaps the CPU sampling and blending loops without
+changing pixels or increasing Metal graph concurrency. Set
+`JASNA_COMPOSITE_CONCURRENCY=1` for the lowest-memory path; values above two are
+capped. On the same one-second proof, concurrency two reduced end-to-end time
+from about 5.70 to 5.02 seconds, with identical decoded frame hashes.
+
 Run an end-to-end 30-second test of both eyes and rebuild an SBS preview with:
 
 ```sh

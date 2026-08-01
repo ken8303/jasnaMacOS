@@ -1398,6 +1398,115 @@ enum SideBySideRestoration {
     }
 
     private final class RestoredFrameWriter {
+        private struct CompositedRegionFrame {
+            let localFrame: Int
+            let pixelBuffer: CVPixelBuffer
+            let wallSeconds: Double
+        }
+
+        private final class RegionFrameCompositeBatch: @unchecked Sendable {
+            private let localFrames: [Int]
+            private let cacheURLs: [URL]
+            private let baseFrames: [CVPixelBuffer]
+            private let outputBuffers: [CVPixelBuffer]
+            private let dimensions: VideoDimensions
+            private let regions: [MosaicRegion]
+            private let projection: VRMosaicProjection
+            private let samplingMaps: [MosaicCropSamplingMap]
+            private let progressStartFrame: Int
+            private let lock = NSLock()
+            private var completed: [CompositedRegionFrame?]
+            private var failures: [(any Error)?]
+
+            init(
+                localFrames: [Int],
+                cacheURLs: [URL],
+                baseFrames: [CVPixelBuffer],
+                outputBuffers: [CVPixelBuffer],
+                dimensions: VideoDimensions,
+                regions: [MosaicRegion],
+                projection: VRMosaicProjection,
+                samplingMaps: [MosaicCropSamplingMap],
+                progressStartFrame: Int
+            ) {
+                self.localFrames = localFrames
+                self.cacheURLs = cacheURLs
+                self.baseFrames = baseFrames
+                self.outputBuffers = outputBuffers
+                self.dimensions = dimensions
+                self.regions = regions
+                self.projection = projection
+                self.samplingMaps = samplingMaps
+                self.progressStartFrame = progressStartFrame
+                completed = [CompositedRegionFrame?](repeating: nil, count: localFrames.count)
+                failures = [(any Error)?](repeating: nil, count: localFrames.count)
+            }
+
+            func execute(_ index: Int) {
+                do {
+                    let started = Date()
+                    let localFrame = localFrames[index]
+                    let cache = try FileHandle(forReadingFrom: cacheURLs[index])
+                    defer { try? cache.close() }
+                    var accumulator = try MosaicRegionFrameAccumulator(
+                        basePixelBuffer: baseFrames[index], dimensions: dimensions
+                    )
+                    for (regionIndex, region) in regions.enumerated() {
+                        let absoluteFrame = progressStartFrame + localFrame
+                        guard region.frameRange.contains(absoluteFrame) else {
+                            try cache.seek(toOffset: UInt64((regionIndex + 1) * tileBytes))
+                            continue
+                        }
+                        guard let data = try cache.read(upToCount: tileBytes),
+                              data.count == tileBytes
+                        else {
+                            throw DeformConvError.commandFailed(
+                                "restored mosaic-crop cache is truncated"
+                            )
+                        }
+                        var values = [Float16](repeating: 0, count: tileElements)
+                        _ = values.withUnsafeMutableBytes { data.copyBytes(to: $0) }
+                        let original = projection == .fisheye
+                            ? try samplingMaps[regionIndex].extractPlanarRGB(
+                                from: baseFrames[index]
+                            )
+                            : nil
+                        try accumulator.composite(
+                            region: region,
+                            planarRGB: values,
+                            originalPlanarRGB: original,
+                            projection: projection
+                        )
+                    }
+                    try accumulator.writeBGRA(to: outputBuffers[index])
+                    let result = CompositedRegionFrame(
+                        localFrame: localFrame,
+                        pixelBuffer: outputBuffers[index],
+                        wallSeconds: Date().timeIntervalSince(started)
+                    )
+                    lock.lock()
+                    completed[index] = result
+                    lock.unlock()
+                } catch {
+                    lock.lock()
+                    failures[index] = error
+                    lock.unlock()
+                }
+            }
+
+            func results() throws -> [CompositedRegionFrame] {
+                lock.lock()
+                defer { lock.unlock() }
+                if let failure = failures.compactMap({ $0 }).first { throw failure }
+                guard completed.allSatisfy({ $0 != nil }) else {
+                    throw DeformConvError.commandFailed(
+                        "parallel mosaic compositing was incomplete"
+                    )
+                }
+                return completed.compactMap { $0 }.sorted { $0.localFrame < $1.localFrame }
+            }
+        }
+
         private let writer: AVAssetWriter
         private let input: AVAssetWriterInput
         private let adaptor: AVAssetWriterInputPixelBufferAdaptor
@@ -1542,67 +1651,79 @@ enum SideBySideRestoration {
                 "Compositing \(regions.count) restored mosaic crops into "
                     + "\(cacheURLs.count) frame(s)"
             )
-            for localFrame in cacheURLs.indices {
-                let frameStarted = Date()
-                let cache = try FileHandle(forReadingFrom: cacheURLs[localFrame])
-                var accumulator = try MosaicRegionFrameAccumulator(
-                    basePixelBuffer: baseFrames[localFrame],
-                    dimensions: plan.dimensions
-                )
-                for (regionIndex, region) in regions.enumerated() {
-                    let absoluteFrame = progressStartFrame + localFrame
-                    guard region.frameRange.contains(absoluteFrame) else {
-                        try cache.seek(toOffset: UInt64((regionIndex + 1) * tileBytes))
-                        continue
-                    }
-                    guard let data = try cache.read(upToCount: tileBytes), data.count == tileBytes else {
-                        try? cache.close()
-                        throw DeformConvError.commandFailed("restored mosaic-crop cache is truncated")
-                    }
-                    var values = [Float16](repeating: 0, count: tileElements)
-                    _ = values.withUnsafeMutableBytes { data.copyBytes(to: $0) }
-                    let original = projection == .fisheye
-                        ? try samplingMaps[regionIndex].extractPlanarRGB(
-                            from: baseFrames[localFrame]
+            let configuredConcurrency = Int(
+                ProcessInfo.processInfo.environment["JASNA_COMPOSITE_CONCURRENCY"] ?? ""
+            )
+            let automaticConcurrency = ProcessInfo.processInfo.physicalMemory
+                >= UInt64(16 * 1_073_741_824) ? 2 : 1
+            let compositeConcurrency = min(
+                2, max(1, configuredConcurrency ?? automaticConcurrency)
+            )
+            report("Frame compositing concurrency: \(compositeConcurrency)")
+            guard let pool = adaptor.pixelBufferPool else {
+                throw DeformConvError.commandFailed("video writer has no pixel-buffer pool")
+            }
+            var nextFrame = 0
+            while nextFrame < cacheURLs.count {
+                let batchEnd = min(cacheURLs.count, nextFrame + compositeConcurrency)
+                let localFrames = Array(nextFrame..<batchEnd)
+                var outputBuffers = [CVPixelBuffer]()
+                outputBuffers.reserveCapacity(localFrames.count)
+                for localFrame in localFrames {
+                    var optionalBuffer: CVPixelBuffer?
+                    let status = CVPixelBufferPoolCreatePixelBuffer(nil, pool, &optionalBuffer)
+                    guard status == kCVReturnSuccess, let pixelBuffer = optionalBuffer else {
+                        throw DeformConvError.commandFailed(
+                            "failed allocating restored output frame"
                         )
-                        : nil
-                    try accumulator.composite(
-                        region: region,
-                        planarRGB: values,
-                        originalPlanarRGB: original,
-                        projection: projection
+                    }
+                    if let frameAttachments = attachments[localFrame] {
+                        CVBufferSetAttachments(pixelBuffer, frameAttachments, .shouldPropagate)
+                    }
+                    outputBuffers.append(pixelBuffer)
+                }
+                let batch = RegionFrameCompositeBatch(
+                    localFrames: localFrames,
+                    cacheURLs: localFrames.map { cacheURLs[$0] },
+                    baseFrames: localFrames.map { baseFrames[$0] },
+                    outputBuffers: outputBuffers,
+                    dimensions: plan.dimensions,
+                    regions: regions,
+                    projection: projection,
+                    samplingMaps: samplingMaps,
+                    progressStartFrame: progressStartFrame
+                )
+                if localFrames.count == 1 {
+                    batch.execute(0)
+                } else {
+                    DispatchQueue.concurrentPerform(iterations: localFrames.count) {
+                        batch.execute($0)
+                    }
+                }
+                for composited in try batch.results() {
+                    while !input.isReadyForMoreMediaData {
+                        if writer.status == .failed {
+                            throw writer.error
+                                ?? DeformConvError.commandFailed("video writer failed")
+                        }
+                        try await Task.sleep(for: .milliseconds(1))
+                    }
+                    let outputFrame = startFrame + composited.localFrame
+                    let time = CMTime(value: CMTimeValue(outputFrame), timescale: 30)
+                    guard adaptor.append(composited.pixelBuffer, withPresentationTime: time) else {
+                        throw writer.error
+                            ?? DeformConvError.commandFailed(
+                                "failed encoding frame \(outputFrame)"
+                            )
+                    }
+                    report(
+                        "Queued crop-restored output frame "
+                            + "\(progressStartFrame + composited.localFrame + 1)/"
+                            + "\(progressFrameCount ?? plan.frameRate.outputFrameCount); "
+                            + "composite \(String(format: "%.3f", composited.wallSeconds)) s"
                     )
                 }
-                try cache.close()
-                while !input.isReadyForMoreMediaData {
-                    if writer.status == .failed {
-                        throw writer.error ?? DeformConvError.commandFailed("video writer failed")
-                    }
-                    try await Task.sleep(for: .milliseconds(1))
-                }
-                guard let pool = adaptor.pixelBufferPool else {
-                    throw DeformConvError.commandFailed("video writer has no pixel-buffer pool")
-                }
-                var optionalBuffer: CVPixelBuffer?
-                let status = CVPixelBufferPoolCreatePixelBuffer(nil, pool, &optionalBuffer)
-                guard status == kCVReturnSuccess, let pixelBuffer = optionalBuffer else {
-                    throw DeformConvError.commandFailed("failed allocating restored output frame")
-                }
-                if let frameAttachments = attachments[localFrame] {
-                    CVBufferSetAttachments(pixelBuffer, frameAttachments, .shouldPropagate)
-                }
-                try accumulator.writeBGRA(to: pixelBuffer)
-                let outputFrame = startFrame + localFrame
-                let time = CMTime(value: CMTimeValue(outputFrame), timescale: 30)
-                guard adaptor.append(pixelBuffer, withPresentationTime: time) else {
-                    throw writer.error
-                        ?? DeformConvError.commandFailed("failed encoding frame \(outputFrame)")
-                }
-                report(
-                    "Queued crop-restored output frame \(progressStartFrame + localFrame + 1)/"
-                        + "\(progressFrameCount ?? plan.frameRate.outputFrameCount) in "
-                        + "\(String(format: "%.3f", Date().timeIntervalSince(frameStarted))) s"
-                )
+                nextFrame = batchEnd
             }
         }
 
