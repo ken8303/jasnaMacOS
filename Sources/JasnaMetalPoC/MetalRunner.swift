@@ -69,6 +69,8 @@ struct BenchmarkResult {
     let simdStatistics: BenchmarkStatistics
     let tiledStatistics: BenchmarkStatistics
     let gemmStatistics: BenchmarkStatistics
+    let gatherStatistics: BenchmarkStatistics
+    let fusedMatrixStatistics: BenchmarkStatistics
     let baselineMedianMilliseconds: Double
     let baselineMinimumMilliseconds: Double
     let baselineMaximumMilliseconds: Double
@@ -95,8 +97,7 @@ final class MetalDeformConv {
     private let fp16JasnaSIMDPipeline: MTLComputePipelineState
     private let fp16JasnaTiledPipeline: MTLComputePipelineState
     private let fp16JasnaGatherPipeline: MTLComputePipelineState
-    private let fp16JasnaSIMDGroupGEMMPipeline: MTLComputePipelineState
-    private let fp16JasnaFloatGEMMOutputPipeline: MTLComputePipelineState
+    private let fp16JasnaFusedSIMDGroupGEMMPipeline: MTLComputePipelineState
     private let spynetPreparePipeline: MTLComputePipelineState
     private let bicubicDownsamplePipeline: MTLComputePipelineState
     private let dcnOffsetPipeline: MTLComputePipelineState
@@ -118,8 +119,9 @@ final class MetalDeformConv {
               let fp16JasnaSIMD = library.makeFunction(name: "deform_conv2d_fp16_jasna_simd"),
               let fp16JasnaTiled = library.makeFunction(name: "deform_conv2d_fp16_jasna_tiled"),
               let fp16JasnaGather = library.makeFunction(name: "deform_conv2d_fp16_jasna_gather"),
-              let fp16JasnaSIMDGroupGEMM = library.makeFunction(name: "deform_conv2d_fp16_jasna_simdgroup_gemm"),
-              let fp16JasnaFloatGEMMOutput = library.makeFunction(name: "deform_conv2d_fp16_jasna_float_gemm_output"),
+              let fp16JasnaFusedSIMDGroupGEMM = library.makeFunction(
+                  name: "deform_conv2d_fp16_jasna_simdgroup_gemm_fused"
+              ),
               let spynetPrepare = library.makeFunction(name: "spynet_prepare_fp16"),
               let bicubicDownsample = library.makeFunction(name: "jasna_bicubic_downsample_quarter_fp16"),
               let dcnOffset = library.makeFunction(name: "prepare_dcn_offsets_fp16"),
@@ -131,8 +133,9 @@ final class MetalDeformConv {
         fp16JasnaSIMDPipeline = try device.makeComputePipelineState(function: fp16JasnaSIMD)
         fp16JasnaTiledPipeline = try device.makeComputePipelineState(function: fp16JasnaTiled)
         fp16JasnaGatherPipeline = try device.makeComputePipelineState(function: fp16JasnaGather)
-        fp16JasnaSIMDGroupGEMMPipeline = try device.makeComputePipelineState(function: fp16JasnaSIMDGroupGEMM)
-        fp16JasnaFloatGEMMOutputPipeline = try device.makeComputePipelineState(function: fp16JasnaFloatGEMMOutput)
+        fp16JasnaFusedSIMDGroupGEMMPipeline = try device.makeComputePipelineState(
+            function: fp16JasnaFusedSIMDGroupGEMM
+        )
         spynetPreparePipeline = try device.makeComputePipelineState(function: spynetPrepare)
         bicubicDownsamplePipeline = try device.makeComputePipelineState(function: bicubicDownsample)
         dcnOffsetPipeline = try device.makeComputePipelineState(function: dcnOffset)
@@ -259,10 +262,6 @@ final class MetalDeformConv {
             length: shape.batch * shape.outputHeight * shape.outputWidth
                 * shape.inputChannels * shape.kernelArea * MemoryLayout<Float16>.stride,
             options: .storageModePrivate
-        ), let simdgroupMatrixOutputBuffer = device.makeBuffer(
-            length: shape.batch * shape.outputHeight * shape.outputWidth
-                * shape.outputChannels * MemoryLayout<Float>.stride,
-            options: .storageModePrivate
         ), let simdgroupOutputBuffer = device.makeBuffer(
             length: shape.outputCount * MemoryLayout<Float16>.stride,
             options: .storageModeShared
@@ -272,7 +271,7 @@ final class MetalDeformConv {
         let baselineBuffers = [inputBuffer, offsetBuffer, maskBuffer, weightBuffer, biasBuffer, baselineOutputBuffer]
         let simdgroupGEMMBuffers = [
             inputBuffer, offsetBuffer, maskBuffer, packedWeightBuffer, biasBuffer,
-            gatheredBuffer, simdgroupMatrixOutputBuffer, simdgroupOutputBuffer,
+            gatheredBuffer, simdgroupOutputBuffer,
         ]
 
         for _ in 0..<2 {
@@ -309,6 +308,22 @@ final class MetalDeformConv {
             )
         }
         simdgroupGEMMSamples.sort()
+        for _ in 0..<2 {
+            _ = try executeJasnaGather(shape: shape, buffers: simdgroupGEMMBuffers)
+            _ = try executeJasnaFusedMatrix(shape: shape, buffers: simdgroupGEMMBuffers)
+        }
+        var gatherSamples = [Double]()
+        var fusedMatrixSamples = [Double]()
+        for _ in 0..<max(iterations, 1) {
+            gatherSamples.append(
+                try executeJasnaGather(shape: shape, buffers: simdgroupGEMMBuffers)
+            )
+            fusedMatrixSamples.append(
+                try executeJasnaFusedMatrix(shape: shape, buffers: simdgroupGEMMBuffers)
+            )
+        }
+        gatherSamples.sort()
+        fusedMatrixSamples.sort()
         let output = tiledOutputBuffer.contents().bindMemory(to: Float16.self, capacity: shape.outputCount)
         let simdgroupOutput = simdgroupOutputBuffer.contents().bindMemory(
             to: Float16.self, capacity: shape.outputCount
@@ -340,7 +355,9 @@ final class MetalDeformConv {
         guard let baselineStatistics = BenchmarkStatistics(baselineSamples),
               let simdStatistics = BenchmarkStatistics(simdSamples),
               let tiledStatistics = BenchmarkStatistics(samples),
-              let gemmStatistics = BenchmarkStatistics(simdgroupGEMMSamples)
+              let gemmStatistics = BenchmarkStatistics(simdgroupGEMMSamples),
+              let gatherStatistics = BenchmarkStatistics(gatherSamples),
+              let fusedMatrixStatistics = BenchmarkStatistics(fusedMatrixSamples)
         else {
             throw DeformConvError.commandFailed("invalid DCNv2 benchmark samples")
         }
@@ -349,6 +366,8 @@ final class MetalDeformConv {
             simdStatistics: simdStatistics,
             tiledStatistics: tiledStatistics,
             gemmStatistics: gemmStatistics,
+            gatherStatistics: gatherStatistics,
+            fusedMatrixStatistics: fusedMatrixStatistics,
             baselineMedianMilliseconds: baselineStatistics.median,
             baselineMinimumMilliseconds: baselineStatistics.minimum,
             baselineMaximumMilliseconds: baselineStatistics.maximum,
@@ -645,7 +664,8 @@ final class MetalDeformConv {
               shape.kernelHeight == 3,
               shape.kernelWidth == 3,
               shape.groups == 1,
-              shape.offsetGroups > 0,
+              shape.offsetGroups == 16,
+              (shape.batch * shape.outputHeight * shape.outputWidth).isMultiple(of: 8),
               let commandBuffer = queue.makeCommandBuffer(),
               let encoder = commandBuffer.makeComputeCommandEncoder()
         else { throw DeformConvError.invalidShape }
@@ -684,7 +704,7 @@ final class MetalDeformConv {
               shape.kernelWidth == 3,
               shape.groups == 1,
               shape.offsetGroups > 0,
-              buffers.count == 8,
+              buffers.count == 7,
               let commandBuffer = queue.makeCommandBuffer(),
               let gatherEncoder = commandBuffer.makeComputeCommandEncoder()
         else { throw DeformConvError.invalidShape }
@@ -706,36 +726,95 @@ final class MetalDeformConv {
         guard let gemmEncoder = commandBuffer.makeComputeCommandEncoder() else {
             throw DeformConvError.metalUnavailable
         }
-        gemmEncoder.setComputePipelineState(fp16JasnaSIMDGroupGEMMPipeline)
+        gemmEncoder.setComputePipelineState(fp16JasnaFusedSIMDGroupGEMMPipeline)
         gemmEncoder.setBuffer(buffers[5], offset: 0, index: 0)
         gemmEncoder.setBuffer(buffers[3], offset: 0, index: 1)
-        gemmEncoder.setBuffer(buffers[6], offset: 0, index: 2)
+        gemmEncoder.setBuffer(buffers[4], offset: 0, index: 2)
+        gemmEncoder.setBuffer(buffers[6], offset: 0, index: 3)
+        gemmEncoder.setBytes(&metalShape, length: MemoryLayout<MetalShape>.stride, index: 4)
         gemmEncoder.dispatchThreadgroups(
             MTLSize(width: rows / 8, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(
-                width: 8 * fp16JasnaSIMDGroupGEMMPipeline.threadExecutionWidth,
+                width: 8 * fp16JasnaFusedSIMDGroupGEMMPipeline.threadExecutionWidth,
                 height: 1,
                 depth: 1
             )
         )
         gemmEncoder.endEncoding()
 
-        guard let outputEncoder = commandBuffer.makeComputeCommandEncoder() else {
-            throw DeformConvError.metalUnavailable
+        let start = ContinuousClock.now
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        let wall = start.duration(to: .now)
+        if commandBuffer.status == .error {
+            throw DeformConvError.commandFailed(
+                commandBuffer.error?.localizedDescription ?? "unknown error"
+            )
         }
-        outputEncoder.setComputePipelineState(fp16JasnaFloatGEMMOutputPipeline)
-        outputEncoder.setBuffer(buffers[6], offset: 0, index: 0)
-        outputEncoder.setBuffer(buffers[4], offset: 0, index: 1)
-        outputEncoder.setBuffer(buffers[7], offset: 0, index: 2)
-        outputEncoder.setBytes(&metalShape, length: MemoryLayout<MetalShape>.stride, index: 3)
-        outputEncoder.dispatchThreads(
-            MTLSize(width: shape.outputCount, height: 1, depth: 1),
+        let gpuSeconds = commandBuffer.gpuEndTime - commandBuffer.gpuStartTime
+        if gpuSeconds > 0 { return gpuSeconds * 1_000 }
+        return Double(wall.components.seconds) * 1_000
+            + Double(wall.components.attoseconds) / 1.0e15
+    }
+
+    private func executeJasnaGather(
+        shape: DeformConvShape,
+        buffers: [MTLBuffer]
+    ) throws -> Double {
+        guard shape.inputChannels == 128,
+              shape.kernelHeight == 3,
+              shape.kernelWidth == 3,
+              shape.offsetGroups == 16,
+              buffers.count == 7,
+              let commandBuffer = queue.makeCommandBuffer(),
+              let encoder = commandBuffer.makeComputeCommandEncoder()
+        else { throw DeformConvError.invalidShape }
+        encoder.setComputePipelineState(fp16JasnaGatherPipeline)
+        encoder.setBuffer(buffers[0], offset: 0, index: 0)
+        encoder.setBuffer(buffers[1], offset: 0, index: 1)
+        encoder.setBuffer(buffers[2], offset: 0, index: 2)
+        encoder.setBuffer(buffers[5], offset: 0, index: 3)
+        var metalShape = MetalShape(shape)
+        encoder.setBytes(&metalShape, length: MemoryLayout<MetalShape>.stride, index: 4)
+        encoder.dispatchThreadgroups(
+            MTLSize(width: shape.batch * shape.outputHeight * shape.outputWidth, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1)
+        )
+        encoder.endEncoding()
+        return try executeAndMeasure(commandBuffer)
+    }
+
+    private func executeJasnaFusedMatrix(
+        shape: DeformConvShape,
+        buffers: [MTLBuffer]
+    ) throws -> Double {
+        guard shape.batch == 1,
+              shape.outputChannels == 64,
+              (shape.outputHeight * shape.outputWidth).isMultiple(of: 8),
+              buffers.count == 7,
+              let commandBuffer = queue.makeCommandBuffer(),
+              let encoder = commandBuffer.makeComputeCommandEncoder()
+        else { throw DeformConvError.invalidShape }
+        encoder.setComputePipelineState(fp16JasnaFusedSIMDGroupGEMMPipeline)
+        encoder.setBuffer(buffers[5], offset: 0, index: 0)
+        encoder.setBuffer(buffers[3], offset: 0, index: 1)
+        encoder.setBuffer(buffers[4], offset: 0, index: 2)
+        encoder.setBuffer(buffers[6], offset: 0, index: 3)
+        var metalShape = MetalShape(shape)
+        encoder.setBytes(&metalShape, length: MemoryLayout<MetalShape>.stride, index: 4)
+        encoder.dispatchThreadgroups(
+            MTLSize(width: shape.batch * shape.outputHeight * shape.outputWidth / 8, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(
-                width: fp16JasnaFloatGEMMOutputPipeline.threadExecutionWidth, height: 1, depth: 1
+                width: 8 * fp16JasnaFusedSIMDGroupGEMMPipeline.threadExecutionWidth,
+                height: 1,
+                depth: 1
             )
         )
-        outputEncoder.endEncoding()
+        encoder.endEncoding()
+        return try executeAndMeasure(commandBuffer)
+    }
 
+    private func executeAndMeasure(_ commandBuffer: MTLCommandBuffer) throws -> Double {
         let start = ContinuousClock.now
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()

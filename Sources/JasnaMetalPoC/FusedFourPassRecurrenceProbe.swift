@@ -71,7 +71,6 @@ private struct FusedBranchRuntime {
     let prepareArguments: [any MTL4ArgumentTable]
     let transformArguments: [any MTL4ArgumentTable]
     let gemmArguments: any MTL4ArgumentTable
-    let gemmOutputArguments: any MTL4ArgumentTable
     let assemblyArguments: [any MTL4ArgumentTable]
     let residualArguments: [any MTL4ArgumentTable]
     let offsetHeap: MTLHeap
@@ -208,7 +207,6 @@ func verifyFusedFourPassRecurrence(
     let maskBuffer = try Support.makeSharedFP16Buffer(device: device, elements: 144 * plane)
     let alignedBuffer = try Support.makeSharedFP16Buffer(device: device, elements: featureCount)
     let gatheredBuffer = try Support.makePrivateBuffer(device: device, bytes: plane * 128 * 9 * 2)
-    let matrixOutputBuffer = try Support.makePrivateBuffer(device: device, bytes: plane * 64 * 4)
     let propagationBuffers = try (0..<4).map { _ in
         try (0..<frameCount).map { _ in
             try Support.makeSharedFP16Buffer(device: device, elements: featureCount)
@@ -236,8 +234,9 @@ func verifyFusedFourPassRecurrence(
           let prepareFunction = library.makeFunction(name: "assemble_temporal_alignment_fp16"),
           let transformFunction = library.makeFunction(name: "prepare_dcn_offsets_fp16"),
           let gatherFunction = library.makeFunction(name: "deform_conv2d_fp16_jasna_gather"),
-          let gemmFunction = library.makeFunction(name: "deform_conv2d_fp16_jasna_simdgroup_gemm"),
-          let gemmOutputFunction = library.makeFunction(name: "deform_conv2d_fp16_jasna_float_gemm_output"),
+          let gemmFunction = library.makeFunction(
+              name: "deform_conv2d_fp16_jasna_simdgroup_gemm_fused"
+          ),
           let simpleAssemblyFunction = library.makeFunction(name: "assemble_propagation_backbone_fp16"),
           let temporalAssemblyFunction = library.makeFunction(name: "assemble_temporal_backbone_fp16"),
           let residualFunction = library.makeFunction(name: "add_propagation_residual_fp16"),
@@ -250,7 +249,6 @@ func verifyFusedFourPassRecurrence(
     let transformPipeline = try cache.computePipeline(device: device, function: transformFunction)
     let gatherPipeline = try cache.computePipeline(device: device, function: gatherFunction)
     let gemmPipeline = try cache.computePipeline(device: device, function: gemmFunction)
-    let gemmOutputPipeline = try cache.computePipeline(device: device, function: gemmOutputFunction)
     let simpleAssemblyPipeline = try cache.computePipeline(
         device: device, function: simpleAssemblyFunction
     )
@@ -380,11 +378,10 @@ func verifyFusedFourPassRecurrence(
         }
         let gemmArguments = try Support.makeComputeArguments(
             device: device,
-            buffers: [gatheredBuffer, checkpoint.weight, matrixOutputBuffer]
-        )
-        let biasedGEMMOutputArguments = try Support.makeComputeArguments(
-            device: device,
-            buffers: [matrixOutputBuffer, checkpoint.bias, alignedBuffer, deformShapeBuffer]
+            buffers: [
+                gatheredBuffer, checkpoint.weight, checkpoint.bias,
+                alignedBuffer, deformShapeBuffer,
+            ]
         )
         branches.append(FusedBranchRuntime(
             name: name, direction: direction, backboneInputChannels: backboneInputChannels,
@@ -395,7 +392,6 @@ func verifyFusedFourPassRecurrence(
             accumulateArguments: accumulateArguments, prepareArguments: prepareArguments,
             transformArguments: transformArguments,
             gemmArguments: gemmArguments,
-            gemmOutputArguments: biasedGEMMOutputArguments,
             assemblyArguments: assemblyArguments,
             residualArguments: residualArguments,
             offsetHeap: try Support.makeHeap(device: device, size: offsetPipeline.intermediatesHeapSize),
@@ -453,7 +449,7 @@ func verifyFusedFourPassRecurrence(
         backwardFlowBuffers + forwardFlowBuffers + branchIndexBuffers + [
             conditionBuffer, rawBuffer, backboneOutputBuffer, zeroFeatureBuffer, flow2Buffer,
             deformInputBuffer, offsetBuffer, maskBuffer, alignedBuffer, gatheredBuffer,
-            matrixOutputBuffer, firstShapeBuffer, secondShapeBuffer, planeBuffer,
+            firstShapeBuffer, secondShapeBuffer, planeBuffer,
             prefixChannelsBuffer, featureCountBuffer, frameElementsBuffer, deformShapeBuffer,
         ]
         + reconstructionBuffers + predictedBuffers + restoredBuffers
@@ -607,14 +603,6 @@ func verifyFusedFourPassRecurrence(
                     alignment, pipeline: gemmPipeline,
                     arguments: branch.gemmArguments, count: plane / 8,
                     threads: 8 * gemmPipeline.threadExecutionWidth, threadgroups: true
-                )
-                alignment.barrier(
-                    afterEncoderStages: .dispatch, beforeEncoderStages: .dispatch,
-                    visibilityOptions: .device
-                )
-                Support.dispatch1D(
-                    alignment, pipeline: gemmOutputPipeline,
-                    arguments: branch.gemmOutputArguments, count: featureCount
                 )
                 alignment.barrier(
                     afterEncoderStages: .dispatch, beforeEncoderStages: .dispatch,

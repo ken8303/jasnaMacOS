@@ -208,7 +208,6 @@ func verifyThreeFrameRecurrence(
     let maskBuffer = try makeBuffer(elements: 144 * plane)
     let alignedBuffer = try makeBuffer(elements: featureCount)
     let gatheredBuffer = try makePrivateBuffer(bytes: plane * 128 * 9 * 2)
-    let matrixOutputBuffer = try makePrivateBuffer(bytes: plane * 64 * 4)
     let propagationBuffers = try (0..<3).map { _ in try makeBuffer(elements: featureCount) }
     let checkpoint = try DeformConvWeightSet(
         direction: branchName,
@@ -235,8 +234,9 @@ func verifyThreeFrameRecurrence(
           let prepareFunction = library.makeFunction(name: "assemble_temporal_alignment_fp16"),
           let transformFunction = library.makeFunction(name: "prepare_dcn_offsets_fp16"),
           let gatherFunction = library.makeFunction(name: "deform_conv2d_fp16_jasna_gather"),
-          let gemmFunction = library.makeFunction(name: "deform_conv2d_fp16_jasna_simdgroup_gemm"),
-          let gemmOutputFunction = library.makeFunction(name: "deform_conv2d_fp16_jasna_float_gemm_output"),
+          let gemmFunction = library.makeFunction(
+              name: "deform_conv2d_fp16_jasna_simdgroup_gemm_fused"
+          ),
           let simpleBackboneAssemblyFunction = library.makeFunction(name: "assemble_propagation_backbone_fp16"),
           let temporalBackboneAssemblyFunction = library.makeFunction(name: "assemble_temporal_backbone_fp16"),
           let residualFunction = library.makeFunction(name: "add_propagation_residual_fp16")
@@ -246,7 +246,6 @@ func verifyThreeFrameRecurrence(
     let transformPipeline = try device.makeComputePipelineState(function: transformFunction)
     let gatherPipeline = try device.makeComputePipelineState(function: gatherFunction)
     let gemmPipeline = try device.makeComputePipelineState(function: gemmFunction)
-    let gemmOutputPipeline = try device.makeComputePipelineState(function: gemmOutputFunction)
     let simpleBackboneAssemblyPipeline = try device.makeComputePipelineState(
         function: simpleBackboneAssemblyFunction
     )
@@ -262,10 +261,7 @@ func verifyThreeFrameRecurrence(
         deformInputBuffer, offsetBuffer, maskBuffer, gatheredBuffer, deformShapeBuffer,
     ])
     let gemmArguments = try makeComputeArguments([
-        gatheredBuffer, checkpoint.weight, matrixOutputBuffer,
-    ])
-    let gemmOutputArguments = try makeComputeArguments([
-        matrixOutputBuffer, checkpoint.bias, alignedBuffer, deformShapeBuffer,
+        gatheredBuffer, checkpoint.weight, checkpoint.bias, alignedBuffer, deformShapeBuffer,
     ])
     let traversal = direction == .backward ? [2, 1, 0] : [0, 1, 2]
     func priorBuffer(_ priorIndex: Int, frame: Int) -> MTLBuffer {
@@ -337,7 +333,6 @@ func verifyThreeFrameRecurrence(
         deformShapeBuffer,
     ] + flowBuffers + propagationBuffers + priorBranchBuffers.flatMap { $0 }
     residencySet.addAllocation(gatheredBuffer)
-    residencySet.addAllocation(matrixOutputBuffer)
     for buffer in residentBuffers { residencySet.addAllocation(buffer) }
     for heap in featureHeaps { residencySet.addAllocation(heap) }
     residencySet.addAllocation(offsetHeap)
@@ -514,13 +509,6 @@ func verifyThreeFrameRecurrence(
                 alignment, pipeline: gemmPipeline,
                 arguments: gemmArguments, count: plane / 8,
                 threads: 8 * gemmPipeline.threadExecutionWidth, threadgroups: true
-            )
-            alignment.barrier(
-                afterEncoderStages: .dispatch, beforeEncoderStages: .dispatch, visibilityOptions: .device
-            )
-            dispatch1D(
-                alignment, pipeline: gemmOutputPipeline,
-                arguments: gemmOutputArguments, count: featureCount
             )
             alignment.barrier(
                 afterEncoderStages: .dispatch, beforeEncoderStages: .dispatch, visibilityOptions: .device

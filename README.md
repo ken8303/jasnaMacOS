@@ -386,15 +386,15 @@ boundary, and allocate the complete buffer-backed clip arena:
 
 ## Measured result
 
-On a 10-GPU-core Apple M4 with Xcode 27 beta 4, a 20-sample run measured the
-gather-plus-SIMD-group-GEMM FP16 deformable convolution at 0.742 ms median.
-Its 20-sample P10–P90 interval was 0.741–0.745 ms; one 1.723 ms outlier raised
-the standard deviation to 0.214 ms. The tiled scalar reduction measured
-1.175 ms, the first SIMD version 9.166 ms, and the direct baseline 16.572 ms.
-The Metal-4-compatible path is 37% faster than tiled and 22.3× faster than the
-direct kernel at the median. Its maximum FP16 difference from the baseline was
-`0.000244`, and its FP32 implementation passed the CPU oracle with a maximum
-absolute error of about `3e-8`.
+On a 10-GPU-core Apple M4 with Xcode 27 beta 4, 20-sample runs across all four
+checkpoint directions measured the shared-coordinate gather plus fused
+SIMD-group-GEMM FP16 deformable convolution at 0.701–0.704 ms median. The tiled
+scalar reduction measured 1.175–1.186 ms, the first SIMD version about 9.1 ms,
+and the direct baseline about 16.2 ms. The Metal-4-compatible path is about 40%
+faster than tiled and 23× faster than the direct kernel at the median. Its
+maximum FP16 difference from the baseline was `0.000977`, and its FP32
+implementation passed the CPU oracle with a maximum absolute error of about
+`3e-8`.
 
 The converted feature extractor executes in about 0.42 ms median. The offset,
 propagation-backbone, reconstruction, and six split SPyNet convolution packages
@@ -421,9 +421,9 @@ usage.
 convolution parameter sets from the public checkpoint and writes the packed
 FP16 `[input channel, kernel element, output channel]` layout consumed directly
 by the Metal kernels. Each direction is 147,584 bytes including bias. All four
-load into Metal buffers and benchmark at 0.741–0.742 ms median through gather
-plus SIMD-group GEMM. Their P10–P90 intervals stay within 0.740–0.747 ms, with
-a maximum delta of `0.000977` from the direct FP16 implementation. The custom
+load into Metal buffers and benchmark at 0.701–0.704 ms median through the
+shared-coordinate gather plus fused SIMD-group GEMM, with a maximum delta of
+`0.000977` from the direct FP16 implementation. The custom
 offset/mask stage implements Jasna's `10*tanh`, interleaved flipped-flow add,
 and sigmoid mask and passes its CPU oracle with maximum error `0.00195`.
 
@@ -606,8 +606,15 @@ early return. An experiment splitting each output-channel reduction across two
 threads regressed from 1.175 ms to 2.059 ms and was rejected. The replacement
 materializes the 4,096×1,152 deformable im2col matrix, multiplies it by the
 1,152×64 packed checkpoint weights using 8×8 SIMD-group matrix instructions,
-and converts the FP32 accumulator back to NCHW FP16. It works inside the same
-Metal 4 command buffer as the Metal ML recurrence stages.
+and converts the FP32 accumulator back to NCHW FP16. The gather now calculates
+the 144 unique offset/mask coordinates once per output pixel in threadgroup
+memory instead of reloading them for each of eight input channels. Bias,
+FP16 conversion, and NCHW scattering are fused into the matrix dispatch, which
+also removes the 1 MiB FP32 output matrix. Across four real checkpoint weight
+sets, the combined median improved from 0.743–0.749 to 0.701–0.704 ms; the
+stage-separated medians were about 0.347 ms gather and 0.354 ms matrix work.
+It works inside the same Metal 4 command buffer as the Metal ML recurrence
+stages.
 
 ## Model conversion
 
