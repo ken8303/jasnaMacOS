@@ -953,5 +953,39 @@ kernel void composite_fisheye_mosaic_delta(
         bgra[destination + bgraChannel] = uchar(clamp(floor(blended + 0.5f), 0.0f, 255.0f));
     }
 }
+
+kernel void composite_fisheye_mosaic_delta_texture(
+    texture2d<float, access::read_write> frame [[texture(0)]],
+    device const half *restored [[buffer(0)]],
+    device const half *original [[buffer(1)]],
+    device const float4 *compositeSamples [[buffer(2)]],
+    constant MosaicCompositeParams &params [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint regionPixels = params.regionWidth * params.regionHeight;
+    if (gid >= regionPixels) return;
+    uint2 position = uint2(
+        params.regionX + gid % params.regionWidth,
+        params.regionY + gid / params.regionWidth
+    );
+    float4 compositeSample = compositeSamples[gid];
+    float alpha = compositeSample.z;
+    if (alpha <= 0.0f) return;
+
+    float4 color = frame.read(position);
+    uint plane = params.modelSize * params.modelSize;
+    for (uint rgbChannel = 0u; rgbChannel < 3u; ++rgbChannel) {
+        uint offset = rgbChannel * plane;
+        float value = color[rgbChannel]
+            + mosaic_sample_plane(
+                restored, offset, params.modelSize, compositeSample.x, compositeSample.y
+            )
+            - mosaic_sample_plane(
+                original, offset, params.modelSize, compositeSample.x, compositeSample.y
+            );
+        color[rgbChannel] = mix(color[rgbChannel], clamp(value, 0.0f, 1.0f), alpha);
+    }
+    frame.write(color, position);
+}
 """#
 }

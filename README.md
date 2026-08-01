@@ -218,14 +218,21 @@ about 0.45 seconds per reused 30-frame crop including roughly 0.38 seconds of
 GPU work. Decoded frame hashes matched the pre-cache output exactly.
 
 Sparse fisheye compositing runs the delta sampling and feather blending on
-Metal. Two independent output frames are prepared in parallel on Macs with at
-least 16 GB of memory, then submitted to AVFoundation in presentation order.
+Metal. Its default zero-copy path wraps the decoder and encoder pixel buffers
+as Metal textures, avoiding two 64 MiB CPU frame copies for every 4096×4096
+eye frame. Two independent output frames are prepared in parallel on Macs with
+at least 16 GB of memory, then submitted to AVFoundation in presentation order.
 Set `JASNA_COMPOSITE_CONCURRENCY=1` for the lowest-memory path; values above two
-are capped. `JASNA_METAL_COMPOSITOR=0` selects the CPU fallback. On the same
-one-second proof, the Metal path completed in 4.79 seconds versus 5.02 seconds
-for the parallel CPU path and 5.70 seconds for the serial CPU path. A raw-frame
-cross-check differed in only 9 of 67,108,864 bytes, each by 1/255. Set
-`JASNA_VERIFY_METAL_COMPOSITOR=1` to repeat that first-frame diagnostic.
+are capped. `JASNA_METAL_TEXTURE_COMPOSITOR=0` selects the Metal buffer-copy
+fallback, while `JASNA_METAL_COMPOSITOR=0` selects the CPU fallback.
+
+In an alternating warmed comparison, zero-copy reduced steady compositor time
+from 20.2 to 8.3 ms/frame and reduced user/system CPU time from 0.93/0.95 to
+0.78/0.74 seconds for a one-second proof. Whole-job time remained about 4.2
+seconds because model inference and HEVC finalization dominate and overlap the
+saved work. A raw-frame cross-check differed in only 8 of 67,108,864 bytes,
+each by 1/255. Set `JASNA_VERIFY_METAL_COMPOSITOR=1` to repeat that first-frame
+diagnostic.
 
 Run an end-to-end 30-second test of both eyes and rebuild an SBS preview with:
 

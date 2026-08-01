@@ -1673,6 +1673,7 @@ enum SideBySideRestoration {
                     kCVPixelBufferWidthKey as String: plan.dimensions.width,
                     kCVPixelBufferHeightKey as String: plan.dimensions.height,
                     kCVPixelBufferMetalCompatibilityKey as String: true,
+                    kCVPixelBufferIOSurfacePropertiesKey as String: [:],
                 ]
             )
             guard writer.canAdd(input) else {
@@ -1801,7 +1802,13 @@ enum SideBySideRestoration {
             report("Frame compositing concurrency: \(compositeConcurrency)")
             report(
                 "Fisheye compositor: "
-                    + (projection == .fisheye && metalCompositor != nil ? "Metal" : "CPU")
+                    + {
+                        guard projection == .fisheye, let metalCompositor else {
+                            return "CPU"
+                        }
+                        return metalCompositor.prefersTextureSurfaces
+                            ? "Metal zero-copy texture" : "Metal buffer-copy fallback"
+                    }()
             )
             guard let pool = adaptor.pixelBufferPool else {
                 throw DeformConvError.commandFailed("video writer has no pixel-buffer pool")
