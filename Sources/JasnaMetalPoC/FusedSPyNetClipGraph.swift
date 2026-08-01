@@ -103,12 +103,18 @@ final class FusedSPyNetClipGraph {
                 packageURL: modelsURL.appendingPathComponent("spynet_level_\(level).mtlpackage")
             )
         }
+        // All pair/direction dispatches at a level are encoded serially. Keep
+        // one scratch heap per level rather than one per pair and direction.
+        // For a 30-frame clip this removes 342 identical MTLHeap allocations.
+        let levelHeaps = try levelPipelines.map {
+            try Support.makeHeap(device: device, size: $0.intermediatesHeapSize)
+        }
 
         var builtPairs = [[[FusedSPyNetLevel]]]()
         var builtPyramidArguments = [any MTL4ArgumentTable]()
         var buffers = sourceFrames + downsampledFrames + [zeroFlow]
         var mutableTransient = downsampledFrames + [zeroFlow]
-        var mutableHeaps = [MTLHeap]()
+        let mutableHeaps = levelHeaps
         var tensors = [any MTLTensor]()
         for pairIndex in 0..<(frameCount - 1) {
             let referencePyramid = try sizes.map {
@@ -159,9 +165,7 @@ final class FusedSPyNetClipGraph {
                     )
                     let shapeBuffer = try Support.makeConstant(device: device, value: &shape)
                     let pipeline = levelPipelines[level]
-                    let heap = try Support.makeHeap(
-                        device: device, size: pipeline.intermediatesHeapSize
-                    )
+                    let heap = levelHeaps[level]
                     directions[direction].append(FusedSPyNetLevel(
                         size: size, pipeline: pipeline, heap: heap,
                         featureBuffer: featureBuffer, residualBuffer: residualBuffer,
@@ -187,7 +191,6 @@ final class FusedSPyNetClipGraph {
                     tensors += [featureTensor, residualTensor]
                     buffers += [featureBuffer, residualBuffer, baseFlow, outputFlow, shapeBuffer]
                     mutableTransient += [featureBuffer, residualBuffer, baseFlow, outputFlow]
-                    mutableHeaps.append(heap)
                 }
             }
             builtPairs.append(directions)

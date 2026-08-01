@@ -19,6 +19,44 @@ struct FusedFourPassRecurrenceResult {
 }
 
 @available(macOS 27.0, *)
+private final class ProductionFusedGraphRunner: @unchecked Sendable {
+    private let lock = NSLock()
+    private let execute: ([[Float16]]) throws -> FusedFourPassRecurrenceResult
+
+    init(execute: @escaping ([[Float16]]) throws -> FusedFourPassRecurrenceResult) {
+        self.execute = execute
+    }
+
+    func restore(_ frames: [[Float16]]) throws -> FusedFourPassRecurrenceResult {
+        lock.lock()
+        defer { lock.unlock() }
+        return try execute(frames)
+    }
+}
+
+@available(macOS 27.0, *)
+private final class ProductionFusedGraphCache: @unchecked Sendable {
+    static let shared = ProductionFusedGraphCache()
+
+    private let lock = NSLock()
+    private var runners = [String: ProductionFusedGraphRunner]()
+
+    private init() {}
+
+    func runner(for key: String) -> ProductionFusedGraphRunner? {
+        lock.lock()
+        defer { lock.unlock() }
+        return runners[key]
+    }
+
+    func retain(_ runner: ProductionFusedGraphRunner, for key: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        if runners[key] == nil { runners[key] = runner }
+    }
+}
+
+@available(macOS 27.0, *)
 private struct FusedBranchRuntime {
     let name: String
     let direction: PropagationDirection
@@ -67,6 +105,15 @@ func verifyFusedFourPassRecurrence(
     let hasFlowOracle = !backwardFlows.isEmpty || !forwardFlows.isEmpty
     let hasStagedPropagation = !stagedBranchFrames.isEmpty
     let hasStagedRestoration = !stagedRestoredFrames.isEmpty
+    let reusableProductionGraph = frameCount == 30
+        && warmupCount == 0
+        && measurementCount == 1
+        && !collectDiagnostics
+        && !hasFlowOracle
+        && !hasStagedPropagation
+        && !hasStagedRestoration
+    let productionGraphKey = "\(device.registryID):\(modelsURL.standardizedFileURL.path):"
+        + "\(weightsURL.standardizedFileURL.path):\(frameCount)"
     let branchSpecs: [(String, PropagationDirection)] = [
         ("backward_1", .backward), ("forward_1", .forward),
         ("backward_2", .backward), ("forward_2", .forward),
@@ -94,6 +141,14 @@ func verifyFusedFourPassRecurrence(
           ))
     else { throw DeformConvError.invalidShape }
 
+    if reusableProductionGraph,
+       let runner = ProductionFusedGraphCache.shared.runner(for: productionGraphKey)
+    {
+        return try runner.restore(inputFrames)
+    }
+
+    var activeInputFrames = inputFrames
+
     let featurePipeline = try makeMetalMLPipeline(
         device: device,
         packageURL: modelsURL.appendingPathComponent("feature_extract.mtlpackage")
@@ -102,12 +157,18 @@ func verifyFusedFourPassRecurrence(
         device: device,
         packageURL: modelsURL.appendingPathComponent("upsample.mtlpackage")
     )
-    let featureHeaps = try (0..<frameCount).map { _ in
-        try Support.makeHeap(device: device, size: featurePipeline.intermediatesHeapSize)
-    }
-    let upsampleHeaps = try (0..<frameCount).map { _ in
-        try Support.makeHeap(device: device, size: upsamplePipeline.intermediatesHeapSize)
-    }
+    // Metal ML's intermediates heap is scratch storage for one dispatch. These
+    // networks execute serially in one command buffer, so a pipeline can reuse
+    // the same heap for every frame instead of allocating 2 * frameCount heaps
+    // for every restored crop.
+    let featureHeap = try Support.makeHeap(
+        device: device, size: featurePipeline.intermediatesHeapSize
+    )
+    let upsampleHeap = try Support.makeHeap(
+        device: device, size: upsamplePipeline.intermediatesHeapSize
+    )
+    let featureHeaps = [MTLHeap](repeating: featureHeap, count: frameCount)
+    let upsampleHeaps = [MTLHeap](repeating: upsampleHeap, count: frameCount)
     var heldTensors = [any MTLTensor]()
     var frameBuffers = [MTLBuffer]()
     var spatialBuffers = [MTLBuffer]()
@@ -422,7 +483,7 @@ func verifyFusedFourPassRecurrence(
             buffer.contents().initializeMemory(as: UInt8.self, repeating: 0, count: buffer.length)
         }
         for frame in 0..<frameCount {
-            inputFrames[frame].withUnsafeBufferPointer { source in
+            activeInputFrames[frame].withUnsafeBufferPointer { source in
                 frameBuffers[frame].contents().bindMemory(to: Float16.self, capacity: frameElements)
                     .update(from: source.baseAddress!, count: frameElements)
             }
@@ -797,7 +858,7 @@ func verifyFusedFourPassRecurrence(
     }
     _ = heldTensors
     _ = branches.map(\.backboneInputTensor)
-    return FusedFourPassRecurrenceResult(
+    let result = FusedFourPassRecurrenceResult(
         statistics: statistics,
         propagationRepeatMaximumError: propagationRepeatMaximumError,
         propagationStagedMaximumError: propagationStagedMaximumError,
@@ -813,4 +874,47 @@ func verifyFusedFourPassRecurrence(
         propagatedFrames: lastOutputs,
         restoredFrames: lastRestored
     )
+    if reusableProductionGraph {
+        let runner = ProductionFusedGraphRunner { frames in
+            guard frames.count == frameCount,
+                  frames.allSatisfy({ $0.count == frameElements })
+            else { throw DeformConvError.invalidShape }
+            // Argument tables store resource IDs, not strong ownership of the
+            // tensor wrappers that created those IDs. A retained production
+            // graph must therefore keep every tensor alive across executions.
+            _ = heldTensors
+            _ = branches.map(\.backboneInputTensor)
+            activeInputFrames = frames
+            let (milliseconds, _, restored, _) = try execute()
+            for (frame, values) in restored.enumerated() {
+                for (index, value) in values.enumerated() where !Float(value).isFinite {
+                    throw DeformConvError.nonFiniteOutput(
+                        "fused graph produced a non-finite output at frame \(frame), "
+                            + "element \(index)"
+                    )
+                }
+            }
+            guard let statistics = BenchmarkStatistics([milliseconds]) else {
+                throw DeformConvError.commandFailed("invalid fused four-pass timing")
+            }
+            return FusedFourPassRecurrenceResult(
+                statistics: statistics,
+                propagationRepeatMaximumError: 0,
+                propagationStagedMaximumError: 0,
+                restoredRepeatMaximumError: 0,
+                restoredStagedMaximumError: 0,
+                residualMaximumError: 0,
+                flowOracleCompared: false,
+                flowRepeatMaximumError: 0,
+                flowOracleMaximumError: 0,
+                flowChecksums: [],
+                propagationChecksums: [],
+                restoredChecksums: [Double](repeating: 0, count: frameCount),
+                propagatedFrames: [],
+                restoredFrames: restored
+            )
+        }
+        ProductionFusedGraphCache.shared.retain(runner, for: productionGraphKey)
+    }
+    return result
 }

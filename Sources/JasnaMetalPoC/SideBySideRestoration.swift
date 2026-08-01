@@ -36,6 +36,7 @@ enum SideBySideRestoration {
         let prepared: PreparedRegionRestoration
         let frames: [[Float16]]
         let gpuMilliseconds: Double
+        let wallMilliseconds: Double
     }
 
     private final class RegionRestorationBatch: @unchecked Sendable {
@@ -64,6 +65,7 @@ enum SideBySideRestoration {
         func execute(_ index: Int) {
             do {
                 let item = work[index]
+                let started = ContinuousClock.now
                 let restored = try SideBySideRestoration.restoreTileWithFallback(
                     device: device,
                     modelsURL: modelsURL,
@@ -71,11 +73,15 @@ enum SideBySideRestoration {
                     inputFrames: item.inputFrames,
                     context: item.context
                 )
+                let elapsed = started.duration(to: .now).components
+                let wallMilliseconds = Double(elapsed.seconds) * 1_000
+                    + Double(elapsed.attoseconds) / 1_000_000_000_000_000
                 lock.lock()
                 completed[index] = CompletedRegionRestoration(
                     prepared: item,
                     frames: restored.frames,
-                    gpuMilliseconds: restored.gpuMilliseconds
+                    gpuMilliseconds: restored.gpuMilliseconds,
+                    wallMilliseconds: wallMilliseconds
                 )
                 lock.unlock()
             } catch {
@@ -927,7 +933,8 @@ enum SideBySideRestoration {
                     report(
                         "Window \(windowIndex + 1)/\(windowCount): mosaic crop "
                             + "\(completedCount)/\(regions.count), GPU "
-                            + "\(String(format: "%.3f", gpuMilliseconds)) ms"
+                            + "\(String(format: "%.3f", gpuMilliseconds)) ms cumulative, "
+                            + "crop wall \(String(format: "%.3f", restored.wallMilliseconds)) ms"
                     )
                 }
                 nextRegion = batchEnd

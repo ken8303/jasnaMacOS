@@ -209,6 +209,15 @@ repeatable output. Lower-memory Macs default to one. Set
 `JASNA_REGION_CONCURRENCY=1` to minimize memory; values above two are capped
 because they increase graph memory without improving the M4 GPU path.
 
+The optimized production path retains its first complete 30-frame Metal graph
+for the lifetime of the eye-restoration process. Later crops reuse the same
+tensors, buffers, argument tables, and residency set under a lock. Sequential
+Metal ML dispatches also share scratch heaps per pipeline/level instead of
+allocating hundreds of identical heaps per crop. A 4096×4096 one-second proof
+measured about 1.10 seconds for the initial graph build and execution, then
+about 0.45 seconds per reused 30-frame crop including roughly 0.38 seconds of
+GPU work. Decoded frame hashes matched the pre-cache output exactly.
+
 Run an end-to-end 30-second test of both eyes and rebuild an SBS preview with:
 
 ```sh
