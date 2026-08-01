@@ -21,6 +21,8 @@ FAST_ENCODE="${JASNA_FAST_ENCODE:-1}"
 DETECT_BATCH_SIZE="${JASNA_DETECT_BATCH_SIZE:-2}"
 DETECT_DECODE_MODE="${JASNA_DETECT_DECODE_MODE:-sequential}"
 REGION_DURATION="${JASNA_REGION_DURATION:-1.0}"
+SPARSE_BATCH_MODE="${JASNA_SPARSE_BATCH_MODE:-run}"
+SPARSE_BATCH_FILE="${JASNA_SPARSE_BATCH_FILE:-}"
 
 [[ "$EYE" == "left" || "$EYE" == "right" ]] || usage
 [[ -f "$INPUT_PATH" ]] || {
@@ -51,6 +53,17 @@ REGION_DURATION="${JASNA_REGION_DURATION:-1.0}"
   echo "error: JASNA_FAST_ENCODE must be 0 or 1" >&2
   exit 1
 }
+[[ "$SPARSE_BATCH_MODE" == "run" || "$SPARSE_BATCH_MODE" == "prepare" \
+  || "$SPARSE_BATCH_MODE" == "finalize" ]] || {
+  echo "error: JASNA_SPARSE_BATCH_MODE must be run, prepare, or finalize" >&2
+  exit 1
+}
+if [[ "$SPARSE_BATCH_MODE" != "run" ]]; then
+  [[ "$SPARSE_MOSAIC" == "1" && -n "$SPARSE_BATCH_FILE" ]] || {
+    echo "error: coordinated sparse mode requires JASNA_SPARSE_BATCH_FILE" >&2
+    exit 1
+  }
+fi
 
 ENCODER_SPEED_ARGS=()
 if [[ "$FAST_ENCODE" == "1" ]]; then
@@ -220,7 +233,7 @@ SOURCE_SEGMENTS=("$SOURCE_DIR"/"$EYE"-*.mov)
 echo "Stage 2/3: restoring ${#SOURCE_SEGMENTS[@]} $EYE-eye segment(s)"
 RESTORED_SEGMENTS=()
 SPARSE_BATCH_ARGS=()
-if [[ "$SPARSE_MOSAIC" == "1" ]]; then
+if [[ "$SPARSE_MOSAIC" == "1" && "$SPARSE_BATCH_MODE" != "finalize" ]]; then
   for SOURCE_SEGMENT in "${SOURCE_SEGMENTS[@]}"; do
     SEGMENT_NAME="$(basename "$SOURCE_SEGMENT")"
     SEGMENT_STEM="${SEGMENT_NAME%.*}"
@@ -247,7 +260,25 @@ if [[ "$SPARSE_MOSAIC" == "1" ]]; then
       )
     fi
   done
-  if (( ${#SPARSE_BATCH_ARGS[@]} > 0 )); then
+  if [[ "$SPARSE_BATCH_MODE" == "prepare" ]]; then
+    for ((ARG_INDEX = 0; ARG_INDEX < ${#SPARSE_BATCH_ARGS[@]}; ARG_INDEX += 4)); do
+      for ((FIELD_INDEX = ARG_INDEX; FIELD_INDEX < ARG_INDEX + 4; FIELD_INDEX++)); do
+        [[ "${SPARSE_BATCH_ARGS[$FIELD_INDEX]}" != *$'\t'* \
+          && "${SPARSE_BATCH_ARGS[$FIELD_INDEX]}" != *$'\n'* ]] || {
+          echo "error: restoration paths cannot contain tabs or newlines" >&2
+          exit 1
+        }
+      done
+      printf '%s\t%s\t%s\t%s\n' \
+        "${SPARSE_BATCH_ARGS[$ARG_INDEX]}" \
+        "${SPARSE_BATCH_ARGS[$((ARG_INDEX + 1))]}" \
+        "${SPARSE_BATCH_ARGS[$((ARG_INDEX + 2))]}" \
+        "${SPARSE_BATCH_ARGS[$((ARG_INDEX + 3))]}" \
+        >> "$SPARSE_BATCH_FILE"
+    done
+    echo "Prepared $((${#SPARSE_BATCH_ARGS[@]} / 4)) pending segment(s) for shared restoration"
+    exit 0
+  elif (( ${#SPARSE_BATCH_ARGS[@]} > 0 )); then
     echo "Restoring $((${#SPARSE_BATCH_ARGS[@]} / 4)) pending segment(s) with one retained Metal ML graph"
     "$ROOT_DIR/script/build_and_run.sh" --restore-eye-windows-sparse-batch \
       "${SPARSE_BATCH_ARGS[@]}"

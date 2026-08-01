@@ -224,6 +224,10 @@ resume cache, and completion marker. A two-job production fixture reduced the
 second job's first-crop wall time from 786 ms to 101 ms; both decoded 30-frame
 outputs had identical frame hashes. Restarting still skips validated windows
 and resumes an interrupted crop from its segment-specific persistent cache.
+The 30-second SBS test coordinates both eyes through the same batch as well.
+On an 8192×4096 end-to-end fixture, the right eye's first crop reused the graph
+and fell from 1.32 seconds to 456 ms. A second invocation skipped both completed
+eyes and the final SBS output without running the model or encoder again.
 
 Sparse fisheye compositing runs the delta sampling and feather blending on
 Metal. Its default zero-copy path wraps the decoder and encoder pixel buffers

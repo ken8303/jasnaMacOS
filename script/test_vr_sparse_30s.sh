@@ -88,6 +88,7 @@ LEFT_OUTPUT="$WORK_DIR/left-restored.mov"
 RIGHT_OUTPUT="$WORK_DIR/right-restored.mov"
 FINAL_TEMP="$WORK_DIR/.joined-sbs-writing.${OUTPUT_NAME##*.}"
 LOG_PATH="$OUTPUT_DIR/${OUTPUT_STEM}.jasna-vr30.log"
+SHARED_BATCH_PATH="$WORK_DIR/pending-eye-restorations.tsv"
 
 mkdir -p "$SOURCE_DIR"
 RUN_CONFIG="input=$INPUT_PATH
@@ -284,14 +285,54 @@ if [[ -z "${JASNA_APP_BINARY:-}" ]]; then
   export JASNA_APP_BINARY
 fi
 
-echo "Stage 2/4: detecting and restoring the left eye"
+echo "Stage 2/4: preparing mosaic regions for both eyes"
+: > "$SHARED_BATCH_PATH"
+JASNA_SPARSE_BATCH_MODE=prepare \
+JASNA_SPARSE_BATCH_FILE="$SHARED_BATCH_PATH" \
 JASNA_SEGMENT_SECONDS=30 \
 JASNA_EYE_BITRATE="$EYE_BITRATE" \
 JASNA_VR_PROJECTION=fisheye \
   "$ROOT_DIR/script/restore_vr_eye_sparse.sh" \
     "$TEST_INPUT" left "$LEFT_OUTPUT"
 
-echo "Stage 3/4: detecting and restoring the right eye"
+JASNA_SPARSE_BATCH_MODE=prepare \
+JASNA_SPARSE_BATCH_FILE="$SHARED_BATCH_PATH" \
+JASNA_SEGMENT_SECONDS=30 \
+JASNA_EYE_BITRATE="$EYE_BITRATE" \
+JASNA_VR_PROJECTION=fisheye \
+  "$ROOT_DIR/script/restore_vr_eye_sparse.sh" \
+    "$TEST_INPUT" right "$RIGHT_OUTPUT"
+
+SHARED_BATCH_ARGS=()
+while IFS=$'\t' read -r JOB_INPUT JOB_WINDOWS JOB_MANIFEST JOB_CACHE JOB_EXTRA; do
+  [[ -n "$JOB_INPUT" ]] || continue
+  [[ -n "$JOB_WINDOWS" && -n "$JOB_MANIFEST" && -n "$JOB_CACHE" && -z "$JOB_EXTRA" ]] || {
+    echo "error: malformed coordinated restoration entry" >&2
+    exit 1
+  }
+  SHARED_BATCH_ARGS+=("$JOB_INPUT" "$JOB_WINDOWS" "$JOB_MANIFEST" "$JOB_CACHE")
+done < "$SHARED_BATCH_PATH"
+
+if (( ${#SHARED_BATCH_ARGS[@]} > 0 )); then
+  echo "Restoring $((${#SHARED_BATCH_ARGS[@]} / 4)) left/right segment job(s) with one retained Metal ML graph"
+  JASNA_VR_PROJECTION=fisheye \
+    "$ROOT_DIR/script/build_and_run.sh" --restore-eye-windows-sparse-batch \
+      "${SHARED_BATCH_ARGS[@]}"
+else
+  echo "All left/right restoration windows are already complete"
+fi
+
+echo "Stage 3/4: finalizing independently restartable left and right eyes"
+JASNA_SPARSE_BATCH_MODE=finalize \
+JASNA_SPARSE_BATCH_FILE="$SHARED_BATCH_PATH" \
+JASNA_SEGMENT_SECONDS=30 \
+JASNA_EYE_BITRATE="$EYE_BITRATE" \
+JASNA_VR_PROJECTION=fisheye \
+  "$ROOT_DIR/script/restore_vr_eye_sparse.sh" \
+    "$TEST_INPUT" left "$LEFT_OUTPUT"
+
+JASNA_SPARSE_BATCH_MODE=finalize \
+JASNA_SPARSE_BATCH_FILE="$SHARED_BATCH_PATH" \
 JASNA_SEGMENT_SECONDS=30 \
 JASNA_EYE_BITRATE="$EYE_BITRATE" \
 JASNA_VR_PROJECTION=fisheye \
