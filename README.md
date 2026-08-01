@@ -155,8 +155,99 @@ JASNA_LEFT_WORK_DIR=/path/to/old.jasna-work \
 
 The final merge copies audio and ordinary container metadata. Injection of
 Spherical Video `st3d`/`sv3d` atoms is not implemented yet, so players may need
-the output manually identified as left-right SBS VR. Sparse mosaic detection
-and region-only restoration remain the next performance step.
+the output manually identified as left-right SBS VR.
+
+Sparse mosaic restoration follows VR Video Toolbox CE's pre-scan design. A
+YOLO detector samples each physical eye every 0.1 seconds, separates distant
+detections, emits short 0.2-second tracked regions for moving mosaics, and
+writes a JSON manifest. The
+Metal restorer then runs only the detected 256×256 model crops. Clean
+one-second windows bypass the Jasna model. Following Jasna's VR180 path, the
+sparse wrapper defaults to fisheye projection: each region is flattened before
+restoration, only the restored delta is inverse-projected, and a feathered mask
+places that delta onto the untouched source frame. Set
+`JASNA_VR_PROJECTION=raw` only when comparing against the older flat-crop path.
+Detector setup is isolated from Swift:
+
+```sh
+./script/setup_mosaic_detector.sh
+```
+
+The setup downloads the public 6 MB
+`lada_vr_mosaic_detection_model_v2_fast.pt` model used by VR Video Toolbox CE
+and installs Ultralytics in `.venv-mosaic`. Neither environment nor model is
+tracked by Git. Test the left eye with:
+
+```sh
+./script/restore_vr_eye_sparse.sh \
+  /path/to/input_30fps.mp4 left /path/to/restored-left.mov
+```
+
+Detection manifests, source segments, restored windows, caches, and the log
+remain beside the requested output, so interrupted work is restartable. A real
+4096×4096 one-second left-eye fisheye proof detected three regions. The Metal
+model used 1.31 seconds of GPU time for all three crops; compositing and hardware
+HEVC encoding brought the post-build work to roughly six seconds. Its output was
+validated as exactly 30 frames at 30 fps. Projection mode is included in the
+resume-cache key, so an older raw crop can never be reused for a fisheye run.
+
+Persistent crop caches are flushed every five completed regions and at the end
+of every window. After an unexpected restart, at most four small regions are
+recomputed. Set `JASNA_REGION_CHECKPOINT_INTERVAL=1` to force per-region
+durability, at the cost of more disk synchronization.
+
+On Macs with at least 16 GB of memory, two independent crop graphs are prepared
+concurrently by default, while Metal ML execution remains serialized for
+repeatable output. Lower-memory Macs default to one. Set
+`JASNA_REGION_CONCURRENCY=1` to minimize memory; values above two are capped
+because they increase graph memory without improving the M4 GPU path.
+
+Run an end-to-end 30-second test of both eyes and rebuild an SBS preview with:
+
+```sh
+./script/test_vr_sparse_30s.sh \
+  /path/to/input-sbs.mp4 /path/to/restored-vr-test.mov 00:12:00
+```
+
+The start time is optional and defaults to the beginning. The script prepares
+an exact 30 fps test clip, restores the left and right eyes sequentially, copies
+the test clip's audio, and keeps all intermediate files and logs beside the
+output. Repeating the same command resumes incomplete work and skips validated
+eye outputs.
+
+The test wrapper reuses a fresh release executable when available, otherwise it
+builds once and shares that executable across both eyes. When the source is
+already 30 fps and the requested start is zero, it copies the first 30 seconds
+without an unnecessary 8K re-encode. VideoToolbox
+speed-priority mode is enabled by default; set `JASNA_FAST_ENCODE=0` to compare
+its output with the slower quality-priority encoder. Set
+`JASNA_FAST_SOURCE_COPY=0` to force regeneration of the 30 fps test source.
+Sparse mosaic scans decode HEVC sequentially and infer two sampled frames at a
+time. Set `JASNA_DETECT_BATCH_SIZE=1` to minimize memory, or
+`JASNA_DETECT_DECODE_MODE=seek` to compare with the former random-seek path.
+Fisheye sampling coordinates and interpolation weights are calculated once per
+mosaic region and reused across its active frames.
+Inactive region/frame cache slots are sparse file holes and are skipped during
+compositing, reducing physical cache I/O without changing resumable offsets.
+
+When the supporter-only Jasna SD1.5 checkpoint is unavailable, the public
+DeepMosaics BVDNet checkpoint can be tested on a persistent 30-second left-eye
+clip:
+
+```sh
+./script/test_deepmosaics_left.sh \
+  /path/to/input_30fps.mp4 /path/to/restored-left-30s.mov
+```
+
+The runner automatically uses PyTorch MPS when the M4 GPU is accessible and
+falls back to CPU otherwise. It batches all detected regions in each one-second
+window, stores every region result before encoding, validates every 30-frame
+HEVC window, and resumes completed work. On an M4, a three-region window fell
+from about 87 seconds on the original sequential CPU path to 38.2 seconds with
+MPS batching. GPU and CPU outputs had a 99th-percentile difference of 1/255.
+The 30-second test completed as 900 validated 4096x4096 frames; its public
+checkpoint produces plausible smoothing rather than recovery of true hidden
+detail.
 
 For the lower-risk physical-file workflow, test one eye first with
 `restore_vr_eye_segments.sh`. It decodes and crops the selected SBS half into

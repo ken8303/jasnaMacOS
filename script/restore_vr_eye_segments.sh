@@ -15,6 +15,11 @@ OUTPUT_PATH="$3"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SEGMENT_SECONDS="${JASNA_SEGMENT_SECONDS:-60}"
 EYE_BITRATE="${JASNA_EYE_BITRATE:-20000000}"
+SPARSE_MOSAIC="${JASNA_SPARSE_MOSAIC:-0}"
+VR_PROJECTION="${JASNA_VR_PROJECTION:-raw}"
+FAST_ENCODE="${JASNA_FAST_ENCODE:-1}"
+DETECT_BATCH_SIZE="${JASNA_DETECT_BATCH_SIZE:-2}"
+DETECT_DECODE_MODE="${JASNA_DETECT_DECODE_MODE:-sequential}"
 
 [[ "$EYE" == "left" || "$EYE" == "right" ]] || usage
 [[ -f "$INPUT_PATH" ]] || {
@@ -37,6 +42,19 @@ EYE_BITRATE="${JASNA_EYE_BITRATE:-20000000}"
   echo "error: JASNA_EYE_BITRATE must be an integer bit rate" >&2
   exit 1
 }
+[[ "$VR_PROJECTION" == "raw" || "$VR_PROJECTION" == "fisheye" ]] || {
+  echo "error: JASNA_VR_PROJECTION must be raw or fisheye" >&2
+  exit 1
+}
+[[ "$FAST_ENCODE" == "0" || "$FAST_ENCODE" == "1" ]] || {
+  echo "error: JASNA_FAST_ENCODE must be 0 or 1" >&2
+  exit 1
+}
+
+ENCODER_SPEED_ARGS=()
+if [[ "$FAST_ENCODE" == "1" ]]; then
+  ENCODER_SPEED_ARGS=(-realtime 1 -prio_speed 1)
+fi
 
 if command -v ffmpeg >/dev/null 2>&1; then
   FFMPEG_PATH="$(command -v ffmpeg)"
@@ -64,6 +82,10 @@ LOG_PATH="$OUTPUT_DIR/${OUTPUT_STEM}.${EYE}-segments.log"
 SOURCE_DIR="$WORK_DIR/source"
 RESTORED_DIR="$WORK_DIR/restored"
 CACHE_DIR="$WORK_DIR/cache"
+if [[ "$SPARSE_MOSAIC" == "1" ]]; then
+  RESTORED_DIR="$WORK_DIR/restored-sparse-crop-v3-$VR_PROJECTION"
+  CACHE_DIR="$WORK_DIR/cache-sparse-crop-v3-$VR_PROJECTION"
+fi
 SOURCE_DONE="$WORK_DIR/source.done"
 MANIFEST_PATH="$WORK_DIR/restored-concat.txt"
 TEMP_OUTPUT="$WORK_DIR/${EYE}-joined.mov"
@@ -78,6 +100,12 @@ echo "Output:           $OUTPUT_PATH"
 echo "Work dir:         $WORK_DIR"
 echo "Log:              $LOG_PATH"
 echo "Segment duration: $SEGMENT_SECONDS seconds"
+echo "Sparse mosaic:    $SPARSE_MOSAIC"
+echo "VR projection:    $VR_PROJECTION"
+echo "Fast encoding:    $FAST_ENCODE"
+if [[ "$SPARSE_MOSAIC" == "1" ]]; then
+  echo "Detector:         $DETECT_DECODE_MODE decode, batch $DETECT_BATCH_SIZE"
+fi
 
 IFS=, read -r SOURCE_WIDTH SOURCE_HEIGHT < <(
   "$FFPROBE_PATH" -v error -select_streams v:0 \
@@ -103,12 +131,16 @@ echo "SBS canvas: ${SOURCE_WIDTH}x${SOURCE_HEIGHT}; selected eye: ${EYE_WIDTH}x$
 video_duration() {
   local candidate="$1"
   local duration
-  duration="$("$FFPROBE_PATH" -v error -select_streams v:0 \
-    -show_entries stream=duration -of default=noprint_wrappers=1:nokey=1 \
+  # Prefer the container timeline. A constant-frame-rate conversion can have
+  # one final video frame beyond the track's reported stream duration while
+  # still matching the MP4/MOV presentation duration exactly.
+  duration="$("$FFPROBE_PATH" -v error -show_entries format=duration \
+    -of default=noprint_wrappers=1:nokey=1 \
     "$candidate" 2>/dev/null)" || return 1
   if [[ -z "$duration" || "$duration" == "N/A" ]]; then
-    duration="$("$FFPROBE_PATH" -v error -show_entries format=duration \
-      -of default=noprint_wrappers=1:nokey=1 "$candidate" 2>/dev/null)" || return 1
+    duration="$("$FFPROBE_PATH" -v error -select_streams v:0 \
+      -show_entries stream=duration -of default=noprint_wrappers=1:nokey=1 \
+      "$candidate" 2>/dev/null)" || return 1
   fi
   [[ "$duration" =~ ^[0-9]+([.][0-9]+)?$ ]] || return 1
   echo "$duration"
@@ -126,7 +158,7 @@ video_duration_matches() {
   local candidate_duration
   candidate_duration="$(video_duration "$candidate")" || return 1
   /usr/bin/awk -v expected="$expected" -v candidate="$candidate_duration" \
-    'BEGIN { delta = expected - candidate; if (delta < 0) delta = -delta; exit !(delta <= 0.01) }'
+    'BEGIN { delta = expected - candidate; if (delta < 0) delta = -delta; exit !(delta <= 0.05) }'
 }
 
 completed_eye_output() {
@@ -155,6 +187,7 @@ if [[ ! -f "$SOURCE_DONE" ]]; then
     -vf "crop=${EYE_WIDTH}:${SOURCE_HEIGHT}:${CROP_X}:0,fps=30" \
     -an \
     -c:v hevc_videotoolbox \
+    "${ENCODER_SPEED_ARGS[@]}" \
     -pix_fmt yuv420p \
     -b:v "$EYE_BITRATE" \
     -maxrate "$((EYE_BITRATE * 3 / 2))" \
@@ -189,6 +222,7 @@ for SOURCE_SEGMENT in "${SOURCE_SEGMENTS[@]}"; do
   SEGMENT_CACHE="$CACHE_DIR/$SEGMENT_STEM.jasna-work"
   SEGMENT_WINDOWS="$RESTORED_DIR/${SEGMENT_STEM}.windows"
   SEGMENT_MANIFEST="$RESTORED_DIR/${SEGMENT_STEM}-windows.txt"
+  MOSAIC_MANIFEST="$RESTORED_DIR/${SEGMENT_STEM}-mosaic-regions.json"
   TEMP_RESTORED_SEGMENT="$RESTORED_DIR/.${SEGMENT_STEM}-joining.mov"
   SEGMENT_DURATION="$(video_duration "$SOURCE_SEGMENT")"
 
@@ -200,9 +234,20 @@ for SOURCE_SEGMENT in "${SOURCE_SEGMENTS[@]}"; do
   if [[ ! -f "$SEGMENT_DONE" ]]; then
     echo "Restoring $SEGMENT_NAME (${SEGMENT_DURATION}s)"
     mkdir -p "$SEGMENT_CACHE" "$SEGMENT_WINDOWS"
-    JASNA_WORK_DIR="$SEGMENT_CACHE" \
-      "$ROOT_DIR/script/build_and_run.sh" --restore-eye-windows \
-        "$SOURCE_SEGMENT" "$SEGMENT_WINDOWS"
+    if [[ "$SPARSE_MOSAIC" == "1" ]]; then
+      if [[ ! -s "$MOSAIC_MANIFEST" ]]; then
+        "$ROOT_DIR/script/scan_mosaic_regions.sh" "$SOURCE_SEGMENT" "$MOSAIC_MANIFEST"
+      else
+        echo "Reusing mosaic-region manifest: $MOSAIC_MANIFEST"
+      fi
+      JASNA_WORK_DIR="$SEGMENT_CACHE" \
+        "$ROOT_DIR/script/build_and_run.sh" --restore-eye-windows-sparse \
+          "$SOURCE_SEGMENT" "$SEGMENT_WINDOWS" "$MOSAIC_MANIFEST"
+    else
+      JASNA_WORK_DIR="$SEGMENT_CACHE" \
+        "$ROOT_DIR/script/build_and_run.sh" --restore-eye-windows \
+          "$SOURCE_SEGMENT" "$SEGMENT_WINDOWS"
+    fi
 
     WINDOW_OUTPUTS=("$SEGMENT_WINDOWS"/window-[0-9][0-9][0-9][0-9][0-9].mov)
     [[ -e "${WINDOW_OUTPUTS[0]}" ]] || {

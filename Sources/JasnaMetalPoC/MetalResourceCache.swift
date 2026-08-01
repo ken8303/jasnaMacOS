@@ -6,11 +6,21 @@ final class MetalResourceCache: @unchecked Sendable {
     static let shared = MetalResourceCache()
 
     private let lock = NSLock()
+    private let machineLearningExecutionLock = NSLock()
     private var machineLearningPipelines = [String: any MTL4MachineLearningPipelineState]()
     private var shaderLibraries = [UInt64: MTLLibrary]()
+    private var computePipelines = [String: MTLComputePipelineState]()
     private var deformConvBuffers = [String: (weight: MTLBuffer, bias: MTLBuffer)]()
 
     private init() {}
+
+    func beginMachineLearningExecution() {
+        machineLearningExecutionLock.lock()
+    }
+
+    func endMachineLearningExecution() {
+        machineLearningExecutionLock.unlock()
+    }
 
     func machineLearningPipeline(
         device: MTLDevice,
@@ -50,6 +60,26 @@ final class MetalResourceCache: @unchecked Sendable {
         defer { lock.unlock() }
         if let cached = shaderLibraries[key] { return cached }
         shaderLibraries[key] = created
+        return created
+    }
+
+    func computePipeline(
+        device: MTLDevice,
+        function: MTLFunction
+    ) throws -> MTLComputePipelineState {
+        let key = "\(device.registryID):\(function.name)"
+        lock.lock()
+        if let cached = computePipelines[key] {
+            lock.unlock()
+            return cached
+        }
+        lock.unlock()
+
+        let created = try device.makeComputePipelineState(function: function)
+        lock.lock()
+        defer { lock.unlock() }
+        if let cached = computePipelines[key] { return cached }
+        computePipelines[key] = created
         return created
     }
 

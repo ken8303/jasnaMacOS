@@ -55,7 +55,8 @@ func verifyFusedFourPassRecurrence(
     stagedBranchFrames: [[[Float16]]],
     stagedRestoredFrames: [[Float16]],
     warmupCount: Int = 3,
-    measurementCount: Int = 20
+    measurementCount: Int = 20,
+    collectDiagnostics: Bool = true
 ) throws -> FusedFourPassRecurrenceResult {
     typealias Support = Metal4GraphSupport
     let plane = 64 * 64
@@ -79,6 +80,7 @@ func verifyFusedFourPassRecurrence(
                   && (backwardFlows + forwardFlows).allSatisfy({ $0.count == 2 * plane })
           )),
           inputFrames.allSatisfy({ $0.count == frameElements }),
+          collectDiagnostics || (!hasFlowOracle && !hasStagedPropagation),
           (!hasStagedPropagation || (
               stagedBranchFrames.count == 4
                   && stagedBranchFrames.allSatisfy({ branch in
@@ -181,19 +183,26 @@ func verifyFusedFourPassRecurrence(
           let reconstructionAssemblyFunction = library.makeFunction(name: "assemble_reconstruction_fp16"),
           let frameResidualFunction = library.makeFunction(name: "add_frame_residual_fp16")
     else { throw DeformConvError.shaderResourceMissing }
-    let accumulatePipeline = try device.makeComputePipelineState(function: accumulateFunction)
-    let preparePipeline = try device.makeComputePipelineState(function: prepareFunction)
-    let transformPipeline = try device.makeComputePipelineState(function: transformFunction)
-    let gatherPipeline = try device.makeComputePipelineState(function: gatherFunction)
-    let gemmPipeline = try device.makeComputePipelineState(function: gemmFunction)
-    let gemmOutputPipeline = try device.makeComputePipelineState(function: gemmOutputFunction)
-    let simpleAssemblyPipeline = try device.makeComputePipelineState(function: simpleAssemblyFunction)
-    let temporalAssemblyPipeline = try device.makeComputePipelineState(function: temporalAssemblyFunction)
-    let residualPipeline = try device.makeComputePipelineState(function: residualFunction)
-    let reconstructionAssemblyPipeline = try device.makeComputePipelineState(
-        function: reconstructionAssemblyFunction
+    let cache = MetalResourceCache.shared
+    let accumulatePipeline = try cache.computePipeline(device: device, function: accumulateFunction)
+    let preparePipeline = try cache.computePipeline(device: device, function: prepareFunction)
+    let transformPipeline = try cache.computePipeline(device: device, function: transformFunction)
+    let gatherPipeline = try cache.computePipeline(device: device, function: gatherFunction)
+    let gemmPipeline = try cache.computePipeline(device: device, function: gemmFunction)
+    let gemmOutputPipeline = try cache.computePipeline(device: device, function: gemmOutputFunction)
+    let simpleAssemblyPipeline = try cache.computePipeline(
+        device: device, function: simpleAssemblyFunction
     )
-    let frameResidualPipeline = try device.makeComputePipelineState(function: frameResidualFunction)
+    let temporalAssemblyPipeline = try cache.computePipeline(
+        device: device, function: temporalAssemblyFunction
+    )
+    let residualPipeline = try cache.computePipeline(device: device, function: residualFunction)
+    let reconstructionAssemblyPipeline = try cache.computePipeline(
+        device: device, function: reconstructionAssemblyFunction
+    )
+    let frameResidualPipeline = try cache.computePipeline(
+        device: device, function: frameResidualFunction
+    )
     let spynetGraph = try FusedSPyNetClipGraph(
         device: device, modelsURL: modelsURL, library: library, sourceFrames: frameBuffers
     )
@@ -421,6 +430,8 @@ func verifyFusedFourPassRecurrence(
     }
 
     func execute() throws -> (Double, [[[Float16]]], [[Float16]], [[Float16]]) {
+        MetalResourceCache.shared.beginMachineLearningExecution()
+        defer { MetalResourceCache.shared.endMachineLearningExecution() }
         initializeBuffers()
         guard let allocator = device.makeCommandAllocator(),
               let commandBuffer = device.makeCommandBuffer()
@@ -639,20 +650,21 @@ func verifyFusedFourPassRecurrence(
         semaphore.wait()
         let (milliseconds, error) = commitResult.load()
         if let error { throw error }
-        let outputs = propagationBuffers.map { branch in
+        let outputs = collectDiagnostics ? propagationBuffers.map { branch in
             branch.map { buffer -> [Float16] in
                 let pointer = buffer.contents().bindMemory(to: Float16.self, capacity: featureCount)
                 return Array(UnsafeBufferPointer(start: pointer, count: featureCount))
             }
-        }
+        } : []
         let restored = restoredBuffers.map { buffer -> [Float16] in
             let pointer = buffer.contents().bindMemory(to: Float16.self, capacity: frameElements)
             return Array(UnsafeBufferPointer(start: pointer, count: frameElements))
         }
-        let flows = (backwardFlowBuffers + forwardFlowBuffers).map { buffer -> [Float16] in
+        let flows = collectDiagnostics ? (backwardFlowBuffers + forwardFlowBuffers).map {
+            buffer -> [Float16] in
             let pointer = buffer.contents().bindMemory(to: Float16.self, capacity: 2 * plane)
             return Array(UnsafeBufferPointer(start: pointer, count: 2 * plane))
-        }
+        } : []
         return (milliseconds, outputs, restored, flows)
     }
 
@@ -676,33 +688,35 @@ func verifyFusedFourPassRecurrence(
     var propagationStagedMaximumError: Float = 0
     var stagedBranchErrors = [Float](repeating: 0, count: 4)
     var checksums = [Double](repeating: 0, count: 4)
-    for branch in 0..<4 {
-        let finalFrame = branchSpecs[branch].1 == .backward ? 0 : frameCount - 1
-        for frame in 0..<frameCount {
-            for index in 0..<featureCount {
-                let value = Float(lastOutputs[branch][frame][index])
-                guard value.isFinite else {
-                    throw DeformConvError.commandFailed(
-                        "fused recurrence produced a non-finite feature in "
-                            + "\(branchSpecs[branch].0), frame \(frame), element \(index)"
+    if collectDiagnostics {
+        for branch in 0..<4 {
+            let finalFrame = branchSpecs[branch].1 == .backward ? 0 : frameCount - 1
+            for frame in 0..<frameCount {
+                for index in 0..<featureCount {
+                    let value = Float(lastOutputs[branch][frame][index])
+                    guard value.isFinite else {
+                        throw DeformConvError.commandFailed(
+                            "fused recurrence produced a non-finite feature in "
+                                + "\(branchSpecs[branch].0), frame \(frame), element \(index)"
+                        )
+                    }
+                    propagationRepeatMaximumError = max(
+                        propagationRepeatMaximumError,
+                        abs(Float(firstOutputs[branch][frame][index]) - value)
                     )
-                }
-                propagationRepeatMaximumError = max(
-                    propagationRepeatMaximumError,
-                    abs(Float(firstOutputs[branch][frame][index]) - value)
-                )
-                if hasStagedPropagation {
-                    propagationStagedMaximumError = max(
-                        propagationStagedMaximumError,
-                        abs(Float(stagedBranchFrames[branch][frame][index]) - value)
-                    )
-                    stagedBranchErrors[branch] = max(
-                        stagedBranchErrors[branch],
-                        abs(Float(stagedBranchFrames[branch][frame][index]) - value)
-                    )
-                }
-                if frame == finalFrame, index.isMultiple(of: 257) {
-                    checksums[branch] += Double(value)
+                    if hasStagedPropagation {
+                        propagationStagedMaximumError = max(
+                            propagationStagedMaximumError,
+                            abs(Float(stagedBranchFrames[branch][frame][index]) - value)
+                        )
+                        stagedBranchErrors[branch] = max(
+                            stagedBranchErrors[branch],
+                            abs(Float(stagedBranchFrames[branch][frame][index]) - value)
+                        )
+                    }
+                    if frame == finalFrame, index.isMultiple(of: 257) {
+                        checksums[branch] += Double(value)
+                    }
                 }
             }
         }
@@ -743,23 +757,25 @@ func verifyFusedFourPassRecurrence(
     var flowRepeatMaximumError: Float = 0
     var flowOracleMaximumError: Float = 0
     var flowChecksums = [Double](repeating: 0, count: 2 * flowCount)
-    for flow in 0..<(2 * flowCount) {
-        for index in 0..<(2 * plane) {
-            let value = Float(lastFlows[flow][index])
-            guard value.isFinite else {
-                throw DeformConvError.commandFailed(
-                    "fused SPyNet produced a non-finite flow \(flow), element \(index)"
+    if collectDiagnostics {
+        for flow in 0..<(2 * flowCount) {
+            for index in 0..<(2 * plane) {
+                let value = Float(lastFlows[flow][index])
+                guard value.isFinite else {
+                    throw DeformConvError.commandFailed(
+                        "fused SPyNet produced a non-finite flow \(flow), element \(index)"
+                    )
+                }
+                flowRepeatMaximumError = max(
+                    flowRepeatMaximumError, abs(Float(firstFlows[flow][index]) - value)
                 )
+                if hasFlowOracle {
+                    flowOracleMaximumError = max(
+                        flowOracleMaximumError, abs(Float(flowOracles[flow][index]) - value)
+                    )
+                }
+                if index.isMultiple(of: 257) { flowChecksums[flow] += Double(value) }
             }
-            flowRepeatMaximumError = max(
-                flowRepeatMaximumError, abs(Float(firstFlows[flow][index]) - value)
-            )
-            if hasFlowOracle {
-                flowOracleMaximumError = max(
-                    flowOracleMaximumError, abs(Float(flowOracles[flow][index]) - value)
-                )
-            }
-            if index.isMultiple(of: 257) { flowChecksums[flow] += Double(value) }
         }
     }
     guard propagationRepeatMaximumError <= 0.001,

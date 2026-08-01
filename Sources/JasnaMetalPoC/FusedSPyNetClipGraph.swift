@@ -60,10 +60,11 @@ final class FusedSPyNetClipGraph {
               let prepareFunction = library.makeFunction(name: "spynet_prepare_padded_fp16"),
               let addFunction = library.makeFunction(name: "spynet_add_flow_padded_fp16")
         else { throw DeformConvError.shaderResourceMissing }
-        downsamplePipeline = try device.makeComputePipelineState(function: downsampleFunction)
-        pyramidPipeline = try device.makeComputePipelineState(function: pyramidFunction)
-        preparePipeline = try device.makeComputePipelineState(function: prepareFunction)
-        addPipeline = try device.makeComputePipelineState(function: addFunction)
+        let cache = MetalResourceCache.shared
+        downsamplePipeline = try cache.computePipeline(device: device, function: downsampleFunction)
+        pyramidPipeline = try cache.computePipeline(device: device, function: pyramidFunction)
+        preparePipeline = try cache.computePipeline(device: device, function: prepareFunction)
+        addPipeline = try cache.computePipeline(device: device, function: addFunction)
 
         func makePaddedTensor(
             dimensions: [Int], rowStride: Int

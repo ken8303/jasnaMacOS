@@ -24,6 +24,78 @@ enum SideBySideRestoration {
         * SideBySideVideoPlan.modelTileSize
     private static let tileBytes = tileElements * MemoryLayout<Float16>.stride
 
+    private struct PreparedRegionRestoration: Sendable {
+        let regionIndex: Int
+        let localStart: Int
+        let activeFrameCount: Int
+        let inputFrames: [[Float16]]
+        let context: String
+    }
+
+    private struct CompletedRegionRestoration: Sendable {
+        let prepared: PreparedRegionRestoration
+        let frames: [[Float16]]
+        let gpuMilliseconds: Double
+    }
+
+    private final class RegionRestorationBatch: @unchecked Sendable {
+        private let device: MTLDevice
+        private let modelsURL: URL
+        private let weightsURL: URL
+        private let work: [PreparedRegionRestoration]
+        private let lock = NSLock()
+        private var completed: [CompletedRegionRestoration?]
+        private var failures: [(any Error)?]
+
+        init(
+            device: MTLDevice,
+            modelsURL: URL,
+            weightsURL: URL,
+            work: [PreparedRegionRestoration]
+        ) {
+            self.device = device
+            self.modelsURL = modelsURL
+            self.weightsURL = weightsURL
+            self.work = work
+            completed = [CompletedRegionRestoration?](repeating: nil, count: work.count)
+            failures = [(any Error)?](repeating: nil, count: work.count)
+        }
+
+        func execute(_ index: Int) {
+            do {
+                let item = work[index]
+                let restored = try SideBySideRestoration.restoreTileWithFallback(
+                    device: device,
+                    modelsURL: modelsURL,
+                    weightsURL: weightsURL,
+                    inputFrames: item.inputFrames,
+                    context: item.context
+                )
+                lock.lock()
+                completed[index] = CompletedRegionRestoration(
+                    prepared: item,
+                    frames: restored.frames,
+                    gpuMilliseconds: restored.gpuMilliseconds
+                )
+                lock.unlock()
+            } catch {
+                lock.lock()
+                failures[index] = error
+                lock.unlock()
+            }
+        }
+
+        func results() throws -> [CompletedRegionRestoration] {
+            lock.lock()
+            defer { lock.unlock() }
+            if let failure = failures.compactMap({ $0 }).first { throw failure }
+            guard completed.allSatisfy({ $0 != nil }) else {
+                throw DeformConvError.commandFailed("parallel mosaic restoration was incomplete")
+            }
+            return completed.compactMap { $0 }
+        }
+    }
+
     static func restoreVideo(
         device: MTLDevice,
         inputURL: URL,
@@ -182,12 +254,14 @@ enum SideBySideRestoration {
             let window = try processWindow(
                 device: device,
                 plan: plan,
+                tiles: plan.tiles,
                 decodedFrames: decoded,
                 outputCount: outputCount,
                 windowIndex: windowIndex,
                 windowCount: plan.temporalWindowCount,
                 modelsURL: modelsURL,
-                weightsURL: weightsURL
+                weightsURL: weightsURL,
+                cacheVariant: nil
             )
             let writer = try RestoredFrameWriter(outputURL: outputURL, plan: plan)
             try await writer.appendCachedFrames(
@@ -214,6 +288,158 @@ enum SideBySideRestoration {
                     + "encoded, validated, and cache removed"
             )
         }
+        return completedWindows
+    }
+
+    static func restoreSparseSingleEyeVideoWindows(
+        device: MTLDevice,
+        inputURL: URL,
+        windowsDirectoryURL: URL,
+        manifestURL: URL,
+        modelsURL: URL,
+        weightsURL: URL,
+        projection: VRMosaicProjection = .raw
+    ) async throws -> Int {
+        let inputInfo = try await SideBySideVideoIO.inspect(url: inputURL)
+        let plan = try SideBySideVideoPlan(
+            width: inputInfo.dimensions.width,
+            height: inputInfo.dimensions.height,
+            sourceFramesPerSecond: inputInfo.nominalFramesPerSecond,
+            durationSeconds: inputInfo.durationSeconds,
+            eyeLayout: .singleEye
+        )
+        let manifest = try MosaicRegionManifest.load(from: manifestURL)
+        try manifest.validate(for: plan)
+        let windowFrameCounts = stride(
+            from: 0,
+            to: manifest.frameCount,
+            by: SideBySideVideoPlan.temporalWindowFrames
+        ).map {
+            min(SideBySideVideoPlan.temporalWindowFrames, manifest.frameCount - $0)
+        }
+        try FileManager.default.createDirectory(
+            at: windowsDirectoryURL, withIntermediateDirectories: true
+        )
+        report(
+            "Sparse single-eye plan: \(plan.dimensions.width)×\(plan.dimensions.height), "
+                + "\(manifest.frameCount) frames, \(manifest.regions.count) regions, "
+                + "VR projection \(projection.rawValue)"
+        )
+        let decoder = try await FrameDecoder(
+            inputURL: inputURL,
+            plan: plan,
+            sourceDimensions: inputInfo.dimensions,
+            cropX: 0
+        )
+        var completedWindows = 0
+        var restoredRegionWindows = 0
+        var skippedTileWindows = 0
+        for (windowIndex, outputCount) in windowFrameCounts.enumerated() {
+            let windowStart = windowIndex * SideBySideVideoPlan.temporalWindowFrames
+            let frameRange = windowStart..<(windowStart + outputCount)
+            let activeRegions = manifest.regions(intersecting: frameRange)
+            let outputURL = windowsDirectoryURL.appendingPathComponent(
+                String(format: "window-%05d.mov", windowIndex + 1)
+            )
+            if await validWindowOutput(
+                outputURL,
+                dimensions: plan.dimensions,
+                frameCount: outputCount
+            ) {
+                report(
+                    "Window \(windowIndex + 1)/\(windowFrameCounts.count): "
+                        + "encoded output already complete"
+                )
+                completedWindows += 1
+                continue
+            }
+            if FileManager.default.fileExists(atPath: outputURL.path) {
+                let archived = try archiveInterruptedOutput(outputURL)
+                report(
+                    "Window \(windowIndex + 1)/\(windowFrameCounts.count): "
+                        + "archived incomplete output at \(archived.path)"
+                )
+            }
+
+            report(
+                "Window \(windowIndex + 1)/\(windowFrameCounts.count): decoding "
+                    + "\(outputCount) frames; mosaic regions \(activeRegions.count), "
+                    + "model crops \(activeRegions.count)"
+            )
+            let baseFrames = try (0..<outputCount).map {
+                try decoder.copyFrame(outputIndex: windowStart + $0)
+            }
+            let attachments = baseFrames.map { CVBufferCopyAttachments($0, .shouldPropagate) }
+            var modelFrames = baseFrames
+            while modelFrames.count < 3 {
+                guard let last = modelFrames.last else { throw DeformConvError.invalidShape }
+                modelFrames.append(last)
+            }
+            let cacheVariant = sparseRegionCacheVariant(
+                regions: activeRegions, projection: projection
+            )
+            let samplingMaps = activeRegions.map {
+                MosaicCropSamplingMap(
+                    region: $0,
+                    eyeWidth: plan.dimensions.width,
+                    eyeHeight: plan.dimensions.height,
+                    projection: projection
+                )
+            }
+            let window = try processRegionWindow(
+                device: device,
+                plan: plan,
+                regions: activeRegions,
+                decodedFrames: modelFrames,
+                outputCount: outputCount,
+                windowIndex: windowIndex,
+                windowCount: windowFrameCounts.count,
+                modelsURL: modelsURL,
+                weightsURL: weightsURL,
+                cacheVariant: cacheVariant,
+                projection: projection,
+                samplingMaps: samplingMaps
+            )
+            let writer = try RestoredFrameWriter(outputURL: outputURL, plan: plan)
+            try await writer.appendRegionCachedFrames(
+                cacheURLs: window.cacheURLs,
+                attachments: attachments,
+                startFrame: 0,
+                progressStartFrame: windowStart,
+                progressFrameCount: manifest.frameCount,
+                plan: plan,
+                baseFrames: baseFrames,
+                regions: activeRegions,
+                projection: projection,
+                samplingMaps: samplingMaps
+            )
+            try await writer.finish()
+            guard await validWindowOutput(
+                outputURL,
+                dimensions: plan.dimensions,
+                frameCount: outputCount
+            ) else {
+                throw DeformConvError.commandFailed(
+                    "encoded sparse window \(windowIndex + 1) failed validation"
+                )
+            }
+            try FileManager.default.removeItem(at: window.cacheDirectory)
+            if activeRegions.isEmpty {
+                skippedTileWindows += 1
+            } else {
+                restoredRegionWindows += activeRegions.count
+            }
+            completedWindows += 1
+            report(
+                "Window \(windowIndex + 1)/\(windowFrameCounts.count): "
+                    + "sparse output encoded, validated, and cache removed"
+            )
+        }
+        report(
+            "Sparse restoration completed: \(completedWindows) windows, "
+                + "\(restoredRegionWindows) mosaic crops restored, "
+                + "\(skippedTileWindows) clean windows bypassed"
+        )
         return completedWindows
     }
 
@@ -290,12 +516,14 @@ enum SideBySideRestoration {
             let window = try processWindow(
                 device: device,
                 plan: plan,
+                tiles: plan.tiles,
                 decodedFrames: decoded,
                 outputCount: outputCount,
                 windowIndex: windowIndex,
                 windowCount: plan.temporalWindowCount,
                 modelsURL: modelsURL,
-                weightsURL: weightsURL
+                weightsURL: weightsURL,
+                cacheVariant: nil
             )
             defer { try? FileManager.default.removeItem(at: window.cacheDirectory) }
             try await writer.appendCachedFrames(
@@ -393,14 +621,16 @@ enum SideBySideRestoration {
     private static func processWindow(
         device: MTLDevice,
         plan: SideBySideVideoPlan,
+        tiles: [VideoTile],
         decodedFrames: [CVPixelBuffer],
         outputCount: Int,
         windowIndex: Int,
         windowCount: Int,
         modelsURL: URL,
-        weightsURL: URL
+        weightsURL: URL,
+        cacheVariant: String?
     ) throws -> WindowResult {
-        let cacheBytes = plan.tiles.count * outputCount * tileBytes
+        let cacheBytes = tiles.count * outputCount * tileBytes
         let configuredWorkPath = ProcessInfo.processInfo.environment["JASNA_WORK_DIR"]
         let temporaryURL = configuredWorkPath.map {
             URL(fileURLWithPath: $0, isDirectory: true)
@@ -421,10 +651,12 @@ enum SideBySideRestoration {
             in: temporaryURL,
             windowIndex: windowIndex,
             outputCount: outputCount,
-            tileCount: plan.tiles.count
+            tileCount: tiles.count,
+            cacheVariant: cacheVariant
         )
+        let prefix = cacheDirectoryPrefix(windowIndex: windowIndex, cacheVariant: cacheVariant)
         let directory = resumed?.directory ?? temporaryURL.appendingPathComponent(
-            "window-\(windowIndex + 1)-\(UUID().uuidString)", isDirectory: true
+            "\(prefix)\(UUID().uuidString)", isDirectory: true
         )
         if resumed == nil {
             try FileManager.default.createDirectory(
@@ -451,13 +683,13 @@ enum SideBySideRestoration {
             }
             defer { for handle in handles { try? handle.close() } }
             var gpuMilliseconds: Double = 0
-            let progressInterval = max(1, plan.tiles.count / 20)
+            let progressInterval = max(1, tiles.count / 20)
             report(
-                "Window \(windowIndex + 1)/\(windowCount): restoring \(plan.tiles.count) tiles; "
+                "Window \(windowIndex + 1)/\(windowCount): restoring \(tiles.count) tiles; "
                     + "cache \(String(format: "%.2f", Double(cacheBytes) / 1_073_741_824)) GiB"
             )
             let completedTiles = resumed?.completedTiles ?? 0
-            if completedTiles == plan.tiles.count {
+            if completedTiles == tiles.count, !tiles.isEmpty {
                 report(
                     "Window \(windowIndex + 1)/\(windowCount): all tiles recovered from "
                         + directory.path
@@ -465,17 +697,17 @@ enum SideBySideRestoration {
             } else if completedTiles > 0 {
                 report(
                     "Window \(windowIndex + 1)/\(windowCount): resuming at tile "
-                        + "\(completedTiles + 1)/\(plan.tiles.count) from \(directory.path)"
+                        + "\(completedTiles + 1)/\(tiles.count) from \(directory.path)"
                 )
             }
-            for tileIndex in completedTiles..<plan.tiles.count {
-                let tile = plan.tiles[tileIndex]
+            for tileIndex in completedTiles..<tiles.count {
+                let tile = tiles[tileIndex]
                 let tileGPU = try autoreleasepool { () throws -> Double in
                     let tileFrames = try decodedFrames.map {
                         try TilePixelPipeline.extractPlanarRGB(from: $0, tile: tile)
                     }
                     let context = "Window \(windowIndex + 1)/\(windowCount): tile "
-                        + "\(tileIndex + 1)/\(plan.tiles.count) at eye \(tile.eyeIndex), "
+                        + "\(tileIndex + 1)/\(tiles.count) at eye \(tile.eyeIndex), "
                         + "x \(tile.x), y \(tile.y)"
                     let restored = try restoreTileWithFallback(
                         device: device,
@@ -493,7 +725,7 @@ enum SideBySideRestoration {
                 }
                 gpuMilliseconds += tileGPU
                 let completed = tileIndex + 1
-                if completed.isMultiple(of: 8) || completed == plan.tiles.count {
+                if completed.isMultiple(of: 8) || completed == tiles.count {
                     for handle in handles { try handle.synchronize() }
                     try Data("\(completed)\n".utf8).write(
                         to: directory.appendingPathComponent("completed-tiles.txt"),
@@ -501,11 +733,11 @@ enum SideBySideRestoration {
                     )
                 }
                 if tileIndex == 0
-                    || tileIndex + 1 == plan.tiles.count
+                    || tileIndex + 1 == tiles.count
                     || (tileIndex + 1).isMultiple(of: progressInterval) {
                     report(
                         "Window \(windowIndex + 1)/\(windowCount): tile "
-                            + "\(tileIndex + 1)/\(plan.tiles.count), GPU "
+                            + "\(tileIndex + 1)/\(tiles.count), GPU "
                             + "\(String(format: "%.3f", gpuMilliseconds)) ms"
                     )
                 }
@@ -523,6 +755,196 @@ enum SideBySideRestoration {
                 try? FileManager.default.removeItem(at: directory)
             } else {
                 report("Preserving failed window cache at \(directory.path)")
+            }
+            throw error
+        }
+    }
+
+    private static func processRegionWindow(
+        device: MTLDevice,
+        plan: SideBySideVideoPlan,
+        regions: [MosaicRegion],
+        decodedFrames: [CVPixelBuffer],
+        outputCount: Int,
+        windowIndex: Int,
+        windowCount: Int,
+        modelsURL: URL,
+        weightsURL: URL,
+        cacheVariant: String,
+        projection: VRMosaicProjection,
+        samplingMaps: [MosaicCropSamplingMap]
+    ) throws -> WindowResult {
+        guard samplingMaps.count == regions.count else {
+            throw DeformConvError.invalidShape
+        }
+        let cacheBytes = regions.count * outputCount * tileBytes
+        let configuredWorkPath = ProcessInfo.processInfo.environment["JASNA_WORK_DIR"]
+        let workURL = configuredWorkPath.map {
+            URL(fileURLWithPath: $0, isDirectory: true)
+        } ?? FileManager.default.temporaryDirectory
+        try FileManager.default.createDirectory(at: workURL, withIntermediateDirectories: true)
+        let resumed = configuredWorkPath == nil ? nil : try resumableWindowCache(
+            in: workURL,
+            windowIndex: windowIndex,
+            outputCount: outputCount,
+            tileCount: regions.count,
+            cacheVariant: cacheVariant
+        )
+        let prefix = cacheDirectoryPrefix(windowIndex: windowIndex, cacheVariant: cacheVariant)
+        let directory = resumed?.directory ?? workURL.appendingPathComponent(
+            "\(prefix)\(UUID().uuidString)", isDirectory: true
+        )
+        if resumed == nil {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        }
+        do {
+            let urls = resumed?.urls ?? (0..<outputCount).map {
+                directory.appendingPathComponent("frame-\($0).fp16")
+            }
+            var handles = try urls.map { url -> FileHandle in
+                if resumed == nil {
+                    guard FileManager.default.createFile(atPath: url.path, contents: nil) else {
+                        throw DeformConvError.commandFailed("failed creating crop cache: \(url.path)")
+                    }
+                }
+                let handle = try FileHandle(forUpdating: url)
+                if let resumed {
+                    let safeOffset = UInt64(resumed.completedTiles * tileBytes)
+                    try handle.truncate(atOffset: safeOffset)
+                    try handle.seek(toOffset: safeOffset)
+                }
+                return handle
+            }
+            defer { for handle in handles { try? handle.close() } }
+            let completedRegions = resumed?.completedTiles ?? 0
+            var gpuMilliseconds: Double = 0
+            let configuredCheckpointInterval = Int(
+                ProcessInfo.processInfo.environment["JASNA_REGION_CHECKPOINT_INTERVAL"] ?? ""
+            )
+            let checkpointInterval = configuredWorkPath == nil
+                ? max(1, regions.count)
+                : max(1, configuredCheckpointInterval ?? 5)
+            let configuredConcurrency = Int(
+                ProcessInfo.processInfo.environment["JASNA_REGION_CONCURRENCY"] ?? ""
+            )
+            let automaticConcurrency = ProcessInfo.processInfo.physicalMemory
+                >= UInt64(16 * 1_073_741_824) ? 2 : 1
+            let regionConcurrency = min(
+                2, max(1, configuredConcurrency ?? automaticConcurrency)
+            )
+            report(
+                "Window \(windowIndex + 1)/\(windowCount): restoring "
+                    + "\(regions.count) tight mosaic crops; cache "
+                    + "\(String(format: "%.2f", Double(cacheBytes) / 1_073_741_824)) GiB; "
+                    + "concurrency \(regionConcurrency)"
+            )
+            var nextRegion = completedRegions
+            while nextRegion < regions.count {
+                let batchEnd = min(regions.count, nextRegion + regionConcurrency)
+                let work = try (nextRegion..<batchEnd).map { regionIndex in
+                    let windowStartFrame = windowIndex * SideBySideVideoPlan.temporalWindowFrames
+                    let region = regions[regionIndex]
+                    let localStart = max(0, region.startFrame - windowStartFrame)
+                    let localEnd = min(outputCount, region.endFrame - windowStartFrame)
+                    guard localStart < localEnd else {
+                        throw DeformConvError.commandFailed(
+                            "mosaic crop does not intersect its assigned window"
+                        )
+                    }
+                    let samplingMap = samplingMaps[regionIndex]
+                    let activeFrames = decodedFrames[localStart..<localEnd]
+                    var cropFrames = try activeFrames.map {
+                        try samplingMap.extractPlanarRGB(from: $0)
+                    }
+                    let activeFrameCount = cropFrames.count
+                    while cropFrames.count < 3 {
+                        guard let last = cropFrames.last else {
+                            throw DeformConvError.invalidShape
+                        }
+                        cropFrames.append(last)
+                    }
+                    let context = "Window \(windowIndex + 1)/\(windowCount): mosaic crop "
+                        + "\(regionIndex + 1)/\(regions.count), x \(region.x), y \(region.y), "
+                        + "size \(region.width)×\(region.height), frames "
+                        + "\(region.startFrame)..<\(region.endFrame)"
+                    return PreparedRegionRestoration(
+                        regionIndex: regionIndex,
+                        localStart: localStart,
+                        activeFrameCount: activeFrameCount,
+                        inputFrames: cropFrames,
+                        context: context
+                    )
+                }
+                let batch = RegionRestorationBatch(
+                    device: device,
+                    modelsURL: modelsURL,
+                    weightsURL: weightsURL,
+                    work: work
+                )
+                if work.count == 1 {
+                    batch.execute(0)
+                } else {
+                    DispatchQueue.concurrentPerform(iterations: work.count) { index in
+                        batch.execute(index)
+                    }
+                }
+                for restored in try batch.results() {
+                    let prepared = restored.prepared
+                    for frame in 0..<outputCount {
+                        if frame >= prepared.localStart
+                            && frame < prepared.localStart + prepared.activeFrameCount
+                        {
+                            let values = restored.frames[
+                                min(
+                                    frame - prepared.localStart,
+                                    prepared.activeFrameCount - 1
+                                )
+                            ]
+                            try values.withUnsafeBytes { bytes in
+                                try handles[frame].write(contentsOf: Data(bytes))
+                            }
+                        } else {
+                            try handles[frame].seek(
+                                toOffset: UInt64((prepared.regionIndex + 1) * tileBytes)
+                            )
+                        }
+                    }
+                    gpuMilliseconds += restored.gpuMilliseconds
+                    let completedCount = prepared.regionIndex + 1
+                    let shouldCheckpoint = completedCount == regions.count
+                        || completedCount.isMultiple(of: checkpointInterval)
+                    if shouldCheckpoint {
+                        let completedBytes = UInt64(completedCount * tileBytes)
+                        for handle in handles {
+                            try handle.truncate(atOffset: completedBytes)
+                            try handle.synchronize()
+                        }
+                        try Data("\(completedCount)\n".utf8).write(
+                            to: directory.appendingPathComponent("completed-tiles.txt"),
+                            options: .atomic
+                        )
+                    }
+                    report(
+                        "Window \(windowIndex + 1)/\(windowCount): mosaic crop "
+                            + "\(completedCount)/\(regions.count), GPU "
+                            + "\(String(format: "%.3f", gpuMilliseconds)) ms"
+                    )
+                }
+                nextRegion = batchEnd
+            }
+            for handle in handles { try handle.close() }
+            handles.removeAll()
+            return WindowResult(
+                cacheDirectory: directory,
+                cacheURLs: urls,
+                gpuMilliseconds: gpuMilliseconds,
+                cacheBytes: cacheBytes
+            )
+        } catch {
+            if configuredWorkPath == nil {
+                try? FileManager.default.removeItem(at: directory)
+            } else {
+                report("Preserving failed crop cache at \(directory.path)")
             }
             throw error
         }
@@ -615,7 +1037,8 @@ enum SideBySideRestoration {
                     stagedBranchFrames: [],
                     stagedRestoredFrames: [],
                     warmupCount: 0,
-                    measurementCount: 1
+                    measurementCount: 1,
+                    collectDiagnostics: false
                 )
             }
             guard recovered.restoredFrames.count == 3 else {
@@ -653,7 +1076,8 @@ enum SideBySideRestoration {
                     stagedBranchFrames: [],
                     stagedRestoredFrames: [],
                     warmupCount: 0,
-                    measurementCount: 1
+                    measurementCount: 1,
+                    collectDiagnostics: false
                 )
             }
             guard result.restoredFrames.count == range.count else {
@@ -715,15 +1139,17 @@ enum SideBySideRestoration {
         in workDirectory: URL,
         windowIndex: Int,
         outputCount: Int,
-        tileCount: Int
+        tileCount: Int,
+        cacheVariant: String?
     ) throws -> ResumableWindowCache? {
-        let prefix = "window-\(windowIndex + 1)-"
+        let prefix = cacheDirectoryPrefix(windowIndex: windowIndex, cacheVariant: cacheVariant)
         let candidates = try FileManager.default.contentsOfDirectory(
             at: workDirectory,
             includingPropertiesForKeys: [.isDirectoryKey],
             options: [.skipsHiddenFiles]
         ).filter { url in
             url.lastPathComponent.hasPrefix(prefix)
+                && (cacheVariant != nil || !url.lastPathComponent.contains("-sparse-"))
                 && (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
         }
         var best: ResumableWindowCache?
@@ -749,6 +1175,61 @@ enum SideBySideRestoration {
             }
         }
         return best
+    }
+
+    private static func cacheDirectoryPrefix(
+        windowIndex: Int,
+        cacheVariant: String?
+    ) -> String {
+        if let cacheVariant {
+            return "window-\(windowIndex + 1)-\(cacheVariant)-"
+        }
+        return "window-\(windowIndex + 1)-"
+    }
+
+    static func sparseCacheVariant(tiles: [VideoTile]) -> String {
+        var hash: UInt64 = 14_695_981_039_346_656_037
+        for tile in tiles {
+            for value in [tile.x, tile.y, tile.width, tile.height] {
+                var littleEndian = UInt64(value).littleEndian
+                withUnsafeBytes(of: &littleEndian) { bytes in
+                    for byte in bytes {
+                        hash ^= UInt64(byte)
+                        hash &*= 1_099_511_628_211
+                    }
+                }
+            }
+        }
+        return String(format: "sparse-%016llx", hash)
+    }
+
+    static func sparseRegionCacheVariant(
+        regions: [MosaicRegion],
+        projection: VRMosaicProjection = .raw
+    ) -> String {
+        var hash: UInt64 = 14_695_981_039_346_656_037
+        for byte in projection.rawValue.utf8 {
+            hash ^= UInt64(byte)
+            hash &*= 1_099_511_628_211
+        }
+        for region in regions {
+            let values = [
+                region.startFrame, region.endFrame,
+                region.x, region.y, region.width, region.height,
+                region.effectiveBlendX, region.effectiveBlendY,
+                region.effectiveBlendWidth, region.effectiveBlendHeight,
+            ]
+            for value in values {
+                var littleEndian = UInt64(value).littleEndian
+                withUnsafeBytes(of: &littleEndian) { bytes in
+                    for byte in bytes {
+                        hash ^= UInt64(byte)
+                        hash &*= 1_099_511_628_211
+                    }
+                }
+            }
+        }
+        return String(format: "crop-v3-%@-%016llx", projection.rawValue, hash)
     }
 
     static func recoverableTileCount(
@@ -904,7 +1385,6 @@ enum SideBySideRestoration {
         private let writer: AVAssetWriter
         private let input: AVAssetWriterInput
         private let adaptor: AVAssetWriterInputPixelBufferAdaptor
-
         init(outputURL: URL, plan: SideBySideVideoPlan) throws {
             writer = try AVAssetWriter(outputURL: outputURL, fileType: .mov)
             let bitRate = min(160_000_000, max(8_000_000, plan.dimensions.pixelCount * 5 / 2))
@@ -946,8 +1426,15 @@ enum SideBySideRestoration {
             attachments: [CFDictionary?],
             startFrame: Int,
             progressStartFrame: Int? = nil,
-            plan: SideBySideVideoPlan
+            plan: SideBySideVideoPlan,
+            tiles: [VideoTile]? = nil,
+            baseFrames: [CVPixelBuffer]? = nil,
+            regions: [MosaicRegion] = []
         ) async throws {
+            let compositeTiles = tiles ?? plan.tiles
+            guard baseFrames == nil || baseFrames?.count == cacheURLs.count else {
+                throw DeformConvError.invalidShape
+            }
             report(
                 "Compositing and encoding \(cacheURLs.count) cached frame(s) "
                     + "starting at output frame \(startFrame)"
@@ -960,15 +1447,115 @@ enum SideBySideRestoration {
                         + "\(plan.frameRate.outputFrameCount)"
                 )
                 let cache = try FileHandle(forReadingFrom: cacheURLs[localFrame])
-                var accumulator = try TileFrameAccumulator(dimensions: plan.dimensions)
-                for tile in plan.tiles {
+                var restoredTiles = [(VideoTile, [Float16])]()
+                restoredTiles.reserveCapacity(compositeTiles.count)
+                for tile in compositeTiles {
                     guard let data = try cache.read(upToCount: tileBytes), data.count == tileBytes else {
                         try? cache.close()
                         throw DeformConvError.commandFailed("restored tile cache is truncated")
                     }
                     var values = [Float16](repeating: 0, count: tileElements)
                     _ = values.withUnsafeMutableBytes { data.copyBytes(to: $0) }
-                    try accumulator.accumulate(tile: tile, planarRGB: values)
+                    restoredTiles.append((tile, values))
+                }
+                try cache.close()
+                while !input.isReadyForMoreMediaData {
+                    if writer.status == .failed {
+                        throw writer.error ?? DeformConvError.commandFailed("video writer failed")
+                    }
+                    try await Task.sleep(for: .milliseconds(1))
+                }
+                guard let pool = adaptor.pixelBufferPool else {
+                    throw DeformConvError.commandFailed("video writer has no pixel-buffer pool")
+                }
+                var optionalBuffer: CVPixelBuffer?
+                let status = CVPixelBufferPoolCreatePixelBuffer(nil, pool, &optionalBuffer)
+                guard status == kCVReturnSuccess, let pixelBuffer = optionalBuffer else {
+                    throw DeformConvError.commandFailed("failed allocating restored output frame")
+                }
+                if let frameAttachments = attachments[localFrame] {
+                    CVBufferSetAttachments(pixelBuffer, frameAttachments, .shouldPropagate)
+                }
+                if let baseFrames {
+                    var accumulator = try SparseTileFrameAccumulator(
+                        basePixelBuffer: baseFrames[localFrame],
+                        dimensions: plan.dimensions
+                    )
+                    for (tile, values) in restoredTiles {
+                        try accumulator.accumulate(tile: tile, planarRGB: values)
+                    }
+                    try accumulator.writeBGRA(to: pixelBuffer, regions: regions)
+                } else {
+                    var accumulator = try TileFrameAccumulator(dimensions: plan.dimensions)
+                    for (tile, values) in restoredTiles {
+                        try accumulator.accumulate(tile: tile, planarRGB: values)
+                    }
+                    try accumulator.writeBGRA(to: pixelBuffer)
+                }
+                let outputFrame = startFrame + localFrame
+                let time = CMTime(value: CMTimeValue(outputFrame), timescale: 30)
+                guard adaptor.append(pixelBuffer, withPresentationTime: time) else {
+                    throw writer.error
+                        ?? DeformConvError.commandFailed("failed encoding frame \(outputFrame)")
+                }
+                report(
+                    "Queued output frame \(progressFrame + 1)/"
+                        + "\(plan.frameRate.outputFrameCount) in "
+                        + "\(String(format: "%.3f", Date().timeIntervalSince(frameStarted))) s"
+                )
+            }
+        }
+
+        func appendRegionCachedFrames(
+            cacheURLs: [URL],
+            attachments: [CFDictionary?],
+            startFrame: Int,
+            progressStartFrame: Int,
+            progressFrameCount: Int? = nil,
+            plan: SideBySideVideoPlan,
+            baseFrames: [CVPixelBuffer],
+            regions: [MosaicRegion],
+            projection: VRMosaicProjection = .raw,
+            samplingMaps: [MosaicCropSamplingMap]
+        ) async throws {
+            guard cacheURLs.count == baseFrames.count,
+                  attachments.count == cacheURLs.count,
+                  samplingMaps.count == regions.count
+            else { throw DeformConvError.invalidShape }
+            report(
+                "Compositing \(regions.count) restored mosaic crops into "
+                    + "\(cacheURLs.count) frame(s)"
+            )
+            for localFrame in cacheURLs.indices {
+                let frameStarted = Date()
+                let cache = try FileHandle(forReadingFrom: cacheURLs[localFrame])
+                var accumulator = try MosaicRegionFrameAccumulator(
+                    basePixelBuffer: baseFrames[localFrame],
+                    dimensions: plan.dimensions
+                )
+                for (regionIndex, region) in regions.enumerated() {
+                    let absoluteFrame = progressStartFrame + localFrame
+                    guard region.frameRange.contains(absoluteFrame) else {
+                        try cache.seek(toOffset: UInt64((regionIndex + 1) * tileBytes))
+                        continue
+                    }
+                    guard let data = try cache.read(upToCount: tileBytes), data.count == tileBytes else {
+                        try? cache.close()
+                        throw DeformConvError.commandFailed("restored mosaic-crop cache is truncated")
+                    }
+                    var values = [Float16](repeating: 0, count: tileElements)
+                    _ = values.withUnsafeMutableBytes { data.copyBytes(to: $0) }
+                    let original = projection == .fisheye
+                        ? try samplingMaps[regionIndex].extractPlanarRGB(
+                            from: baseFrames[localFrame]
+                        )
+                        : nil
+                    try accumulator.composite(
+                        region: region,
+                        planarRGB: values,
+                        originalPlanarRGB: original,
+                        projection: projection
+                    )
                 }
                 try cache.close()
                 while !input.isReadyForMoreMediaData {
@@ -996,8 +1583,8 @@ enum SideBySideRestoration {
                         ?? DeformConvError.commandFailed("failed encoding frame \(outputFrame)")
                 }
                 report(
-                    "Queued output frame \(progressFrame + 1)/"
-                        + "\(plan.frameRate.outputFrameCount) in "
+                    "Queued crop-restored output frame \(progressStartFrame + localFrame + 1)/"
+                        + "\(progressFrameCount ?? plan.frameRate.outputFrameCount) in "
                         + "\(String(format: "%.3f", Date().timeIntervalSince(frameStarted))) s"
                 )
             }

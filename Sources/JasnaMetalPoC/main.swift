@@ -534,6 +534,43 @@ do {
         print("Completed windows: \(count)")
         print("Output directory:  \(CommandLine.arguments[restoreWindowsIndex + 2])")
     }
+    if let sparseWindowsIndex = CommandLine.arguments.firstIndex(
+        of: "--restore-eye-windows-sparse"
+    ) {
+        guard CommandLine.arguments.indices.contains(sparseWindowsIndex + 5) else {
+            throw DeformConvError.commandFailed(
+                "--restore-eye-windows-sparse requires input, output directory, region "
+                    + "manifest, MetalML, and DeformConv paths"
+            )
+        }
+        guard #available(macOS 27.0, *) else {
+            throw DeformConvError.commandFailed("sparse eye restoration requires macOS 27")
+        }
+        let projectionName = CommandLine.arguments.indices.contains(sparseWindowsIndex + 6)
+            ? CommandLine.arguments[sparseWindowsIndex + 6]
+            : VRMosaicProjection.raw.rawValue
+        guard let projection = VRMosaicProjection(rawValue: projectionName) else {
+            throw DeformConvError.commandFailed(
+                "unknown sparse VR projection '\(projectionName)'; use raw or fisheye"
+            )
+        }
+        let count = try await SideBySideRestoration.restoreSparseSingleEyeVideoWindows(
+            device: runner.device,
+            inputURL: URL(fileURLWithPath: CommandLine.arguments[sparseWindowsIndex + 1]),
+            windowsDirectoryURL: URL(
+                fileURLWithPath: CommandLine.arguments[sparseWindowsIndex + 2],
+                isDirectory: true
+            ),
+            manifestURL: URL(fileURLWithPath: CommandLine.arguments[sparseWindowsIndex + 3]),
+            modelsURL: URL(fileURLWithPath: CommandLine.arguments[sparseWindowsIndex + 4]),
+            weightsURL: URL(fileURLWithPath: CommandLine.arguments[sparseWindowsIndex + 5]),
+            projection: projection
+        )
+        print("Sparse single-eye windows: PASS")
+        print("VR projection:      \(projection.rawValue)")
+        print("Completed windows: \(count)")
+        print("Output directory:  \(CommandLine.arguments[sparseWindowsIndex + 2])")
+    }
     if let diagnoseIndex = CommandLine.arguments.firstIndex(of: "--diagnose-sbs-tile") {
         guard CommandLine.arguments.indices.contains(diagnoseIndex + 4),
               let tileNumber = Int(CommandLine.arguments[diagnoseIndex + 2])
