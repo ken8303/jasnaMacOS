@@ -203,11 +203,10 @@ of every window. After an unexpected restart, at most four small regions are
 recomputed. Set `JASNA_REGION_CHECKPOINT_INTERVAL=1` to force per-region
 durability, at the cost of more disk synchronization.
 
-On Macs with at least 16 GB of memory, two independent crop graphs are prepared
-concurrently by default, while Metal ML execution remains serialized for
-repeatable output. Lower-memory Macs default to one. Set
-`JASNA_REGION_CONCURRENCY=1` to minimize memory; values above two are capped
-because they increase graph memory without improving the M4 GPU path.
+Metal ML crop execution is serialized. The first 30-frame crop builds the
+retained graph and every later crop reuses it; attempting to construct two
+first-use graphs concurrently proved unstable in the macOS 27 beta runtime.
+`JASNA_REGION_CONCURRENCY` is therefore ignored for production restoration.
 
 The optimized production path retains its first complete 30-frame Metal graph
 for the lifetime of the eye-restoration process. Later crops reuse the same
@@ -218,13 +217,15 @@ measured about 1.10 seconds for the initial graph build and execution, then
 about 0.45 seconds per reused 30-frame crop including roughly 0.38 seconds of
 GPU work. Decoded frame hashes matched the pre-cache output exactly.
 
-Sparse fisheye compositing prepares two independent output frames in parallel
-on Macs with at least 16 GB of memory, then submits them to AVFoundation in
-presentation order. This overlaps the CPU sampling and blending loops without
-changing pixels or increasing Metal graph concurrency. Set
-`JASNA_COMPOSITE_CONCURRENCY=1` for the lowest-memory path; values above two are
-capped. On the same one-second proof, concurrency two reduced end-to-end time
-from about 5.70 to 5.02 seconds, with identical decoded frame hashes.
+Sparse fisheye compositing runs the delta sampling and feather blending on
+Metal. Two independent output frames are prepared in parallel on Macs with at
+least 16 GB of memory, then submitted to AVFoundation in presentation order.
+Set `JASNA_COMPOSITE_CONCURRENCY=1` for the lowest-memory path; values above two
+are capped. `JASNA_METAL_COMPOSITOR=0` selects the CPU fallback. On the same
+one-second proof, the Metal path completed in 4.79 seconds versus 5.02 seconds
+for the parallel CPU path and 5.70 seconds for the serial CPU path. A raw-frame
+cross-check differed in only 9 of 67,108,864 bytes, each by 1/255. Set
+`JASNA_VERIFY_METAL_COMPOSITOR=1` to repeat that first-frame diagnostic.
 
 Run an end-to-end 30-second test of both eyes and rebuild an SBS preview with:
 

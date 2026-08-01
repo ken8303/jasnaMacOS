@@ -61,6 +61,13 @@ enum TilePixelPipeline {
     }
 }
 
+struct MosaicCompositeSample: Sendable {
+    var modelX: Float
+    var modelY: Float
+    var alpha: Float
+    var padding: Float = 0
+}
+
 struct MosaicCropSamplingMap: Sendable {
     private struct Sample: Sendable {
         let x0: Int32
@@ -74,6 +81,7 @@ struct MosaicCropSamplingMap: Sendable {
     let eyeWidth: Int
     let eyeHeight: Int
     let modelSize: Int
+    let compositeSamples: [MosaicCompositeSample]
     private let samples: [Sample]
 
     init(
@@ -119,6 +127,43 @@ struct MosaicCropSamplingMap: Sendable {
             }
         }
         samples = generated
+        if let fisheyeTransform {
+            var generatedComposite = [MosaicCompositeSample]()
+            generatedComposite.reserveCapacity(region.width * region.height)
+            let left = region.effectiveBlendX
+            let right = left + region.effectiveBlendWidth - 1
+            let top = region.effectiveBlendY
+            let bottom = top + region.effectiveBlendHeight - 1
+            for pixelY in region.y..<(region.y + region.height) {
+                for pixelX in region.x..<(region.x + region.width) {
+                    let model = fisheyeTransform.modelCoordinate(
+                        pixelX: pixelX, pixelY: pixelY
+                    )
+                    let outside = max(
+                        max(left - pixelX, pixelX - right),
+                        max(top - pixelY, pixelY - bottom)
+                    )
+                    let alpha: Float
+                    if outside > 0 {
+                        alpha = max(0, 0.5 * (1 - Float(outside) / 12))
+                    } else {
+                        let inside = min(
+                            min(pixelX - left, right - pixelX),
+                            min(pixelY - top, bottom - pixelY)
+                        )
+                        alpha = min(1, 0.5 + 0.5 * Float(inside + 1) / 12)
+                    }
+                    generatedComposite.append(
+                        MosaicCompositeSample(
+                            modelX: model.x, modelY: model.y, alpha: alpha
+                        )
+                    )
+                }
+            }
+            compositeSamples = generatedComposite
+        } else {
+            compositeSamples = []
+        }
     }
 
     func extractPlanarRGB(from pixelBuffer: CVPixelBuffer) throws -> [Float16] {

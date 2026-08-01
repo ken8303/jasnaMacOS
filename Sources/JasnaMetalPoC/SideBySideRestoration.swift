@@ -269,7 +269,7 @@ enum SideBySideRestoration {
                 weightsURL: weightsURL,
                 cacheVariant: nil
             )
-            let writer = try RestoredFrameWriter(outputURL: outputURL, plan: plan)
+            let writer = try RestoredFrameWriter(device: device, outputURL: outputURL, plan: plan)
             try await writer.appendCachedFrames(
                 cacheURLs: window.cacheURLs,
                 attachments: attachments,
@@ -406,7 +406,7 @@ enum SideBySideRestoration {
                 projection: projection,
                 samplingMaps: samplingMaps
             )
-            let writer = try RestoredFrameWriter(outputURL: outputURL, plan: plan)
+            let writer = try RestoredFrameWriter(device: device, outputURL: outputURL, plan: plan)
             try await writer.appendRegionCachedFrames(
                 cacheURLs: window.cacheURLs,
                 attachments: attachments,
@@ -500,7 +500,7 @@ enum SideBySideRestoration {
             sourceDimensions: inputInfo.dimensions,
             cropX: cropX
         )
-        let writer = try RestoredFrameWriter(outputURL: outputURL, plan: plan)
+        let writer = try RestoredFrameWriter(device: device, outputURL: outputURL, plan: plan)
         var totalGPU: Double = 0
         var peakCacheBytes = 0
         var windows = 0
@@ -830,14 +830,10 @@ enum SideBySideRestoration {
             let checkpointInterval = configuredWorkPath == nil
                 ? max(1, regions.count)
                 : max(1, configuredCheckpointInterval ?? 5)
-            let configuredConcurrency = Int(
-                ProcessInfo.processInfo.environment["JASNA_REGION_CONCURRENCY"] ?? ""
-            )
-            let automaticConcurrency = ProcessInfo.processInfo.physicalMemory
-                >= UInt64(16 * 1_073_741_824) ? 2 : 1
-            let regionConcurrency = min(
-                2, max(1, configuredConcurrency ?? automaticConcurrency)
-            )
+            // The retained 30-frame graph makes concurrent graph construction
+            // unnecessary after the first crop. Building two first-use Metal ML
+            // graphs concurrently is also unstable in the macOS 27 beta runtime.
+            let regionConcurrency = 1
             report(
                 "Window \(windowIndex + 1)/\(windowCount): restoring "
                     + "\(regions.count) tight mosaic crops; cache "
@@ -1414,6 +1410,7 @@ enum SideBySideRestoration {
             private let projection: VRMosaicProjection
             private let samplingMaps: [MosaicCropSamplingMap]
             private let progressStartFrame: Int
+            private let metalCompositor: MetalMosaicCompositor?
             private let lock = NSLock()
             private var completed: [CompositedRegionFrame?]
             private var failures: [(any Error)?]
@@ -1427,7 +1424,8 @@ enum SideBySideRestoration {
                 regions: [MosaicRegion],
                 projection: VRMosaicProjection,
                 samplingMaps: [MosaicCropSamplingMap],
-                progressStartFrame: Int
+                progressStartFrame: Int,
+                metalCompositor: MetalMosaicCompositor?
             ) {
                 self.localFrames = localFrames
                 self.cacheURLs = cacheURLs
@@ -1438,6 +1436,7 @@ enum SideBySideRestoration {
                 self.projection = projection
                 self.samplingMaps = samplingMaps
                 self.progressStartFrame = progressStartFrame
+                self.metalCompositor = metalCompositor
                 completed = [CompositedRegionFrame?](repeating: nil, count: localFrames.count)
                 failures = [(any Error)?](repeating: nil, count: localFrames.count)
             }
@@ -1448,9 +1447,8 @@ enum SideBySideRestoration {
                     let localFrame = localFrames[index]
                     let cache = try FileHandle(forReadingFrom: cacheURLs[index])
                     defer { try? cache.close() }
-                    var accumulator = try MosaicRegionFrameAccumulator(
-                        basePixelBuffer: baseFrames[index], dimensions: dimensions
-                    )
+                    var compositeInputs = [MetalMosaicCompositeInput]()
+                    compositeInputs.reserveCapacity(regions.count)
                     for (regionIndex, region) in regions.enumerated() {
                         let absoluteFrame = progressStartFrame + localFrame
                         guard region.frameRange.contains(absoluteFrame) else {
@@ -1471,14 +1469,70 @@ enum SideBySideRestoration {
                                 from: baseFrames[index]
                             )
                             : nil
-                        try accumulator.composite(
-                            region: region,
-                            planarRGB: values,
-                            originalPlanarRGB: original,
+                        compositeInputs.append(
+                            MetalMosaicCompositeInput(
+                                region: region,
+                                restored: values,
+                                original: original ?? [],
+                                samples: samplingMaps[regionIndex].compositeSamples
+                            )
+                        )
+                    }
+                    if projection == .fisheye, let metalCompositor {
+                        var usedMetal = false
+                        do {
+                            try metalCompositor.composite(
+                                basePixelBuffer: baseFrames[index],
+                                outputPixelBuffer: outputBuffers[index],
+                                dimensions: dimensions,
+                                inputs: compositeInputs
+                            )
+                            usedMetal = true
+                        } catch {
+                            report(
+                                "WARNING: Metal mosaic compositing failed; using CPU for frame "
+                                    + "\(progressStartFrame + localFrame + 1) (\(error))"
+                            )
+                            try Self.compositeOnCPU(
+                                basePixelBuffer: baseFrames[index],
+                                outputPixelBuffer: outputBuffers[index],
+                                dimensions: dimensions,
+                                inputs: compositeInputs,
+                                projection: projection
+                            )
+                        }
+                        if usedMetal,
+                           localFrame == 0,
+                           ProcessInfo.processInfo.environment[
+                            "JASNA_VERIFY_METAL_COMPOSITOR"
+                           ] == "1"
+                        {
+                            let cpuReference = try Self.makePixelBuffer(dimensions: dimensions)
+                            try Self.compositeOnCPU(
+                                basePixelBuffer: baseFrames[index],
+                                outputPixelBuffer: cpuReference,
+                                dimensions: dimensions,
+                                inputs: compositeInputs,
+                                projection: projection
+                            )
+                            let difference = try Self.pixelDifference(
+                                outputBuffers[index], cpuReference, dimensions: dimensions
+                            )
+                            report(
+                                "Metal compositor raw check: max byte error "
+                                    + "\(difference.maximum), differing bytes "
+                                    + "\(difference.differing)/\(difference.total)"
+                            )
+                        }
+                    } else {
+                        try Self.compositeOnCPU(
+                            basePixelBuffer: baseFrames[index],
+                            outputPixelBuffer: outputBuffers[index],
+                            dimensions: dimensions,
+                            inputs: compositeInputs,
                             projection: projection
                         )
                     }
-                    try accumulator.writeBGRA(to: outputBuffers[index])
                     let result = CompositedRegionFrame(
                         localFrame: localFrame,
                         pixelBuffer: outputBuffers[index],
@@ -1492,6 +1546,87 @@ enum SideBySideRestoration {
                     failures[index] = error
                     lock.unlock()
                 }
+            }
+
+            private static func compositeOnCPU(
+                basePixelBuffer: CVPixelBuffer,
+                outputPixelBuffer: CVPixelBuffer,
+                dimensions: VideoDimensions,
+                inputs: [MetalMosaicCompositeInput],
+                projection: VRMosaicProjection
+            ) throws {
+                var accumulator = try MosaicRegionFrameAccumulator(
+                    basePixelBuffer: basePixelBuffer, dimensions: dimensions
+                )
+                for input in inputs {
+                    try accumulator.composite(
+                        region: input.region,
+                        planarRGB: input.restored,
+                        originalPlanarRGB: projection == .fisheye ? input.original : nil,
+                        projection: projection
+                    )
+                }
+                try accumulator.writeBGRA(to: outputPixelBuffer)
+            }
+
+            private static func makePixelBuffer(
+                dimensions: VideoDimensions
+            ) throws -> CVPixelBuffer {
+                var optionalBuffer: CVPixelBuffer?
+                let status = CVPixelBufferCreate(
+                    nil,
+                    dimensions.width,
+                    dimensions.height,
+                    kCVPixelFormatType_32BGRA,
+                    [
+                        kCVPixelBufferMetalCompatibilityKey as String: true,
+                        kCVPixelBufferIOSurfacePropertiesKey as String: [:],
+                    ] as CFDictionary,
+                    &optionalBuffer
+                )
+                guard status == kCVReturnSuccess, let buffer = optionalBuffer else {
+                    throw DeformConvError.commandFailed(
+                        "failed allocating Metal compositor verification frame"
+                    )
+                }
+                return buffer
+            }
+
+            private static func pixelDifference(
+                _ lhs: CVPixelBuffer,
+                _ rhs: CVPixelBuffer,
+                dimensions: VideoDimensions
+            ) throws -> (maximum: Int, differing: Int, total: Int) {
+                CVPixelBufferLockBaseAddress(lhs, .readOnly)
+                CVPixelBufferLockBaseAddress(rhs, .readOnly)
+                defer {
+                    CVPixelBufferUnlockBaseAddress(rhs, .readOnly)
+                    CVPixelBufferUnlockBaseAddress(lhs, .readOnly)
+                }
+                guard let lhsBase = CVPixelBufferGetBaseAddress(lhs),
+                      let rhsBase = CVPixelBufferGetBaseAddress(rhs)
+                else {
+                    throw DeformConvError.commandFailed(
+                        "Metal compositor verification frame is not CPU accessible"
+                    )
+                }
+                let packedRowBytes = dimensions.width * 4
+                var maximum = 0
+                var differing = 0
+                for row in 0..<dimensions.height {
+                    let lhsRow = lhsBase.advanced(
+                        by: row * CVPixelBufferGetBytesPerRow(lhs)
+                    ).assumingMemoryBound(to: UInt8.self)
+                    let rhsRow = rhsBase.advanced(
+                        by: row * CVPixelBufferGetBytesPerRow(rhs)
+                    ).assumingMemoryBound(to: UInt8.self)
+                    for column in 0..<packedRowBytes {
+                        let difference = abs(Int(lhsRow[column]) - Int(rhsRow[column]))
+                        maximum = max(maximum, difference)
+                        if difference != 0 { differing += 1 }
+                    }
+                }
+                return (maximum, differing, packedRowBytes * dimensions.height)
             }
 
             func results() throws -> [CompositedRegionFrame] {
@@ -1510,7 +1645,11 @@ enum SideBySideRestoration {
         private let writer: AVAssetWriter
         private let input: AVAssetWriterInput
         private let adaptor: AVAssetWriterInputPixelBufferAdaptor
-        init(outputURL: URL, plan: SideBySideVideoPlan) throws {
+        private let metalCompositor: MetalMosaicCompositor?
+
+        init(device: MTLDevice, outputURL: URL, plan: SideBySideVideoPlan) throws {
+            metalCompositor = ProcessInfo.processInfo.environment["JASNA_METAL_COMPOSITOR"] == "0"
+                ? nil : try? MetalMosaicCompositor(device: device)
             writer = try AVAssetWriter(outputURL: outputURL, fileType: .mov)
             let bitRate = min(160_000_000, max(8_000_000, plan.dimensions.pixelCount * 5 / 2))
             input = AVAssetWriterInput(
@@ -1660,6 +1799,10 @@ enum SideBySideRestoration {
                 2, max(1, configuredConcurrency ?? automaticConcurrency)
             )
             report("Frame compositing concurrency: \(compositeConcurrency)")
+            report(
+                "Fisheye compositor: "
+                    + (projection == .fisheye && metalCompositor != nil ? "Metal" : "CPU")
+            )
             guard let pool = adaptor.pixelBufferPool else {
                 throw DeformConvError.commandFailed("video writer has no pixel-buffer pool")
             }
@@ -1691,7 +1834,8 @@ enum SideBySideRestoration {
                     regions: regions,
                     projection: projection,
                     samplingMaps: samplingMaps,
-                    progressStartFrame: progressStartFrame
+                    progressStartFrame: progressStartFrame,
+                    metalCompositor: metalCompositor
                 )
                 if localFrames.count == 1 {
                     batch.execute(0)

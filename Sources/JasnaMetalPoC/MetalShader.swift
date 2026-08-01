@@ -887,5 +887,71 @@ kernel void assemble_temporal_backbone_fused_fp16(
     else if (source == 2u) output[gid] = forward1[localIndex];
     else output[gid] = backward2[localIndex];
 }
+
+struct MosaicCompositeParams {
+    uint frameWidth;
+    uint regionX;
+    uint regionY;
+    uint regionWidth;
+    uint regionHeight;
+    uint modelSize;
+};
+
+inline float mosaic_sample_plane(
+    device const half *values, uint offset, uint size, float x, float y
+) {
+    float clampedX = clamp(x, 0.0f, float(size - 1u));
+    float clampedY = clamp(y, 0.0f, float(size - 1u));
+    uint x0 = uint(floor(clampedX));
+    uint y0 = uint(floor(clampedY));
+    uint x1 = min(x0 + 1u, size - 1u);
+    uint y1 = min(y0 + 1u, size - 1u);
+    float fx = clampedX - float(x0);
+    float fy = clampedY - float(y0);
+    float top = mix(
+        float(values[offset + y0 * size + x0]),
+        float(values[offset + y0 * size + x1]), fx
+    );
+    float bottom = mix(
+        float(values[offset + y1 * size + x0]),
+        float(values[offset + y1 * size + x1]), fx
+    );
+    return mix(top, bottom, fy);
+}
+
+kernel void composite_fisheye_mosaic_delta(
+    device uchar *bgra [[buffer(0)]],
+    device const half *restored [[buffer(1)]],
+    device const half *original [[buffer(2)]],
+    device const float4 *compositeSamples [[buffer(3)]],
+    constant MosaicCompositeParams &params [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint regionPixels = params.regionWidth * params.regionHeight;
+    if (gid >= regionPixels) return;
+    uint pixelX = params.regionX + gid % params.regionWidth;
+    uint pixelY = params.regionY + gid / params.regionWidth;
+
+    float4 compositeSample = compositeSamples[gid];
+    float alpha = compositeSample.z;
+    if (alpha <= 0.0f) return;
+    float modelX = compositeSample.x;
+    float modelY = compositeSample.y;
+
+    uint plane = params.modelSize * params.modelSize;
+    uint destination = 4u * (pixelY * params.frameWidth + pixelX);
+    for (uint bgraChannel = 0u; bgraChannel < 3u; ++bgraChannel) {
+        uint rgbChannel = 2u - bgraChannel;
+        uint offset = rgbChannel * plane;
+        float base = float(bgra[destination + bgraChannel]) / 255.0f;
+        float value = base
+            + mosaic_sample_plane(restored, offset, params.modelSize, modelX, modelY)
+            - mosaic_sample_plane(original, offset, params.modelSize, modelX, modelY);
+        float restoredByte = clamp(value, 0.0f, 1.0f) * 255.0f;
+        float blended = float(bgra[destination + bgraChannel]) * (1.0f - alpha)
+            + restoredByte * alpha;
+        bgra[destination + bgraChannel] = uchar(clamp(floor(blended + 0.5f), 0.0f, 255.0f));
+    }
+}
 """#
 }
