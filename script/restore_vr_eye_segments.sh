@@ -20,6 +20,7 @@ VR_PROJECTION="${JASNA_VR_PROJECTION:-raw}"
 FAST_ENCODE="${JASNA_FAST_ENCODE:-1}"
 DETECT_BATCH_SIZE="${JASNA_DETECT_BATCH_SIZE:-2}"
 DETECT_DECODE_MODE="${JASNA_DETECT_DECODE_MODE:-sequential}"
+REGION_DURATION="${JASNA_REGION_DURATION:-1.0}"
 
 [[ "$EYE" == "left" || "$EYE" == "right" ]] || usage
 [[ -f "$INPUT_PATH" ]] || {
@@ -83,9 +84,12 @@ SOURCE_DIR="$WORK_DIR/source"
 RESTORED_DIR="$WORK_DIR/restored"
 CACHE_DIR="$WORK_DIR/cache"
 if [[ "$SPARSE_MOSAIC" == "1" ]]; then
-  RESTORED_DIR="$WORK_DIR/restored-sparse-crop-v3-$VR_PROJECTION"
-  CACHE_DIR="$WORK_DIR/cache-sparse-crop-v3-$VR_PROJECTION"
+  # v4 uses full 30-frame tracked regions. Keep it separate from the old
+  # six-frame v3 cache so a quality run can never reuse the softer result.
+  RESTORED_DIR="$WORK_DIR/restored-sparse-crop-v4-temporal-$VR_PROJECTION"
+  CACHE_DIR="$WORK_DIR/cache-sparse-crop-v4-temporal-$VR_PROJECTION"
 fi
+OUTPUT_DONE="$RESTORED_DIR/${EYE}-joined.done"
 SOURCE_DONE="$WORK_DIR/source.done"
 MANIFEST_PATH="$WORK_DIR/restored-concat.txt"
 TEMP_OUTPUT="$WORK_DIR/${EYE}-joined.mov"
@@ -105,6 +109,7 @@ echo "VR projection:    $VR_PROJECTION"
 echo "Fast encoding:    $FAST_ENCODE"
 if [[ "$SPARSE_MOSAIC" == "1" ]]; then
   echo "Detector:         $DETECT_DECODE_MODE decode, batch $DETECT_BATCH_SIZE"
+  echo "Temporal clips:   $REGION_DURATION seconds"
 fi
 
 IFS=, read -r SOURCE_WIDTH SOURCE_HEIGHT < <(
@@ -290,7 +295,7 @@ for SOURCE_SEGMENT in "${SOURCE_SEGMENTS[@]}"; do
   RESTORED_SEGMENTS+=("$RESTORED_SEGMENT")
 done
 
-if completed_eye_output "$OUTPUT_PATH"; then
+if [[ -f "$OUTPUT_DONE" ]] && completed_eye_output "$OUTPUT_PATH"; then
   echo "Stage 3/3: joined $EYE-eye output already complete"
   echo "Segmented $EYE-eye restoration: PASS"
   echo "Output: $OUTPUT_PATH"
@@ -333,6 +338,7 @@ if [[ -e "$OUTPUT_PATH" ]]; then
   echo "Archived previous output: $OUTPUT_ARCHIVE"
 fi
 mv "$TEMP_OUTPUT" "$OUTPUT_PATH"
+/usr/bin/touch "$OUTPUT_DONE"
 
 FINAL_INFO="$("$FFPROBE_PATH" \
   -v error \

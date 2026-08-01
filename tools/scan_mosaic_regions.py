@@ -18,7 +18,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("output_manifest", type=Path)
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--sample-stride", type=float, default=0.1)
-    parser.add_argument("--region-duration", type=float, default=0.2)
+    parser.add_argument(
+        "--region-duration",
+        type=float,
+        default=1.0,
+        help=(
+            "temporal restoration clip length in seconds; the default keeps a "
+            "tracked mosaic active for the complete 30-frame processing window"
+        ),
+    )
     parser.add_argument("--confidence", type=float, default=0.20)
     parser.add_argument("--image-size", type=int, default=2048)
     parser.add_argument("--rect-expand", type=float, default=1.5)
@@ -189,9 +197,15 @@ def main() -> int:
         raise SystemExit(f"input video not found: {args.input_video}")
     if not args.model.is_file():
         raise SystemExit(f"mosaic detector not found: {args.model}")
-    if args.sample_stride <= 0 or args.region_duration <= 0 or args.temporal_padding < 0:
+    if (
+        args.sample_stride <= 0
+        or args.region_duration <= 0
+        or args.region_duration > 1.0
+        or args.temporal_padding < 0
+    ):
         raise SystemExit(
-            "sample stride and region duration must be positive; temporal padding cannot be negative"
+            "sample stride must be positive, region duration must be in (0, 1], "
+            "and temporal padding cannot be negative"
         )
     if args.batch_size <= 0:
         raise SystemExit("batch size must be positive")

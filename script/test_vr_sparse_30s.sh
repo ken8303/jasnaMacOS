@@ -298,7 +298,8 @@ JASNA_VR_PROJECTION=fisheye \
   "$ROOT_DIR/script/restore_vr_eye_sparse.sh" \
     "$TEST_INPUT" right "$RIGHT_OUTPUT"
 
-if duration_matches "$OUTPUT_PATH" "$TEST_DURATION"; then
+if duration_matches "$OUTPUT_PATH" "$TEST_DURATION" \
+    && [[ "$OUTPUT_PATH" -nt "$LEFT_OUTPUT" && "$OUTPUT_PATH" -nt "$RIGHT_OUTPUT" ]]; then
   echo "Stage 4/4: combined SBS output already complete"
 else
   if [[ -e "$FINAL_TEMP" ]]; then

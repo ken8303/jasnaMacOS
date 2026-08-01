@@ -159,8 +159,12 @@ the output manually identified as left-right SBS VR.
 
 Sparse mosaic restoration follows VR Video Toolbox CE's pre-scan design. A
 YOLO detector samples each physical eye every 0.1 seconds, separates distant
-detections, emits short 0.2-second tracked regions for moving mosaics, and
-writes a JSON manifest. The
+detections, and emits one-second tracked regions aligned with each 30-frame
+processing window. This gives BasicVSR++ five times more temporal context than
+the former 0.2-second clips, which reduces residual blocks and flicker on moving
+mosaics without materially increasing the total number of restored frames. Set
+`JASNA_REGION_DURATION=0.2` only for an old-behaviour comparison. The detector
+writes a JSON manifest, and the
 Metal restorer then runs only the detected 256×256 model crops. Clean
 one-second windows bypass the Jasna model. Following Jasna's VR180 path, the
 sparse wrapper defaults to fisheye projection: each region is flattened before
