@@ -356,8 +356,9 @@ kernel void deform_conv2d_fp16_jasna_gather(
     }
 }
 
-// Eight SIMD groups cooperatively produce an 8x64 output tile using the GPU's
-// 8x8 matrix instructions. The accumulator is staged in threadgroup memory so
+// Eight SIMD groups cooperatively produce a 16x64 output tile using the GPU's
+// 8x8 matrix instructions. Each weight tile feeds two row blocks before being
+// discarded. The accumulators are staged in threadgroup memory so
 // this dispatch can add bias, convert to FP16 and scatter directly to NCHW.
 kernel void deform_conv2d_fp16_jasna_simdgroup_gemm_fused(
     device const half *gathered [[buffer(0)]],
@@ -372,20 +373,27 @@ kernel void deform_conv2d_fp16_jasna_simdgroup_gemm_fused(
 ) {
     constexpr uint innerColumns = 128 * 9;
     constexpr uint outputColumns = 64;
-    constexpr uint rowsPerTile = 8;
+    constexpr uint rowsPerTile = 16;
     uint row = tile * rowsPerTile;
     uint column = simdgroupIndex * 8;
-    simdgroup_half8x8 matrixA;
+    simdgroup_half8x8 matrixA0;
+    simdgroup_half8x8 matrixA1;
     simdgroup_half8x8 matrixB;
-    simdgroup_float8x8 matrixC(0.0f);
+    simdgroup_float8x8 matrixC0(0.0f);
+    simdgroup_float8x8 matrixC1(0.0f);
     for (uint k = 0; k < innerColumns; k += 8) {
-        simdgroup_load(matrixA, gathered + row * innerColumns + k, innerColumns);
+        simdgroup_load(matrixA0, gathered + row * innerColumns + k, innerColumns);
+        simdgroup_load(matrixA1, gathered + (row + 8) * innerColumns + k, innerColumns);
         simdgroup_load(matrixB, weight + k * outputColumns + column, outputColumns);
-        simdgroup_multiply_accumulate(matrixC, matrixA, matrixB, matrixC);
+        simdgroup_multiply_accumulate(matrixC0, matrixA0, matrixB, matrixC0);
+        simdgroup_multiply_accumulate(matrixC1, matrixA1, matrixB, matrixC1);
     }
     threadgroup float tileOutput[rowsPerTile * outputColumns];
     simdgroup_store(
-        matrixC, tileOutput + column, outputColumns
+        matrixC0, tileOutput + column, outputColumns
+    );
+    simdgroup_store(
+        matrixC1, tileOutput + 8 * outputColumns + column, outputColumns
     );
     threadgroup_barrier(mem_flags::mem_threadgroup);
 

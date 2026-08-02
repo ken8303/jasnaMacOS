@@ -625,8 +625,12 @@ FP16 conversion, and NCHW scattering are fused into the matrix dispatch, which
 also removes the 1 MiB FP32 output matrix. Across four real checkpoint weight
 sets, the combined median improved from 0.743–0.749 to 0.701–0.704 ms; the
 stage-separated medians were about 0.347 ms gather and 0.354 ms matrix work.
-It works inside the same Metal 4 command buffer as the Metal ML recurrence
-stages.
+The matrix kernel now reuses each loaded 8×8 weight tile across two row blocks,
+producing 16×64 output tiles per threadgroup. Across the same four checkpoints,
+matrix work fell to 0.276 ms and combined DCNv2 to 0.625–0.626 ms—about 22% and
+11% faster respectively. The full four-pass oracle still passes at 70.49 dB,
+and decoded production frames match the earlier 8-row output exactly. It works
+inside the same Metal 4 command buffer as the Metal ML recurrence stages.
 
 ## Model conversion
 
