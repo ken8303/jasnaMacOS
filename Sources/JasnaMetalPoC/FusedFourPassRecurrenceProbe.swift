@@ -465,9 +465,13 @@ func verifyFusedFourPassRecurrence(
         residencySet.addAllocation(branch.biasBuffer)
     }
     residencySet.commit()
-    guard let queue = device.makeMTL4CommandQueue() else {
+    guard let queue = device.makeMTL4CommandQueue(),
+          let commandAllocator = device.makeCommandAllocator(),
+          let commandBuffer = device.makeCommandBuffer()
+    else {
         throw DeformConvError.metalUnavailable
     }
+    var commandAllocatorHasCompletedSubmission = false
 
     let transientBuffers = spatialBuffers + propagationBuffers.flatMap { $0 } + [
         conditionBuffer, rawBuffer, backboneOutputBuffer, zeroFeatureBuffer, flow2Buffer,
@@ -490,10 +494,8 @@ func verifyFusedFourPassRecurrence(
         MetalResourceCache.shared.beginMachineLearningExecution()
         defer { MetalResourceCache.shared.endMachineLearningExecution() }
         initializeBuffers()
-        guard let allocator = device.makeCommandAllocator(),
-              let commandBuffer = device.makeCommandBuffer()
-        else { throw DeformConvError.metalUnavailable }
-        commandBuffer.beginCommandBuffer(allocator: allocator)
+        if commandAllocatorHasCompletedSubmission { commandAllocator.reset() }
+        commandBuffer.beginCommandBuffer(allocator: commandAllocator)
         commandBuffer.useResidencySet(residencySet)
         for index in 0..<frameCount {
             guard let encoder = commandBuffer.makeMachineLearningCommandEncoder() else {
@@ -697,6 +699,7 @@ func verifyFusedFourPassRecurrence(
         }
         queue.commit([commandBuffer], options: commitOptions)
         semaphore.wait()
+        commandAllocatorHasCompletedSubmission = true
         let (milliseconds, error) = commitResult.load()
         if let error { throw error }
         let outputs = collectDiagnostics ? propagationBuffers.map { branch in
