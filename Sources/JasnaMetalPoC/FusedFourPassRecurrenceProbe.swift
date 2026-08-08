@@ -477,10 +477,21 @@ func verifyFusedFourPassRecurrence(
         conditionBuffer, rawBuffer, backboneOutputBuffer, zeroFeatureBuffer, flow2Buffer,
         deformInputBuffer, offsetBuffer, maskBuffer, alignedBuffer,
     ] + reconstructionBuffers + predictedBuffers + restoredBuffers
+    var buffersNeedInitialClear = true
     func initializeBuffers() {
+        // SPyNet's small tensors use padded row strides; their padding must
+        // remain zero because Metal ML can read the complete physical rows.
         spynetGraph.initializeBuffers()
-        for buffer in transientBuffers {
-            buffer.contents().initializeMemory(as: UInt8.self, repeating: 0, count: buffer.length)
+        // The main graph fully overwrites every mutable destination, while
+        // zeroFeatureBuffer is immutable. Clear these shared buffers once
+        // instead of rewriting roughly 190 MB before every retained-graph run.
+        if buffersNeedInitialClear {
+            for buffer in transientBuffers {
+                buffer.contents().initializeMemory(
+                    as: UInt8.self, repeating: 0, count: buffer.length
+                )
+            }
+            buffersNeedInitialClear = false
         }
         for frame in 0..<frameCount {
             activeInputFrames[frame].withUnsafeBufferPointer { source in

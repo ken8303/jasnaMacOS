@@ -233,6 +233,13 @@ measured about 1.10 seconds for the initial graph build and execution, then
 about 0.45 seconds per reused 30-frame crop including roughly 0.38 seconds of
 GPU work. Decoded frame hashes matched the pre-cache output exactly.
 
+The retained graph clears its unpadded main buffers only on first use because
+every later destination is fully overwritten. SPyNet's padded-row tensors are
+still cleared for every crop; skipping those clears changed output and was
+rejected. On a five-region production fixture, the accepted change removed
+about 26 ms of non-GPU work per reused crop. The decoded 30-frame output was
+byte-identical, and the full PyTorch oracle remained at 70.49 dB PSNR.
+
 Long sparse eye restorations also submit every pending 30–120 second physical
 segment to one sequential app process. This keeps that retained graph alive
 across segment boundaries while each segment continues to use its own output,
