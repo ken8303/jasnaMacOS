@@ -5,6 +5,8 @@ import Metal
 
 @available(macOS 27.0, *)
 extension SideBySideRestoration {
+    static let defaultEncoderWindowsPerSegment = 120
+
     static func elapsedMilliseconds(since start: ContinuousClock.Instant) -> Double {
         let elapsed = start.duration(to: .now).components
         return Double(elapsed.seconds) * 1_000
@@ -138,7 +140,7 @@ extension SideBySideRestoration {
                     ProcessInfo.processInfo.environment[
                         "JASNA_ENCODER_WINDOWS_PER_SEGMENT"
                     ] ?? ""
-                ) ?? 5
+                ) ?? defaultEncoderWindowsPerSegment
             )
         )
         report(

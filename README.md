@@ -210,14 +210,18 @@ next optimization should pipeline CPU preparation, reduce cache traffic, or
 remain focused on the Metal graph without changing restoration quality.
 
 Sparse output keeps the one-second recurrence boundaries but, by default, feeds
-five consecutive windows to one HEVC writer. This reduces hardware-encoder
-startup and drain work while preserving restartability: model caches remain
-per-window, and an interruption rebuilds at most the current five-second output
-segment. Existing one-window outputs are detected and reused. Set
-`JASNA_ENCODER_WINDOWS_PER_SEGMENT=1` for the previous behavior or choose a
-different positive segment size. A three-window 4096×4096 fixture reduced
+up to 120 consecutive windows to one HEVC writer. This produces one restored
+file per two minutes and reduces hardware-encoder startup and drain work while
+preserving restartability: model caches remain per-window, so an interrupted
+writer can rebuild its current output without rerunning completed model crops.
+Existing one- and five-window outputs are detected and reused. Set
+`JASNA_ENCODER_WINDOWS_PER_SEGMENT=5` for the earlier five-second behavior,
+`JASNA_ENCODER_WINDOWS_PER_SEGMENT=1` for one file per recurrence window, or
+choose another positive segment size. A three-window 4096×4096 fixture reduced
 encoder-finish time from 1.431 seconds to 0.497 seconds and produced one
-validated 90-frame, 30 fps segment.
+validated 90-frame, 30 fps segment. The 30-second production log measured about
+0.48 seconds per encoder drain; grouping a two-minute segment avoids up to 23
+extra drains, or roughly 11 seconds per eye on that workload.
 
 Metal ML crop execution is serialized. The first 30-frame crop builds the
 retained graph and every later crop reuses it; attempting to construct two
@@ -330,10 +334,11 @@ skips completed one-second windows and resumes only the incomplete window:
   /path/to/input_30fps.mp4 left /path/to/restored-left.mov
 ```
 
-The segment length defaults to 60 seconds and can be changed to 120 seconds:
+The segment length defaults to 120 seconds. Use 60-second physical files when
+you prefer smaller restart units:
 
 ```sh
-JASNA_SEGMENT_SECONDS=120 ./script/restore_vr_eye_segments.sh \
+JASNA_SEGMENT_SECONDS=60 ./script/restore_vr_eye_segments.sh \
   /path/to/input_30fps.mp4 left /path/to/restored-left.mov
 ```
 
