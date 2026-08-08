@@ -241,7 +241,8 @@ func verifyFusedFourPassRecurrence(
           let temporalAssemblyFunction = library.makeFunction(name: "assemble_temporal_backbone_fp16"),
           let residualFunction = library.makeFunction(name: "add_propagation_residual_fp16"),
           let reconstructionAssemblyFunction = library.makeFunction(name: "assemble_reconstruction_fp16"),
-          let frameResidualFunction = library.makeFunction(name: "add_frame_residual_fp16")
+          let frameResidualFunction = library.makeFunction(name: "add_frame_residual_fp16"),
+          let nonFiniteFunction = library.makeFunction(name: "flag_non_finite_fp16")
     else { throw DeformConvError.shaderResourceMissing }
     let cache = MetalResourceCache.shared
     let accumulatePipeline = try cache.computePipeline(device: device, function: accumulateFunction)
@@ -262,6 +263,7 @@ func verifyFusedFourPassRecurrence(
     let frameResidualPipeline = try cache.computePipeline(
         device: device, function: frameResidualFunction
     )
+    let nonFinitePipeline = try cache.computePipeline(device: device, function: nonFiniteFunction)
     let spynetGraph = try FusedSPyNetClipGraph(
         device: device, modelsURL: modelsURL, library: library, sourceFrames: frameBuffers
     )
@@ -408,6 +410,9 @@ func verifyFusedFourPassRecurrence(
     var reconstructionAssemblyArguments = [any MTL4ArgumentTable]()
     var upsampleArguments = [any MTL4ArgumentTable]()
     var frameResidualArguments = [any MTL4ArgumentTable]()
+    var nonFiniteArguments = [any MTL4ArgumentTable]()
+    guard let nonFiniteFlagBuffer = device.makeBuffer(length: 4, options: .storageModeShared)
+    else { throw DeformConvError.metalUnavailable }
     for frame in 0..<frameCount {
         let (reconstructionTensor, reconstructionBuffer) = try Support.makeTensor(
             device: device, dimensions: [64, 64, 320, 1]
@@ -440,6 +445,10 @@ func verifyFusedFourPassRecurrence(
             device: device,
             buffers: [predictedBuffer, frameBuffers[frame], restoredBuffer, frameElementsBuffer]
         ))
+        nonFiniteArguments.append(try Support.makeComputeArguments(
+            device: device,
+            buffers: [restoredBuffer, nonFiniteFlagBuffer, frameElementsBuffer]
+        ))
     }
     let residencyDescriptor = MTLResidencySetDescriptor()
     residencyDescriptor.label = "fused three-frame feature-to-restored graph"
@@ -452,7 +461,7 @@ func verifyFusedFourPassRecurrence(
             firstShapeBuffer, secondShapeBuffer, planeBuffer,
             prefixChannelsBuffer, featureCountBuffer, frameElementsBuffer, deformShapeBuffer,
         ]
-        + reconstructionBuffers + predictedBuffers + restoredBuffers
+        + reconstructionBuffers + predictedBuffers + restoredBuffers + [nonFiniteFlagBuffer]
     for buffer in sharedBuffers { residencySet.addAllocation(buffer) }
     for heap in featureHeaps { residencySet.addAllocation(heap) }
     for heap in upsampleHeaps { residencySet.addAllocation(heap) }
@@ -482,6 +491,7 @@ func verifyFusedFourPassRecurrence(
         // SPyNet's small tensors use padded row strides; their padding must
         // remain zero because Metal ML can read the complete physical rows.
         spynetGraph.initializeBuffers()
+        nonFiniteFlagBuffer.contents().storeBytes(of: UInt32(0), as: UInt32.self)
         // The main graph fully overwrites every mutable destination, while
         // zeroFeatureBuffer is immutable. Clear these shared buffers once
         // instead of rewriting roughly 190 MB before every retained-graph run.
@@ -697,6 +707,18 @@ func verifyFusedFourPassRecurrence(
                 count: frameElements
             )
         }
+        frameResidual.barrier(
+            afterEncoderStages: .dispatch, beforeEncoderStages: .dispatch,
+            visibilityOptions: .device
+        )
+        for arguments in nonFiniteArguments {
+            Support.dispatch1D(
+                frameResidual,
+                pipeline: nonFinitePipeline,
+                arguments: arguments,
+                count: frameElements
+            )
+        }
         frameResidual.endEncoding()
         commandBuffer.endCommandBuffer()
         let semaphore = DispatchSemaphore(value: 0)
@@ -714,6 +736,11 @@ func verifyFusedFourPassRecurrence(
         commandAllocatorHasCompletedSubmission = true
         let (milliseconds, error) = commitResult.load()
         if let error { throw error }
+        if nonFiniteFlagBuffer.contents().load(as: UInt32.self) != 0 {
+            throw DeformConvError.nonFiniteOutput(
+                "fused graph produced a non-finite restored-frame value"
+            )
+        }
         let outputs = collectDiagnostics ? propagationBuffers.map { branch in
             branch.map { buffer -> [Float16] in
                 let pointer = buffer.contents().bindMemory(to: Float16.self, capacity: featureCount)
@@ -789,32 +816,29 @@ func verifyFusedFourPassRecurrence(
     var restoredStagedMaximumError: Float = 0
     var residualMaximumError: Float = 0
     var restoredChecksums = [Double](repeating: 0, count: frameCount)
-    for frame in 0..<frameCount {
-        let predicted = predictedBuffers[frame].contents().bindMemory(
-            to: Float16.self, capacity: frameElements
-        )
-        for index in 0..<frameElements {
-            let value = Float(lastRestored[frame][index])
-            guard value.isFinite else {
-                throw DeformConvError.nonFiniteOutput(
-                    "fused graph produced a non-finite output at frame \(frame), element \(index)"
-                )
-            }
-            restoredRepeatMaximumError = max(
-                restoredRepeatMaximumError,
-                abs(Float(firstRestored[frame][index]) - value)
+    if collectDiagnostics || hasStagedRestoration {
+        for frame in 0..<frameCount {
+            let predicted = predictedBuffers[frame].contents().bindMemory(
+                to: Float16.self, capacity: frameElements
             )
-            if hasStagedRestoration {
-                restoredStagedMaximumError = max(
-                    restoredStagedMaximumError,
-                    abs(Float(stagedRestoredFrames[frame][index]) - value)
+            for index in 0..<frameElements {
+                let value = Float(lastRestored[frame][index])
+                restoredRepeatMaximumError = max(
+                    restoredRepeatMaximumError,
+                    abs(Float(firstRestored[frame][index]) - value)
                 )
+                if hasStagedRestoration {
+                    restoredStagedMaximumError = max(
+                        restoredStagedMaximumError,
+                        abs(Float(stagedRestoredFrames[frame][index]) - value)
+                    )
+                }
+                residualMaximumError = max(
+                    residualMaximumError,
+                    abs(Float(predicted[index]) + Float(inputFrames[frame][index]) - value)
+                )
+                if index.isMultiple(of: 257) { restoredChecksums[frame] += Double(value) }
             }
-            residualMaximumError = max(
-                residualMaximumError,
-                abs(Float(predicted[index]) + Float(inputFrames[frame][index]) - value)
-            )
-            if index.isMultiple(of: 257) { restoredChecksums[frame] += Double(value) }
         }
     }
     let flowOracles = backwardFlows + forwardFlows
@@ -889,14 +913,6 @@ func verifyFusedFourPassRecurrence(
             _ = branches.map(\.backboneInputTensor)
             activeInputFrames = frames
             let (milliseconds, _, restored, _) = try execute()
-            for (frame, values) in restored.enumerated() {
-                for (index, value) in values.enumerated() where !Float(value).isFinite {
-                    throw DeformConvError.nonFiniteOutput(
-                        "fused graph produced a non-finite output at frame \(frame), "
-                            + "element \(index)"
-                    )
-                }
-            }
             guard let statistics = BenchmarkStatistics([milliseconds]) else {
                 throw DeformConvError.commandFailed("invalid fused four-pass timing")
             }

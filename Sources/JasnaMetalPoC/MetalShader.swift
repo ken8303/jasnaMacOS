@@ -451,6 +451,17 @@ kernel void deform_conv2d_fp16_jasna_simdgroup_gemm_fused(
     }
 }
 
+kernel void flag_non_finite_fp16(
+    device const half *values [[buffer(0)]],
+    device atomic_uint *flag [[buffer(1)]],
+    constant uint &count [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid < count && !isfinite(float(values[gid]))) {
+        atomic_store_explicit(flag, 1u, memory_order_relaxed);
+    }
+}
+
 struct SPyNetPrepareShape {
     uint width;
     uint height;

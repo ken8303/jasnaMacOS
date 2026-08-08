@@ -666,6 +666,14 @@ gather from 0.347–0.348 ms to 0.280–0.289 ms and combined DCNv2 from
 0.599–0.607 ms to 0.534–0.550 ms. The full-model oracle and decoded production
 frames remain unchanged.
 
+Production recurrence runs now check restored FP16 outputs for NaN and Infinity
+with a GPU atomic flag before returning the shared buffers. This replaces a
+second Swift scalar pass over 5.9 million values for every 30-frame crop without
+weakening the numerical-failure fallback. On the five-crop production fixture,
+normalized non-GPU graph overhead fell by about 68 ms while model GPU time and
+decoded output remained unchanged. A dedicated Metal test verifies finite,
+Infinity, and NaN inputs.
+
 ## Model conversion
 
 `tools/convert_basicvsrpp.py` splits the public Jasna/Lada BasicVSR++ checkpoint
