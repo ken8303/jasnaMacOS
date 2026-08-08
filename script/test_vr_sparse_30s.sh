@@ -4,7 +4,8 @@ set -euo pipefail
 usage() {
   echo "usage: $0 INPUT_SBS_VIDEO OUTPUT_SBS_VIDEO [START_TIME]" >&2
   echo "example: $0 input.mp4 restored-test.mov 00:12:00" >&2
-  echo "optional: JASNA_TEST_SECONDS=30 JASNA_ENCODER_WINDOWS_PER_SEGMENT=120" >&2
+  echo "optional: JASNA_TEST_SECONDS=30 (maximum 300)" >&2
+  echo "          JASNA_ENCODER_WINDOWS_PER_SEGMENT=120" >&2
   echo "          JASNA_EYE_BITRATE=20000000 JASNA_VR_BITRATE=40000000" >&2
   exit 2
 }
@@ -33,10 +34,13 @@ FAST_SOURCE_COPY="${JASNA_FAST_SOURCE_COPY:-auto}"
   echo "error: output path ends with whitespace: '$OUTPUT_PATH'" >&2
   exit 1
 }
-[[ "$TEST_SECONDS" =~ ^[0-9]+$ ]] && (( TEST_SECONDS >= 1 && TEST_SECONDS <= 120 )) || {
-  echo "error: JASNA_TEST_SECONDS must be an integer from 1 to 120" >&2
+[[ "$TEST_SECONDS" =~ ^[0-9]+$ ]] && (( TEST_SECONDS >= 1 && TEST_SECONDS <= 300 )) || {
+  echo "error: JASNA_TEST_SECONDS must be an integer from 1 to 300" >&2
   exit 1
 }
+TEST_SEGMENT_SECONDS="$TEST_SECONDS"
+(( TEST_SEGMENT_SECONDS < 30 )) && TEST_SEGMENT_SECONDS=30
+(( TEST_SEGMENT_SECONDS > 120 )) && TEST_SEGMENT_SECONDS=120
 [[ "$EYE_BITRATE" =~ ^[0-9]+$ && "$VR_BITRATE" =~ ^[0-9]+$ ]] || {
   echo "error: JASNA_EYE_BITRATE and JASNA_VR_BITRATE must be integer bit rates" >&2
   exit 1
@@ -290,7 +294,7 @@ echo "Stage 2/4: preparing mosaic regions for both eyes"
 : > "$SHARED_BATCH_PATH"
 JASNA_SPARSE_BATCH_MODE=prepare \
 JASNA_SPARSE_BATCH_FILE="$SHARED_BATCH_PATH" \
-JASNA_SEGMENT_SECONDS=30 \
+JASNA_SEGMENT_SECONDS="$TEST_SEGMENT_SECONDS" \
 JASNA_EYE_BITRATE="$EYE_BITRATE" \
 JASNA_VR_PROJECTION=fisheye \
   "$ROOT_DIR/script/restore_vr_eye_sparse.sh" \
@@ -298,7 +302,7 @@ JASNA_VR_PROJECTION=fisheye \
 
 JASNA_SPARSE_BATCH_MODE=prepare \
 JASNA_SPARSE_BATCH_FILE="$SHARED_BATCH_PATH" \
-JASNA_SEGMENT_SECONDS=30 \
+JASNA_SEGMENT_SECONDS="$TEST_SEGMENT_SECONDS" \
 JASNA_EYE_BITRATE="$EYE_BITRATE" \
 JASNA_VR_PROJECTION=fisheye \
   "$ROOT_DIR/script/restore_vr_eye_sparse.sh" \
@@ -326,7 +330,7 @@ fi
 echo "Stage 3/4: finalizing independently restartable left and right eyes"
 JASNA_SPARSE_BATCH_MODE=finalize \
 JASNA_SPARSE_BATCH_FILE="$SHARED_BATCH_PATH" \
-JASNA_SEGMENT_SECONDS=30 \
+JASNA_SEGMENT_SECONDS="$TEST_SEGMENT_SECONDS" \
 JASNA_EYE_BITRATE="$EYE_BITRATE" \
 JASNA_VR_PROJECTION=fisheye \
   "$ROOT_DIR/script/restore_vr_eye_sparse.sh" \
@@ -334,7 +338,7 @@ JASNA_VR_PROJECTION=fisheye \
 
 JASNA_SPARSE_BATCH_MODE=finalize \
 JASNA_SPARSE_BATCH_FILE="$SHARED_BATCH_PATH" \
-JASNA_SEGMENT_SECONDS=30 \
+JASNA_SEGMENT_SECONDS="$TEST_SEGMENT_SECONDS" \
 JASNA_EYE_BITRATE="$EYE_BITRATE" \
 JASNA_VR_PROJECTION=fisheye \
   "$ROOT_DIR/script/restore_vr_eye_sparse.sh" \

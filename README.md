@@ -286,10 +286,21 @@ the test clip's audio, and keeps all intermediate files and logs beside the
 output. Repeating the same command resumes incomplete work and skips validated
 eye outputs.
 
+Limit a longer quality and stability test to exactly five minutes with:
+
+```sh
+JASNA_TEST_SECONDS=300 ./script/test_vr_sparse_30s.sh \
+  /path/to/input-sbs.mp4 /path/to/restored-vr-5m.mov 00:12:00
+```
+
+The test duration is capped at 300 seconds. A five-minute run uses physical and
+restored eye segments of 120, 120, and 60 seconds while model recurrence and
+resume checkpoints remain one second apart.
+
 The test wrapper reuses a fresh release executable when available, otherwise it
 builds once and shares that executable across both eyes. When the source is
-already 30 fps and the requested start is zero, it copies the first 30 seconds
-without an unnecessary 8K re-encode. VideoToolbox
+already 30 fps and the requested start is zero, it copies the requested test
+interval without an unnecessary 8K re-encode. VideoToolbox
 speed-priority mode is enabled by default; set `JASNA_FAST_ENCODE=0` to compare
 its output with the slower quality-priority encoder. Set
 `JASNA_FAST_SOURCE_COPY=0` to force regeneration of the 30 fps test source.
