@@ -203,6 +203,12 @@ of every window. After an unexpected restart, at most four small regions are
 recomputed. Set `JASNA_REGION_CHECKPOINT_INTERVAL=1` to force per-region
 durability, at the cost of more disk synchronization.
 
+Each sparse window also reports its model-frame count and separate timings for
+crop extraction, graph wall time, GPU time, cache writes, compositing/writer
+submission, and encoder finish. These end-to-end phases determine whether the
+next optimization should pipeline CPU preparation, reduce cache traffic, or
+remain focused on the Metal graph without changing restoration quality.
+
 Metal ML crop execution is serialized. The first 30-frame crop builds the
 retained graph and every later crop reuses it; attempting to construct two
 first-use graphs concurrently proved unstable in the macOS 27 beta runtime.

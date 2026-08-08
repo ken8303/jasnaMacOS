@@ -24,6 +24,12 @@ enum SideBySideRestoration {
         * SideBySideVideoPlan.modelTileSize
     private static let tileBytes = tileElements * MemoryLayout<Float16>.stride
 
+    private static func elapsedMilliseconds(since start: ContinuousClock.Instant) -> Double {
+        let elapsed = start.duration(to: .now).components
+        return Double(elapsed.seconds) * 1_000
+            + Double(elapsed.attoseconds) / 1_000_000_000_000_000
+    }
+
     private struct PreparedRegionRestoration: Sendable {
         let regionIndex: Int
         let localStart: Int
@@ -73,9 +79,9 @@ enum SideBySideRestoration {
                     inputFrames: item.inputFrames,
                     context: item.context
                 )
-                let elapsed = started.duration(to: .now).components
-                let wallMilliseconds = Double(elapsed.seconds) * 1_000
-                    + Double(elapsed.attoseconds) / 1_000_000_000_000_000
+                let wallMilliseconds = SideBySideRestoration.elapsedMilliseconds(
+                    since: started
+                )
                 lock.lock()
                 completed[index] = CompletedRegionRestoration(
                     prepared: item,
@@ -409,6 +415,7 @@ enum SideBySideRestoration {
                 workDirectoryURL: workDirectoryURL
             )
             let writer = try RestoredFrameWriter(device: device, outputURL: outputURL, plan: plan)
+            let compositeStarted = ContinuousClock.now
             try await writer.appendRegionCachedFrames(
                 cacheURLs: window.cacheURLs,
                 attachments: attachments,
@@ -421,7 +428,15 @@ enum SideBySideRestoration {
                 projection: projection,
                 samplingMaps: samplingMaps
             )
+            let compositeMilliseconds = elapsedMilliseconds(since: compositeStarted)
+            let finishStarted = ContinuousClock.now
             try await writer.finish()
+            let finishMilliseconds = elapsedMilliseconds(since: finishStarted)
+            report(
+                "Window \(windowIndex + 1)/\(windowFrameCounts.count): compositor/writer "
+                    + "\(String(format: "%.3f", compositeMilliseconds)) ms, encoder finish "
+                    + "\(String(format: "%.3f", finishMilliseconds)) ms"
+            )
             guard await validWindowOutput(
                 outputURL,
                 dimensions: plan.dimensions,
@@ -828,6 +843,10 @@ enum SideBySideRestoration {
             defer { for handle in handles { try? handle.close() } }
             let completedRegions = resumed?.completedTiles ?? 0
             var gpuMilliseconds: Double = 0
+            var extractionMilliseconds: Double = 0
+            var graphWallMilliseconds: Double = 0
+            var cacheWriteMilliseconds: Double = 0
+            var restoredModelFrames = 0
             let configuredCheckpointInterval = Int(
                 ProcessInfo.processInfo.environment["JASNA_REGION_CHECKPOINT_INTERVAL"] ?? ""
             )
@@ -847,6 +866,7 @@ enum SideBySideRestoration {
             var nextRegion = completedRegions
             while nextRegion < regions.count {
                 let batchEnd = min(regions.count, nextRegion + regionConcurrency)
+                let extractionStarted = ContinuousClock.now
                 let work = try (nextRegion..<batchEnd).map { regionIndex in
                     let windowStartFrame = windowIndex * SideBySideVideoPlan.temporalWindowFrames
                     let region = regions[regionIndex]
@@ -881,6 +901,7 @@ enum SideBySideRestoration {
                         context: context
                     )
                 }
+                extractionMilliseconds += elapsedMilliseconds(since: extractionStarted)
                 let batch = RegionRestorationBatch(
                     device: device,
                     modelsURL: modelsURL,
@@ -896,6 +917,7 @@ enum SideBySideRestoration {
                 }
                 for restored in try batch.results() {
                     let prepared = restored.prepared
+                    let cacheWriteStarted = ContinuousClock.now
                     for frame in 0..<outputCount {
                         if frame >= prepared.localStart
                             && frame < prepared.localStart + prepared.activeFrameCount
@@ -916,6 +938,8 @@ enum SideBySideRestoration {
                         }
                     }
                     gpuMilliseconds += restored.gpuMilliseconds
+                    graphWallMilliseconds += restored.wallMilliseconds
+                    restoredModelFrames += prepared.activeFrameCount
                     let completedCount = prepared.regionIndex + 1
                     let shouldCheckpoint = completedCount == regions.count
                         || completedCount.isMultiple(of: checkpointInterval)
@@ -930,6 +954,7 @@ enum SideBySideRestoration {
                             options: .atomic
                         )
                     }
+                    cacheWriteMilliseconds += elapsedMilliseconds(since: cacheWriteStarted)
                     report(
                         "Window \(windowIndex + 1)/\(windowCount): mosaic crop "
                             + "\(completedCount)/\(regions.count), GPU "
@@ -939,6 +964,14 @@ enum SideBySideRestoration {
                 }
                 nextRegion = batchEnd
             }
+            report(
+                "Window \(windowIndex + 1)/\(windowCount): sparse hot-path phases: "
+                    + "\(restoredModelFrames) model frames, extraction "
+                    + "\(String(format: "%.3f", extractionMilliseconds)) ms, graph wall "
+                    + "\(String(format: "%.3f", graphWallMilliseconds)) ms, GPU "
+                    + "\(String(format: "%.3f", gpuMilliseconds)) ms, cache writes "
+                    + "\(String(format: "%.3f", cacheWriteMilliseconds)) ms"
+            )
             for handle in handles { try handle.close() }
             handles.removeAll()
             return WindowResult(
