@@ -1,4 +1,5 @@
 enum MetalShader {
+static let fusedGEMMRowsPerTile = 32
 static let source = #"""
 #include <metal_stdlib>
 using namespace metal;
@@ -306,6 +307,7 @@ kernel void deform_conv2d_fp16_jasna_gather(
     uint threadsPerGroup [[threads_per_threadgroup]]
 ) {
     constexpr uint sampleCount = 128 * 9;
+    constexpr uint offsetSampleCount = 16 * 9;
     uint outputPlane = s.outputHeight * s.outputWidth;
     if (row >= s.batch * outputPlane) return;
     uint n = row / outputPlane;
@@ -315,73 +317,149 @@ kernel void deform_conv2d_fp16_jasna_gather(
     uint channelsPerOffsetGroup = 128 / s.offsetGroups;
     uint offsetBase = n * 2 * s.offsetGroups * 9 * outputPlane;
     uint inputPlane = s.inputHeight * s.inputWidth;
+    threadgroup int4 sampleNeighbor[offsetSampleCount];
+    threadgroup float2 sampleFraction[offsetSampleCount];
+    threadgroup float sampleMask[offsetSampleCount];
+    for (
+        uint offsetSample = tid;
+        offsetSample < offsetSampleCount;
+        offsetSample += threadsPerGroup
+    ) {
+        uint k = offsetSample % 9;
+        uint ky = k / 3;
+        uint kx = k % 3;
+        uint offsetChannel = 2 * offsetSample;
+        float y = float(int(oy * s.strideHeight + ky * s.dilationHeight)
+            - int(s.padHeight))
+            + float(offset[offsetBase + offsetChannel * outputPlane + spatial]);
+        float x = float(int(ox * s.strideWidth + kx * s.dilationWidth)
+            - int(s.padWidth))
+            + float(offset[offsetBase + (offsetChannel + 1) * outputPlane + spatial]);
+        int y0 = int(floor(y));
+        int x0 = int(floor(x));
+        int y1 = y0 + 1;
+        int x1 = x0 + 1;
+        sampleNeighbor[offsetSample] = int4(
+            y0 >= 0 && y0 < int(s.inputHeight) && x0 >= 0 && x0 < int(s.inputWidth)
+                ? y0 * int(s.inputWidth) + x0 : -1,
+            y0 >= 0 && y0 < int(s.inputHeight) && x1 >= 0 && x1 < int(s.inputWidth)
+                ? y0 * int(s.inputWidth) + x1 : -1,
+            y1 >= 0 && y1 < int(s.inputHeight) && x0 >= 0 && x0 < int(s.inputWidth)
+                ? y1 * int(s.inputWidth) + x0 : -1,
+            y1 >= 0 && y1 < int(s.inputHeight) && x1 >= 0 && x1 < int(s.inputWidth)
+                ? y1 * int(s.inputWidth) + x1 : -1
+        );
+        sampleFraction[offsetSample] = float2(y - float(y0), x - float(x0));
+        sampleMask[offsetSample] = float(
+            mask[n * s.offsetGroups * 9 * outputPlane
+                + offsetSample * outputPlane + spatial]
+        );
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint sampleIndex = tid; sampleIndex < sampleCount; sampleIndex += threadsPerGroup) {
         uint ic = sampleIndex / 9;
         uint k = sampleIndex % 9;
-        uint ky = k / 3;
-        uint kx = k % 3;
         uint offsetGroup = ic / channelsPerOffsetGroup;
-        uint offsetChannel = 2 * (offsetGroup * 9 + k);
-        float offY = float(offset[offsetBase + offsetChannel * outputPlane + spatial]);
-        float offX = float(offset[offsetBase + (offsetChannel + 1) * outputPlane + spatial]);
-        float y = float(int(oy * s.strideHeight + ky * s.dilationHeight) - int(s.padHeight)) + offY;
-        float x = float(int(ox * s.strideWidth + kx * s.dilationWidth) - int(s.padWidth)) + offX;
-        float sampled = sample_fp16(
-            input, (n * 128 + ic) * inputPlane,
-            s.inputHeight, s.inputWidth, y, x
-        );
-        uint maskIndex = n * s.offsetGroups * 9 * outputPlane
-            + (offsetGroup * 9 + k) * outputPlane + spatial;
+        uint offsetSample = offsetGroup * 9 + k;
+        uint inputBase = (n * 128 + ic) * inputPlane;
+        int4 neighbor = sampleNeighbor[offsetSample];
+        float2 fraction = sampleFraction[offsetSample];
+        float v00 = neighbor.x >= 0 ? float(input[inputBase + uint(neighbor.x)]) : 0.0f;
+        float v01 = neighbor.y >= 0 ? float(input[inputBase + uint(neighbor.y)]) : 0.0f;
+        float v10 = neighbor.z >= 0 ? float(input[inputBase + uint(neighbor.z)]) : 0.0f;
+        float v11 = neighbor.w >= 0 ? float(input[inputBase + uint(neighbor.w)]) : 0.0f;
+        float ly = fraction.x;
+        float lx = fraction.y;
+        float sampled = v00 * (1.0f - ly) * (1.0f - lx)
+            + v01 * (1.0f - ly) * lx
+            + v10 * ly * (1.0f - lx)
+            + v11 * ly * lx;
         gathered[row * sampleCount + sampleIndex] = half(
-            sampled * float(mask[maskIndex])
+            sampled * sampleMask[offsetSample]
         );
     }
 }
 
-// Eight SIMD groups cooperatively produce an 8x64 output tile using the
-// GPU's 8x8 matrix instructions. This form is usable from both Metal 3 and
-// Metal 4 command encoders, unlike an MPSMatrixMultiplication object.
-kernel void deform_conv2d_fp16_jasna_simdgroup_gemm(
+// Eight SIMD groups cooperatively produce a 32x64 output tile using the GPU's
+// 8x8 matrix instructions. Each weight tile feeds four row blocks before being
+// discarded. The accumulators are staged in threadgroup memory so
+// this dispatch can add bias, convert to FP16 and scatter directly to NCHW.
+kernel void deform_conv2d_fp16_jasna_simdgroup_gemm_fused(
     device const half *gathered [[buffer(0)]],
     device const half *weight [[buffer(1)]],
-    device float *matrixOutput [[buffer(2)]],
+    device const half *bias [[buffer(2)]],
+    device half *output [[buffer(3)]],
+    constant DeformConvShape &s [[buffer(4)]],
     uint tile [[threadgroup_position_in_grid]],
-    uint simdgroupIndex [[simdgroup_index_in_threadgroup]]
+    uint simdgroupIndex [[simdgroup_index_in_threadgroup]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint threadsPerGroup [[threads_per_threadgroup]]
 ) {
     constexpr uint innerColumns = 128 * 9;
     constexpr uint outputColumns = 64;
-    uint row = tile * 8;
+    constexpr uint rowsPerTile = \#(fusedGEMMRowsPerTile);
+    uint row = tile * rowsPerTile;
     uint column = simdgroupIndex * 8;
-    simdgroup_half8x8 matrixA;
+    simdgroup_half8x8 matrixA0;
+    simdgroup_half8x8 matrixA1;
+    simdgroup_half8x8 matrixA2;
+    simdgroup_half8x8 matrixA3;
     simdgroup_half8x8 matrixB;
-    simdgroup_float8x8 matrixC(0.0f);
+    simdgroup_float8x8 matrixC0(0.0f);
+    simdgroup_float8x8 matrixC1(0.0f);
+    simdgroup_float8x8 matrixC2(0.0f);
+    simdgroup_float8x8 matrixC3(0.0f);
     for (uint k = 0; k < innerColumns; k += 8) {
-        simdgroup_load(matrixA, gathered + row * innerColumns + k, innerColumns);
+        simdgroup_load(matrixA0, gathered + row * innerColumns + k, innerColumns);
+        simdgroup_load(matrixA1, gathered + (row + 8) * innerColumns + k, innerColumns);
+        simdgroup_load(matrixA2, gathered + (row + 16) * innerColumns + k, innerColumns);
+        simdgroup_load(matrixA3, gathered + (row + 24) * innerColumns + k, innerColumns);
         simdgroup_load(matrixB, weight + k * outputColumns + column, outputColumns);
-        simdgroup_multiply_accumulate(matrixC, matrixA, matrixB, matrixC);
+        simdgroup_multiply_accumulate(matrixC0, matrixA0, matrixB, matrixC0);
+        simdgroup_multiply_accumulate(matrixC1, matrixA1, matrixB, matrixC1);
+        simdgroup_multiply_accumulate(matrixC2, matrixA2, matrixB, matrixC2);
+        simdgroup_multiply_accumulate(matrixC3, matrixA3, matrixB, matrixC3);
     }
-    simdgroup_store(matrixC, matrixOutput + row * outputColumns + column, outputColumns);
+    threadgroup float tileOutput[rowsPerTile * outputColumns];
+    simdgroup_store(
+        matrixC0, tileOutput + column, outputColumns
+    );
+    simdgroup_store(
+        matrixC1, tileOutput + 8 * outputColumns + column, outputColumns
+    );
+    simdgroup_store(
+        matrixC2, tileOutput + 16 * outputColumns + column, outputColumns
+    );
+    simdgroup_store(
+        matrixC3, tileOutput + 24 * outputColumns + column, outputColumns
+    );
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint outputPlane = s.outputHeight * s.outputWidth;
+    uint totalRows = s.batch * outputPlane;
+    for (uint index = tid; index < rowsPerTile * outputColumns; index += threadsPerGroup) {
+        uint localRow = index / outputColumns;
+        uint outputChannel = index % outputColumns;
+        uint outputRow = row + localRow;
+        if (outputRow < totalRows) {
+            uint n = outputRow / outputPlane;
+            uint spatial = outputRow % outputPlane;
+            output[(n * outputColumns + outputChannel) * outputPlane + spatial] = half(
+                tileOutput[index] + float(bias[outputChannel])
+            );
+        }
+    }
 }
 
-// Converts the row-major FP32 accumulator back to Jasna's NCHW FP16 tensor
-// layout and applies the convolution bias.
-kernel void deform_conv2d_fp16_jasna_float_gemm_output(
-    device const float *matrixOutput [[buffer(0)]],
-    device const half *bias [[buffer(1)]],
-    device half *output [[buffer(2)]],
-    constant DeformConvShape &s [[buffer(3)]],
+kernel void flag_non_finite_fp16(
+    device const half *values [[buffer(0)]],
+    device atomic_uint *flag [[buffer(1)]],
+    constant uint &count [[buffer(2)]],
     uint gid [[thread_position_in_grid]]
 ) {
-    uint outputPlane = s.outputHeight * s.outputWidth;
-    uint total = s.batch * outputPlane * 64;
-    if (gid >= total) return;
-    uint oc = gid % 64;
-    uint row = gid / 64;
-    uint n = row / outputPlane;
-    uint spatial = row % outputPlane;
-    output[(n * 64 + oc) * outputPlane + spatial] = half(
-        matrixOutput[gid] + float(bias[oc])
-    );
+    if (gid < count && !isfinite(float(values[gid]))) {
+        atomic_store_explicit(flag, 1u, memory_order_relaxed);
+    }
 }
 
 struct SPyNetPrepareShape {
@@ -886,6 +964,106 @@ kernel void assemble_temporal_backbone_fused_fp16(
     else if (source == 1u) output[gid] = backward1[localIndex];
     else if (source == 2u) output[gid] = forward1[localIndex];
     else output[gid] = backward2[localIndex];
+}
+
+struct MosaicCompositeParams {
+    uint frameWidth;
+    uint regionX;
+    uint regionY;
+    uint regionWidth;
+    uint regionHeight;
+    uint modelSize;
+};
+
+inline float mosaic_sample_plane(
+    device const half *values, uint offset, uint size, float x, float y
+) {
+    float clampedX = clamp(x, 0.0f, float(size - 1u));
+    float clampedY = clamp(y, 0.0f, float(size - 1u));
+    uint x0 = uint(floor(clampedX));
+    uint y0 = uint(floor(clampedY));
+    uint x1 = min(x0 + 1u, size - 1u);
+    uint y1 = min(y0 + 1u, size - 1u);
+    float fx = clampedX - float(x0);
+    float fy = clampedY - float(y0);
+    float top = mix(
+        float(values[offset + y0 * size + x0]),
+        float(values[offset + y0 * size + x1]), fx
+    );
+    float bottom = mix(
+        float(values[offset + y1 * size + x0]),
+        float(values[offset + y1 * size + x1]), fx
+    );
+    return mix(top, bottom, fy);
+}
+
+kernel void composite_fisheye_mosaic_delta(
+    device uchar *bgra [[buffer(0)]],
+    device const half *restored [[buffer(1)]],
+    device const half *original [[buffer(2)]],
+    device const float4 *compositeSamples [[buffer(3)]],
+    constant MosaicCompositeParams &params [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint regionPixels = params.regionWidth * params.regionHeight;
+    if (gid >= regionPixels) return;
+    uint pixelX = params.regionX + gid % params.regionWidth;
+    uint pixelY = params.regionY + gid / params.regionWidth;
+
+    float4 compositeSample = compositeSamples[gid];
+    float alpha = compositeSample.z;
+    if (alpha <= 0.0f) return;
+    float modelX = compositeSample.x;
+    float modelY = compositeSample.y;
+
+    uint plane = params.modelSize * params.modelSize;
+    uint destination = 4u * (pixelY * params.frameWidth + pixelX);
+    for (uint bgraChannel = 0u; bgraChannel < 3u; ++bgraChannel) {
+        uint rgbChannel = 2u - bgraChannel;
+        uint offset = rgbChannel * plane;
+        float base = float(bgra[destination + bgraChannel]) / 255.0f;
+        float value = base
+            + mosaic_sample_plane(restored, offset, params.modelSize, modelX, modelY)
+            - mosaic_sample_plane(original, offset, params.modelSize, modelX, modelY);
+        float restoredByte = clamp(value, 0.0f, 1.0f) * 255.0f;
+        float blended = float(bgra[destination + bgraChannel]) * (1.0f - alpha)
+            + restoredByte * alpha;
+        bgra[destination + bgraChannel] = uchar(clamp(floor(blended + 0.5f), 0.0f, 255.0f));
+    }
+}
+
+kernel void composite_fisheye_mosaic_delta_texture(
+    texture2d<float, access::read_write> frame [[texture(0)]],
+    device const half *restored [[buffer(0)]],
+    device const half *original [[buffer(1)]],
+    device const float4 *compositeSamples [[buffer(2)]],
+    constant MosaicCompositeParams &params [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint regionPixels = params.regionWidth * params.regionHeight;
+    if (gid >= regionPixels) return;
+    uint2 position = uint2(
+        params.regionX + gid % params.regionWidth,
+        params.regionY + gid / params.regionWidth
+    );
+    float4 compositeSample = compositeSamples[gid];
+    float alpha = compositeSample.z;
+    if (alpha <= 0.0f) return;
+
+    float4 color = frame.read(position);
+    uint plane = params.modelSize * params.modelSize;
+    for (uint rgbChannel = 0u; rgbChannel < 3u; ++rgbChannel) {
+        uint offset = rgbChannel * plane;
+        float value = color[rgbChannel]
+            + mosaic_sample_plane(
+                restored, offset, params.modelSize, compositeSample.x, compositeSample.y
+            )
+            - mosaic_sample_plane(
+                original, offset, params.modelSize, compositeSample.x, compositeSample.y
+            );
+        color[rgbChannel] = mix(color[rgbChannel], clamp(value, 0.0f, 1.0f), alpha);
+    }
+    frame.write(color, position);
 }
 """#
 }

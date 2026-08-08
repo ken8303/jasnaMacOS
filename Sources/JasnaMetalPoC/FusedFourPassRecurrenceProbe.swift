@@ -19,6 +19,44 @@ struct FusedFourPassRecurrenceResult {
 }
 
 @available(macOS 27.0, *)
+private final class ProductionFusedGraphRunner: @unchecked Sendable {
+    private let lock = NSLock()
+    private let execute: ([[Float16]]) throws -> FusedFourPassRecurrenceResult
+
+    init(execute: @escaping ([[Float16]]) throws -> FusedFourPassRecurrenceResult) {
+        self.execute = execute
+    }
+
+    func restore(_ frames: [[Float16]]) throws -> FusedFourPassRecurrenceResult {
+        lock.lock()
+        defer { lock.unlock() }
+        return try execute(frames)
+    }
+}
+
+@available(macOS 27.0, *)
+private final class ProductionFusedGraphCache: @unchecked Sendable {
+    static let shared = ProductionFusedGraphCache()
+
+    private let lock = NSLock()
+    private var runners = [String: ProductionFusedGraphRunner]()
+
+    private init() {}
+
+    func runner(for key: String) -> ProductionFusedGraphRunner? {
+        lock.lock()
+        defer { lock.unlock() }
+        return runners[key]
+    }
+
+    func retain(_ runner: ProductionFusedGraphRunner, for key: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        if runners[key] == nil { runners[key] = runner }
+    }
+}
+
+@available(macOS 27.0, *)
 private struct FusedBranchRuntime {
     let name: String
     let direction: PropagationDirection
@@ -33,7 +71,6 @@ private struct FusedBranchRuntime {
     let prepareArguments: [any MTL4ArgumentTable]
     let transformArguments: [any MTL4ArgumentTable]
     let gemmArguments: any MTL4ArgumentTable
-    let gemmOutputArguments: any MTL4ArgumentTable
     let assemblyArguments: [any MTL4ArgumentTable]
     let residualArguments: [any MTL4ArgumentTable]
     let offsetHeap: MTLHeap
@@ -55,7 +92,8 @@ func verifyFusedFourPassRecurrence(
     stagedBranchFrames: [[[Float16]]],
     stagedRestoredFrames: [[Float16]],
     warmupCount: Int = 3,
-    measurementCount: Int = 20
+    measurementCount: Int = 20,
+    collectDiagnostics: Bool = true
 ) throws -> FusedFourPassRecurrenceResult {
     typealias Support = Metal4GraphSupport
     let plane = 64 * 64
@@ -66,6 +104,15 @@ func verifyFusedFourPassRecurrence(
     let hasFlowOracle = !backwardFlows.isEmpty || !forwardFlows.isEmpty
     let hasStagedPropagation = !stagedBranchFrames.isEmpty
     let hasStagedRestoration = !stagedRestoredFrames.isEmpty
+    let reusableProductionGraph = frameCount == 30
+        && warmupCount == 0
+        && measurementCount == 1
+        && !collectDiagnostics
+        && !hasFlowOracle
+        && !hasStagedPropagation
+        && !hasStagedRestoration
+    let productionGraphKey = "\(device.registryID):\(modelsURL.standardizedFileURL.path):"
+        + "\(weightsURL.standardizedFileURL.path):\(frameCount)"
     let branchSpecs: [(String, PropagationDirection)] = [
         ("backward_1", .backward), ("forward_1", .forward),
         ("backward_2", .backward), ("forward_2", .forward),
@@ -79,6 +126,7 @@ func verifyFusedFourPassRecurrence(
                   && (backwardFlows + forwardFlows).allSatisfy({ $0.count == 2 * plane })
           )),
           inputFrames.allSatisfy({ $0.count == frameElements }),
+          collectDiagnostics || (!hasFlowOracle && !hasStagedPropagation),
           (!hasStagedPropagation || (
               stagedBranchFrames.count == 4
                   && stagedBranchFrames.allSatisfy({ branch in
@@ -92,6 +140,14 @@ func verifyFusedFourPassRecurrence(
           ))
     else { throw DeformConvError.invalidShape }
 
+    if reusableProductionGraph,
+       let runner = ProductionFusedGraphCache.shared.runner(for: productionGraphKey)
+    {
+        return try runner.restore(inputFrames)
+    }
+
+    var activeInputFrames = inputFrames
+
     let featurePipeline = try makeMetalMLPipeline(
         device: device,
         packageURL: modelsURL.appendingPathComponent("feature_extract.mtlpackage")
@@ -100,12 +156,18 @@ func verifyFusedFourPassRecurrence(
         device: device,
         packageURL: modelsURL.appendingPathComponent("upsample.mtlpackage")
     )
-    let featureHeaps = try (0..<frameCount).map { _ in
-        try Support.makeHeap(device: device, size: featurePipeline.intermediatesHeapSize)
-    }
-    let upsampleHeaps = try (0..<frameCount).map { _ in
-        try Support.makeHeap(device: device, size: upsamplePipeline.intermediatesHeapSize)
-    }
+    // Metal ML's intermediates heap is scratch storage for one dispatch. These
+    // networks execute serially in one command buffer, so a pipeline can reuse
+    // the same heap for every frame instead of allocating 2 * frameCount heaps
+    // for every restored crop.
+    let featureHeap = try Support.makeHeap(
+        device: device, size: featurePipeline.intermediatesHeapSize
+    )
+    let upsampleHeap = try Support.makeHeap(
+        device: device, size: upsamplePipeline.intermediatesHeapSize
+    )
+    let featureHeaps = [MTLHeap](repeating: featureHeap, count: frameCount)
+    let upsampleHeaps = [MTLHeap](repeating: upsampleHeap, count: frameCount)
     var heldTensors = [any MTLTensor]()
     var frameBuffers = [MTLBuffer]()
     var spatialBuffers = [MTLBuffer]()
@@ -145,7 +207,6 @@ func verifyFusedFourPassRecurrence(
     let maskBuffer = try Support.makeSharedFP16Buffer(device: device, elements: 144 * plane)
     let alignedBuffer = try Support.makeSharedFP16Buffer(device: device, elements: featureCount)
     let gatheredBuffer = try Support.makePrivateBuffer(device: device, bytes: plane * 128 * 9 * 2)
-    let matrixOutputBuffer = try Support.makePrivateBuffer(device: device, bytes: plane * 64 * 4)
     let propagationBuffers = try (0..<4).map { _ in
         try (0..<frameCount).map { _ in
             try Support.makeSharedFP16Buffer(device: device, elements: featureCount)
@@ -173,27 +234,36 @@ func verifyFusedFourPassRecurrence(
           let prepareFunction = library.makeFunction(name: "assemble_temporal_alignment_fp16"),
           let transformFunction = library.makeFunction(name: "prepare_dcn_offsets_fp16"),
           let gatherFunction = library.makeFunction(name: "deform_conv2d_fp16_jasna_gather"),
-          let gemmFunction = library.makeFunction(name: "deform_conv2d_fp16_jasna_simdgroup_gemm"),
-          let gemmOutputFunction = library.makeFunction(name: "deform_conv2d_fp16_jasna_float_gemm_output"),
+          let gemmFunction = library.makeFunction(
+              name: "deform_conv2d_fp16_jasna_simdgroup_gemm_fused"
+          ),
           let simpleAssemblyFunction = library.makeFunction(name: "assemble_propagation_backbone_fp16"),
           let temporalAssemblyFunction = library.makeFunction(name: "assemble_temporal_backbone_fp16"),
           let residualFunction = library.makeFunction(name: "add_propagation_residual_fp16"),
           let reconstructionAssemblyFunction = library.makeFunction(name: "assemble_reconstruction_fp16"),
-          let frameResidualFunction = library.makeFunction(name: "add_frame_residual_fp16")
+          let frameResidualFunction = library.makeFunction(name: "add_frame_residual_fp16"),
+          let nonFiniteFunction = library.makeFunction(name: "flag_non_finite_fp16")
     else { throw DeformConvError.shaderResourceMissing }
-    let accumulatePipeline = try device.makeComputePipelineState(function: accumulateFunction)
-    let preparePipeline = try device.makeComputePipelineState(function: prepareFunction)
-    let transformPipeline = try device.makeComputePipelineState(function: transformFunction)
-    let gatherPipeline = try device.makeComputePipelineState(function: gatherFunction)
-    let gemmPipeline = try device.makeComputePipelineState(function: gemmFunction)
-    let gemmOutputPipeline = try device.makeComputePipelineState(function: gemmOutputFunction)
-    let simpleAssemblyPipeline = try device.makeComputePipelineState(function: simpleAssemblyFunction)
-    let temporalAssemblyPipeline = try device.makeComputePipelineState(function: temporalAssemblyFunction)
-    let residualPipeline = try device.makeComputePipelineState(function: residualFunction)
-    let reconstructionAssemblyPipeline = try device.makeComputePipelineState(
-        function: reconstructionAssemblyFunction
+    let cache = MetalResourceCache.shared
+    let accumulatePipeline = try cache.computePipeline(device: device, function: accumulateFunction)
+    let preparePipeline = try cache.computePipeline(device: device, function: prepareFunction)
+    let transformPipeline = try cache.computePipeline(device: device, function: transformFunction)
+    let gatherPipeline = try cache.computePipeline(device: device, function: gatherFunction)
+    let gemmPipeline = try cache.computePipeline(device: device, function: gemmFunction)
+    let simpleAssemblyPipeline = try cache.computePipeline(
+        device: device, function: simpleAssemblyFunction
     )
-    let frameResidualPipeline = try device.makeComputePipelineState(function: frameResidualFunction)
+    let temporalAssemblyPipeline = try cache.computePipeline(
+        device: device, function: temporalAssemblyFunction
+    )
+    let residualPipeline = try cache.computePipeline(device: device, function: residualFunction)
+    let reconstructionAssemblyPipeline = try cache.computePipeline(
+        device: device, function: reconstructionAssemblyFunction
+    )
+    let frameResidualPipeline = try cache.computePipeline(
+        device: device, function: frameResidualFunction
+    )
+    let nonFinitePipeline = try cache.computePipeline(device: device, function: nonFiniteFunction)
     let spynetGraph = try FusedSPyNetClipGraph(
         device: device, modelsURL: modelsURL, library: library, sourceFrames: frameBuffers
     )
@@ -310,11 +380,10 @@ func verifyFusedFourPassRecurrence(
         }
         let gemmArguments = try Support.makeComputeArguments(
             device: device,
-            buffers: [gatheredBuffer, checkpoint.weight, matrixOutputBuffer]
-        )
-        let biasedGEMMOutputArguments = try Support.makeComputeArguments(
-            device: device,
-            buffers: [matrixOutputBuffer, checkpoint.bias, alignedBuffer, deformShapeBuffer]
+            buffers: [
+                gatheredBuffer, checkpoint.weight, checkpoint.bias,
+                alignedBuffer, deformShapeBuffer,
+            ]
         )
         branches.append(FusedBranchRuntime(
             name: name, direction: direction, backboneInputChannels: backboneInputChannels,
@@ -325,7 +394,6 @@ func verifyFusedFourPassRecurrence(
             accumulateArguments: accumulateArguments, prepareArguments: prepareArguments,
             transformArguments: transformArguments,
             gemmArguments: gemmArguments,
-            gemmOutputArguments: biasedGEMMOutputArguments,
             assemblyArguments: assemblyArguments,
             residualArguments: residualArguments,
             offsetHeap: try Support.makeHeap(device: device, size: offsetPipeline.intermediatesHeapSize),
@@ -342,6 +410,9 @@ func verifyFusedFourPassRecurrence(
     var reconstructionAssemblyArguments = [any MTL4ArgumentTable]()
     var upsampleArguments = [any MTL4ArgumentTable]()
     var frameResidualArguments = [any MTL4ArgumentTable]()
+    var nonFiniteArguments = [any MTL4ArgumentTable]()
+    guard let nonFiniteFlagBuffer = device.makeBuffer(length: 4, options: .storageModeShared)
+    else { throw DeformConvError.metalUnavailable }
     for frame in 0..<frameCount {
         let (reconstructionTensor, reconstructionBuffer) = try Support.makeTensor(
             device: device, dimensions: [64, 64, 320, 1]
@@ -374,6 +445,10 @@ func verifyFusedFourPassRecurrence(
             device: device,
             buffers: [predictedBuffer, frameBuffers[frame], restoredBuffer, frameElementsBuffer]
         ))
+        nonFiniteArguments.append(try Support.makeComputeArguments(
+            device: device,
+            buffers: [restoredBuffer, nonFiniteFlagBuffer, frameElementsBuffer]
+        ))
     }
     let residencyDescriptor = MTLResidencySetDescriptor()
     residencyDescriptor.label = "fused three-frame feature-to-restored graph"
@@ -383,10 +458,10 @@ func verifyFusedFourPassRecurrence(
         backwardFlowBuffers + forwardFlowBuffers + branchIndexBuffers + [
             conditionBuffer, rawBuffer, backboneOutputBuffer, zeroFeatureBuffer, flow2Buffer,
             deformInputBuffer, offsetBuffer, maskBuffer, alignedBuffer, gatheredBuffer,
-            matrixOutputBuffer, firstShapeBuffer, secondShapeBuffer, planeBuffer,
+            firstShapeBuffer, secondShapeBuffer, planeBuffer,
             prefixChannelsBuffer, featureCountBuffer, frameElementsBuffer, deformShapeBuffer,
         ]
-        + reconstructionBuffers + predictedBuffers + restoredBuffers
+        + reconstructionBuffers + predictedBuffers + restoredBuffers + [nonFiniteFlagBuffer]
     for buffer in sharedBuffers { residencySet.addAllocation(buffer) }
     for heap in featureHeaps { residencySet.addAllocation(heap) }
     for heap in upsampleHeaps { residencySet.addAllocation(heap) }
@@ -399,21 +474,37 @@ func verifyFusedFourPassRecurrence(
         residencySet.addAllocation(branch.biasBuffer)
     }
     residencySet.commit()
-    guard let queue = device.makeMTL4CommandQueue() else {
+    guard let queue = device.makeMTL4CommandQueue(),
+          let commandAllocator = device.makeCommandAllocator(),
+          let commandBuffer = device.makeCommandBuffer()
+    else {
         throw DeformConvError.metalUnavailable
     }
+    var commandAllocatorHasCompletedSubmission = false
 
     let transientBuffers = spatialBuffers + propagationBuffers.flatMap { $0 } + [
         conditionBuffer, rawBuffer, backboneOutputBuffer, zeroFeatureBuffer, flow2Buffer,
         deformInputBuffer, offsetBuffer, maskBuffer, alignedBuffer,
     ] + reconstructionBuffers + predictedBuffers + restoredBuffers
+    var buffersNeedInitialClear = true
     func initializeBuffers() {
+        // SPyNet's small tensors use padded row strides; their padding must
+        // remain zero because Metal ML can read the complete physical rows.
         spynetGraph.initializeBuffers()
-        for buffer in transientBuffers {
-            buffer.contents().initializeMemory(as: UInt8.self, repeating: 0, count: buffer.length)
+        nonFiniteFlagBuffer.contents().storeBytes(of: UInt32(0), as: UInt32.self)
+        // The main graph fully overwrites every mutable destination, while
+        // zeroFeatureBuffer is immutable. Clear these shared buffers once
+        // instead of rewriting roughly 190 MB before every retained-graph run.
+        if buffersNeedInitialClear {
+            for buffer in transientBuffers {
+                buffer.contents().initializeMemory(
+                    as: UInt8.self, repeating: 0, count: buffer.length
+                )
+            }
+            buffersNeedInitialClear = false
         }
         for frame in 0..<frameCount {
-            inputFrames[frame].withUnsafeBufferPointer { source in
+            activeInputFrames[frame].withUnsafeBufferPointer { source in
                 frameBuffers[frame].contents().bindMemory(to: Float16.self, capacity: frameElements)
                     .update(from: source.baseAddress!, count: frameElements)
             }
@@ -421,11 +512,11 @@ func verifyFusedFourPassRecurrence(
     }
 
     func execute() throws -> (Double, [[[Float16]]], [[Float16]], [[Float16]]) {
+        MetalResourceCache.shared.beginMachineLearningExecution()
+        defer { MetalResourceCache.shared.endMachineLearningExecution() }
         initializeBuffers()
-        guard let allocator = device.makeCommandAllocator(),
-              let commandBuffer = device.makeCommandBuffer()
-        else { throw DeformConvError.metalUnavailable }
-        commandBuffer.beginCommandBuffer(allocator: allocator)
+        if commandAllocatorHasCompletedSubmission { commandAllocator.reset() }
+        commandBuffer.beginCommandBuffer(allocator: commandAllocator)
         commandBuffer.useResidencySet(residencySet)
         for index in 0..<frameCount {
             guard let encoder = commandBuffer.makeMachineLearningCommandEncoder() else {
@@ -533,16 +624,9 @@ func verifyFusedFourPassRecurrence(
                 )
                 Support.dispatch1D(
                     alignment, pipeline: gemmPipeline,
-                    arguments: branch.gemmArguments, count: plane / 8,
+                    arguments: branch.gemmArguments,
+                    count: plane / MetalShader.fusedGEMMRowsPerTile,
                     threads: 8 * gemmPipeline.threadExecutionWidth, threadgroups: true
-                )
-                alignment.barrier(
-                    afterEncoderStages: .dispatch, beforeEncoderStages: .dispatch,
-                    visibilityOptions: .device
-                )
-                Support.dispatch1D(
-                    alignment, pipeline: gemmOutputPipeline,
-                    arguments: branch.gemmOutputArguments, count: featureCount
                 )
                 alignment.barrier(
                     afterEncoderStages: .dispatch, beforeEncoderStages: .dispatch,
@@ -623,6 +707,18 @@ func verifyFusedFourPassRecurrence(
                 count: frameElements
             )
         }
+        frameResidual.barrier(
+            afterEncoderStages: .dispatch, beforeEncoderStages: .dispatch,
+            visibilityOptions: .device
+        )
+        for arguments in nonFiniteArguments {
+            Support.dispatch1D(
+                frameResidual,
+                pipeline: nonFinitePipeline,
+                arguments: arguments,
+                count: frameElements
+            )
+        }
         frameResidual.endEncoding()
         commandBuffer.endCommandBuffer()
         let semaphore = DispatchSemaphore(value: 0)
@@ -637,22 +733,29 @@ func verifyFusedFourPassRecurrence(
         }
         queue.commit([commandBuffer], options: commitOptions)
         semaphore.wait()
+        commandAllocatorHasCompletedSubmission = true
         let (milliseconds, error) = commitResult.load()
         if let error { throw error }
-        let outputs = propagationBuffers.map { branch in
+        if nonFiniteFlagBuffer.contents().load(as: UInt32.self) != 0 {
+            throw DeformConvError.nonFiniteOutput(
+                "fused graph produced a non-finite restored-frame value"
+            )
+        }
+        let outputs = collectDiagnostics ? propagationBuffers.map { branch in
             branch.map { buffer -> [Float16] in
                 let pointer = buffer.contents().bindMemory(to: Float16.self, capacity: featureCount)
                 return Array(UnsafeBufferPointer(start: pointer, count: featureCount))
             }
-        }
+        } : []
         let restored = restoredBuffers.map { buffer -> [Float16] in
             let pointer = buffer.contents().bindMemory(to: Float16.self, capacity: frameElements)
             return Array(UnsafeBufferPointer(start: pointer, count: frameElements))
         }
-        let flows = (backwardFlowBuffers + forwardFlowBuffers).map { buffer -> [Float16] in
+        let flows = collectDiagnostics ? (backwardFlowBuffers + forwardFlowBuffers).map {
+            buffer -> [Float16] in
             let pointer = buffer.contents().bindMemory(to: Float16.self, capacity: 2 * plane)
             return Array(UnsafeBufferPointer(start: pointer, count: 2 * plane))
-        }
+        } : []
         return (milliseconds, outputs, restored, flows)
     }
 
@@ -676,33 +779,35 @@ func verifyFusedFourPassRecurrence(
     var propagationStagedMaximumError: Float = 0
     var stagedBranchErrors = [Float](repeating: 0, count: 4)
     var checksums = [Double](repeating: 0, count: 4)
-    for branch in 0..<4 {
-        let finalFrame = branchSpecs[branch].1 == .backward ? 0 : frameCount - 1
-        for frame in 0..<frameCount {
-            for index in 0..<featureCount {
-                let value = Float(lastOutputs[branch][frame][index])
-                guard value.isFinite else {
-                    throw DeformConvError.commandFailed(
-                        "fused recurrence produced a non-finite feature in "
-                            + "\(branchSpecs[branch].0), frame \(frame), element \(index)"
+    if collectDiagnostics {
+        for branch in 0..<4 {
+            let finalFrame = branchSpecs[branch].1 == .backward ? 0 : frameCount - 1
+            for frame in 0..<frameCount {
+                for index in 0..<featureCount {
+                    let value = Float(lastOutputs[branch][frame][index])
+                    guard value.isFinite else {
+                        throw DeformConvError.nonFiniteOutput(
+                            "fused recurrence produced a non-finite feature in "
+                                + "\(branchSpecs[branch].0), frame \(frame), element \(index)"
+                        )
+                    }
+                    propagationRepeatMaximumError = max(
+                        propagationRepeatMaximumError,
+                        abs(Float(firstOutputs[branch][frame][index]) - value)
                     )
-                }
-                propagationRepeatMaximumError = max(
-                    propagationRepeatMaximumError,
-                    abs(Float(firstOutputs[branch][frame][index]) - value)
-                )
-                if hasStagedPropagation {
-                    propagationStagedMaximumError = max(
-                        propagationStagedMaximumError,
-                        abs(Float(stagedBranchFrames[branch][frame][index]) - value)
-                    )
-                    stagedBranchErrors[branch] = max(
-                        stagedBranchErrors[branch],
-                        abs(Float(stagedBranchFrames[branch][frame][index]) - value)
-                    )
-                }
-                if frame == finalFrame, index.isMultiple(of: 257) {
-                    checksums[branch] += Double(value)
+                    if hasStagedPropagation {
+                        propagationStagedMaximumError = max(
+                            propagationStagedMaximumError,
+                            abs(Float(stagedBranchFrames[branch][frame][index]) - value)
+                        )
+                        stagedBranchErrors[branch] = max(
+                            stagedBranchErrors[branch],
+                            abs(Float(stagedBranchFrames[branch][frame][index]) - value)
+                        )
+                    }
+                    if frame == finalFrame, index.isMultiple(of: 257) {
+                        checksums[branch] += Double(value)
+                    }
                 }
             }
         }
@@ -711,55 +816,54 @@ func verifyFusedFourPassRecurrence(
     var restoredStagedMaximumError: Float = 0
     var residualMaximumError: Float = 0
     var restoredChecksums = [Double](repeating: 0, count: frameCount)
-    for frame in 0..<frameCount {
-        let predicted = predictedBuffers[frame].contents().bindMemory(
-            to: Float16.self, capacity: frameElements
-        )
-        for index in 0..<frameElements {
-            let value = Float(lastRestored[frame][index])
-            guard value.isFinite else {
-                throw DeformConvError.commandFailed(
-                    "fused graph produced a non-finite output at frame \(frame), element \(index)"
-                )
-            }
-            restoredRepeatMaximumError = max(
-                restoredRepeatMaximumError,
-                abs(Float(firstRestored[frame][index]) - value)
+    if collectDiagnostics || hasStagedRestoration {
+        for frame in 0..<frameCount {
+            let predicted = predictedBuffers[frame].contents().bindMemory(
+                to: Float16.self, capacity: frameElements
             )
-            if hasStagedRestoration {
-                restoredStagedMaximumError = max(
-                    restoredStagedMaximumError,
-                    abs(Float(stagedRestoredFrames[frame][index]) - value)
+            for index in 0..<frameElements {
+                let value = Float(lastRestored[frame][index])
+                restoredRepeatMaximumError = max(
+                    restoredRepeatMaximumError,
+                    abs(Float(firstRestored[frame][index]) - value)
                 )
+                if hasStagedRestoration {
+                    restoredStagedMaximumError = max(
+                        restoredStagedMaximumError,
+                        abs(Float(stagedRestoredFrames[frame][index]) - value)
+                    )
+                }
+                residualMaximumError = max(
+                    residualMaximumError,
+                    abs(Float(predicted[index]) + Float(inputFrames[frame][index]) - value)
+                )
+                if index.isMultiple(of: 257) { restoredChecksums[frame] += Double(value) }
             }
-            residualMaximumError = max(
-                residualMaximumError,
-                abs(Float(predicted[index]) + Float(inputFrames[frame][index]) - value)
-            )
-            if index.isMultiple(of: 257) { restoredChecksums[frame] += Double(value) }
         }
     }
     let flowOracles = backwardFlows + forwardFlows
     var flowRepeatMaximumError: Float = 0
     var flowOracleMaximumError: Float = 0
     var flowChecksums = [Double](repeating: 0, count: 2 * flowCount)
-    for flow in 0..<(2 * flowCount) {
-        for index in 0..<(2 * plane) {
-            let value = Float(lastFlows[flow][index])
-            guard value.isFinite else {
-                throw DeformConvError.commandFailed(
-                    "fused SPyNet produced a non-finite flow \(flow), element \(index)"
+    if collectDiagnostics {
+        for flow in 0..<(2 * flowCount) {
+            for index in 0..<(2 * plane) {
+                let value = Float(lastFlows[flow][index])
+                guard value.isFinite else {
+                    throw DeformConvError.nonFiniteOutput(
+                        "fused SPyNet produced a non-finite flow \(flow), element \(index)"
+                    )
+                }
+                flowRepeatMaximumError = max(
+                    flowRepeatMaximumError, abs(Float(firstFlows[flow][index]) - value)
                 )
+                if hasFlowOracle {
+                    flowOracleMaximumError = max(
+                        flowOracleMaximumError, abs(Float(flowOracles[flow][index]) - value)
+                    )
+                }
+                if index.isMultiple(of: 257) { flowChecksums[flow] += Double(value) }
             }
-            flowRepeatMaximumError = max(
-                flowRepeatMaximumError, abs(Float(firstFlows[flow][index]) - value)
-            )
-            if hasFlowOracle {
-                flowOracleMaximumError = max(
-                    flowOracleMaximumError, abs(Float(flowOracles[flow][index]) - value)
-                )
-            }
-            if index.isMultiple(of: 257) { flowChecksums[flow] += Double(value) }
         }
     }
     guard propagationRepeatMaximumError <= 0.001,
@@ -781,7 +885,7 @@ func verifyFusedFourPassRecurrence(
     }
     _ = heldTensors
     _ = branches.map(\.backboneInputTensor)
-    return FusedFourPassRecurrenceResult(
+    let result = FusedFourPassRecurrenceResult(
         statistics: statistics,
         propagationRepeatMaximumError: propagationRepeatMaximumError,
         propagationStagedMaximumError: propagationStagedMaximumError,
@@ -797,4 +901,39 @@ func verifyFusedFourPassRecurrence(
         propagatedFrames: lastOutputs,
         restoredFrames: lastRestored
     )
+    if reusableProductionGraph {
+        let runner = ProductionFusedGraphRunner { frames in
+            guard frames.count == frameCount,
+                  frames.allSatisfy({ $0.count == frameElements })
+            else { throw DeformConvError.invalidShape }
+            // Argument tables store resource IDs, not strong ownership of the
+            // tensor wrappers that created those IDs. A retained production
+            // graph must therefore keep every tensor alive across executions.
+            _ = heldTensors
+            _ = branches.map(\.backboneInputTensor)
+            activeInputFrames = frames
+            let (milliseconds, _, restored, _) = try execute()
+            guard let statistics = BenchmarkStatistics([milliseconds]) else {
+                throw DeformConvError.commandFailed("invalid fused four-pass timing")
+            }
+            return FusedFourPassRecurrenceResult(
+                statistics: statistics,
+                propagationRepeatMaximumError: 0,
+                propagationStagedMaximumError: 0,
+                restoredRepeatMaximumError: 0,
+                restoredStagedMaximumError: 0,
+                residualMaximumError: 0,
+                flowOracleCompared: false,
+                flowRepeatMaximumError: 0,
+                flowOracleMaximumError: 0,
+                flowChecksums: [],
+                propagationChecksums: [],
+                restoredChecksums: [Double](repeating: 0, count: frameCount),
+                propagatedFrames: [],
+                restoredFrames: restored
+            )
+        }
+        ProductionFusedGraphCache.shared.retain(runner, for: productionGraphKey)
+    }
+    return result
 }

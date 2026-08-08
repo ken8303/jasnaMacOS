@@ -155,8 +155,166 @@ JASNA_LEFT_WORK_DIR=/path/to/old.jasna-work \
 
 The final merge copies audio and ordinary container metadata. Injection of
 Spherical Video `st3d`/`sv3d` atoms is not implemented yet, so players may need
-the output manually identified as left-right SBS VR. Sparse mosaic detection
-and region-only restoration remain the next performance step.
+the output manually identified as left-right SBS VR.
+
+Sparse mosaic restoration follows VR Video Toolbox CE's pre-scan design. A
+YOLO detector samples each physical eye every 0.1 seconds, separates distant
+detections, and emits one-second tracked regions aligned with each 30-frame
+processing window. This gives BasicVSR++ five times more temporal context than
+the former 0.2-second clips, which reduces residual blocks and flicker on moving
+mosaics without materially increasing the total number of restored frames. Set
+`JASNA_REGION_DURATION=0.2` only for an old-behaviour comparison. The detector
+writes a JSON manifest, and the
+Metal restorer then runs only the detected 256×256 model crops. Clean
+one-second windows bypass the Jasna model. Following Jasna's VR180 path, the
+sparse wrapper defaults to fisheye projection: each region is flattened before
+restoration, only the restored delta is inverse-projected, and a feathered mask
+places that delta onto the untouched source frame. Set
+`JASNA_VR_PROJECTION=raw` only when comparing against the older flat-crop path.
+The current sparse VR path decodes and encodes 8-bit BGRA/SDR. A Main 10 or HDR
+source therefore does not retain its original bit depth or HDR transfer
+characteristics; do not use this path when HDR preservation is required.
+Detector setup is isolated from Swift:
+
+```sh
+./script/setup_mosaic_detector.sh
+```
+
+The setup downloads the public 6 MB
+`lada_vr_mosaic_detection_model_v2_fast.pt` model used by VR Video Toolbox CE
+and installs Ultralytics in `.venv-mosaic`. Neither environment nor model is
+tracked by Git. Test the left eye with:
+
+```sh
+./script/restore_vr_eye_sparse.sh \
+  /path/to/input_30fps.mp4 left /path/to/restored-left.mov
+```
+
+Detection manifests, source segments, restored windows, caches, and the log
+remain beside the requested output, so interrupted work is restartable. A real
+4096×4096 one-second left-eye fisheye proof detected three regions. The Metal
+model used 1.31 seconds of GPU time for all three crops; compositing and hardware
+HEVC encoding brought the post-build work to roughly six seconds. Its output was
+validated as exactly 30 frames at 30 fps. Projection mode is included in the
+resume-cache key, so an older raw crop can never be reused for a fisheye run.
+
+Persistent crop caches are flushed every five completed regions and at the end
+of every window. After an unexpected restart, at most four small regions are
+recomputed. Set `JASNA_REGION_CHECKPOINT_INTERVAL=1` to force per-region
+durability, at the cost of more disk synchronization.
+
+Each sparse window also reports its model-frame count and separate timings for
+crop extraction, graph wall time, GPU time, cache writes, compositing/writer
+submission, and encoder finish. These end-to-end phases determine whether the
+next optimization should pipeline CPU preparation, reduce cache traffic, or
+remain focused on the Metal graph without changing restoration quality.
+
+Sparse output keeps the one-second recurrence boundaries but, by default, feeds
+five consecutive windows to one HEVC writer. This reduces hardware-encoder
+startup and drain work while preserving restartability: model caches remain
+per-window, and an interruption rebuilds at most the current five-second output
+segment. Existing one-window outputs are detected and reused. Set
+`JASNA_ENCODER_WINDOWS_PER_SEGMENT=1` for the previous behavior or choose a
+different positive segment size. A three-window 4096×4096 fixture reduced
+encoder-finish time from 1.431 seconds to 0.497 seconds and produced one
+validated 90-frame, 30 fps segment.
+
+Metal ML crop execution is serialized. The first 30-frame crop builds the
+retained graph and every later crop reuses it; attempting to construct two
+first-use graphs concurrently proved unstable in the macOS 27 beta runtime.
+`JASNA_REGION_CONCURRENCY` is therefore ignored for production restoration.
+
+The optimized production path retains its first complete 30-frame Metal graph
+for the lifetime of the eye-restoration process. Later crops reuse the same
+tensors, buffers, argument tables, and residency set under a lock. Sequential
+Metal ML dispatches also share scratch heaps per pipeline/level instead of
+allocating hundreds of identical heaps per crop. A 4096×4096 one-second proof
+measured about 1.10 seconds for the initial graph build and execution, then
+about 0.45 seconds per reused 30-frame crop including roughly 0.38 seconds of
+GPU work. Decoded frame hashes matched the pre-cache output exactly.
+
+The retained graph clears its unpadded main buffers only on first use because
+every later destination is fully overwritten. SPyNet's padded-row tensors are
+still cleared for every crop; skipping those clears changed output and was
+rejected. On a five-region production fixture, the accepted change removed
+about 26 ms of non-GPU work per reused crop. The decoded 30-frame output was
+byte-identical, and the full PyTorch oracle remained at 70.49 dB PSNR.
+
+Long sparse eye restorations also submit every pending 30–120 second physical
+segment to one sequential app process. This keeps that retained graph alive
+across segment boundaries while each segment continues to use its own output,
+resume cache, and completion marker. A two-job production fixture reduced the
+second job's first-crop wall time from 786 ms to 101 ms; both decoded 30-frame
+outputs had identical frame hashes. Restarting still skips validated windows
+and resumes an interrupted crop from its segment-specific persistent cache.
+The 30-second SBS test coordinates both eyes through the same batch as well.
+On an 8192×4096 end-to-end fixture, the right eye's first crop reused the graph
+and fell from 1.32 seconds to 456 ms. A second invocation skipped both completed
+eyes and the final SBS output without running the model or encoder again.
+
+Sparse fisheye compositing runs the delta sampling and feather blending on
+Metal. Its default zero-copy path wraps the decoder and encoder pixel buffers
+as Metal textures, avoiding two 64 MiB CPU frame copies for every 4096×4096
+eye frame. Two independent output frames are prepared in parallel on Macs with
+at least 16 GB of memory, then submitted to AVFoundation in presentation order.
+Set `JASNA_COMPOSITE_CONCURRENCY=1` for the lowest-memory path; values above two
+are capped. `JASNA_METAL_TEXTURE_COMPOSITOR=0` selects the Metal buffer-copy
+fallback, while `JASNA_METAL_COMPOSITOR=0` selects the CPU fallback.
+
+In an alternating warmed comparison, zero-copy reduced steady compositor time
+from 20.2 to 8.3 ms/frame and reduced user/system CPU time from 0.93/0.95 to
+0.78/0.74 seconds for a one-second proof. Whole-job time remained about 4.2
+seconds because model inference and HEVC finalization dominate and overlap the
+saved work. A raw-frame cross-check differed in only 8 of 67,108,864 bytes,
+each by 1/255. Set `JASNA_VERIFY_METAL_COMPOSITOR=1` to repeat that first-frame
+diagnostic.
+
+Run an end-to-end 30-second test of both eyes and rebuild an SBS preview with:
+
+```sh
+./script/test_vr_sparse_30s.sh \
+  /path/to/input-sbs.mp4 /path/to/restored-vr-test.mov 00:12:00
+```
+
+The start time is optional and defaults to the beginning. The script prepares
+an exact 30 fps test clip, restores the left and right eyes sequentially, copies
+the test clip's audio, and keeps all intermediate files and logs beside the
+output. Repeating the same command resumes incomplete work and skips validated
+eye outputs.
+
+The test wrapper reuses a fresh release executable when available, otherwise it
+builds once and shares that executable across both eyes. When the source is
+already 30 fps and the requested start is zero, it copies the first 30 seconds
+without an unnecessary 8K re-encode. VideoToolbox
+speed-priority mode is enabled by default; set `JASNA_FAST_ENCODE=0` to compare
+its output with the slower quality-priority encoder. Set
+`JASNA_FAST_SOURCE_COPY=0` to force regeneration of the 30 fps test source.
+Sparse mosaic scans decode HEVC sequentially and infer two sampled frames at a
+time. Set `JASNA_DETECT_BATCH_SIZE=1` to minimize memory, or
+`JASNA_DETECT_DECODE_MODE=seek` to compare with the former random-seek path.
+Fisheye sampling coordinates and interpolation weights are calculated once per
+mosaic region and reused across its active frames.
+Inactive region/frame cache slots are sparse file holes and are skipped during
+compositing, reducing physical cache I/O without changing resumable offsets.
+
+When the supporter-only Jasna SD1.5 checkpoint is unavailable, the public
+DeepMosaics BVDNet checkpoint can be tested on a persistent 30-second left-eye
+clip:
+
+```sh
+./script/test_deepmosaics_left.sh \
+  /path/to/input_30fps.mp4 /path/to/restored-left-30s.mov
+```
+
+The runner automatically uses PyTorch MPS when the M4 GPU is accessible and
+falls back to CPU otherwise. It batches all detected regions in each one-second
+window, stores every region result before encoding, validates every 30-frame
+HEVC window, and resumes completed work. On an M4, a three-region window fell
+from about 87 seconds on the original sequential CPU path to 38.2 seconds with
+MPS batching. GPU and CPU outputs had a 99th-percentile difference of 1/255.
+The 30-second test completed as 900 validated 4096x4096 frames; its public
+checkpoint produces plausible smoothing rather than recovery of true hidden
+detail.
 
 For the lower-risk physical-file workflow, test one eye first with
 `restore_vr_eye_segments.sh`. It decodes and crops the selected SBS half into
@@ -263,15 +421,15 @@ boundary, and allocate the complete buffer-backed clip arena:
 
 ## Measured result
 
-On a 10-GPU-core Apple M4 with Xcode 27 beta 4, a 20-sample run measured the
-gather-plus-SIMD-group-GEMM FP16 deformable convolution at 0.742 ms median.
-Its 20-sample P10–P90 interval was 0.741–0.745 ms; one 1.723 ms outlier raised
-the standard deviation to 0.214 ms. The tiled scalar reduction measured
-1.175 ms, the first SIMD version 9.166 ms, and the direct baseline 16.572 ms.
-The Metal-4-compatible path is 37% faster than tiled and 22.3× faster than the
-direct kernel at the median. Its maximum FP16 difference from the baseline was
-`0.000244`, and its FP32 implementation passed the CPU oracle with a maximum
-absolute error of about `3e-8`.
+On a 10-GPU-core Apple M4 with Xcode 27 beta 4, 20-sample runs across all four
+checkpoint directions measured the shared-coordinate gather plus fused
+SIMD-group-GEMM FP16 deformable convolution at 0.534–0.550 ms median. The tiled
+scalar reduction measured 1.178–1.186 ms, the first SIMD version about 9.1 ms,
+and the direct baseline about 16.2 ms. The Metal-4-compatible path is about 54%
+faster than tiled and 29–30× faster than the direct kernel at the median. Its
+maximum FP16 difference from the baseline was `0.000977`, and its FP32
+implementation passed the CPU oracle with a maximum absolute error of about
+`3e-8`.
 
 The converted feature extractor executes in about 0.42 ms median. The offset,
 propagation-backbone, reconstruction, and six split SPyNet convolution packages
@@ -298,9 +456,9 @@ usage.
 convolution parameter sets from the public checkpoint and writes the packed
 FP16 `[input channel, kernel element, output channel]` layout consumed directly
 by the Metal kernels. Each direction is 147,584 bytes including bias. All four
-load into Metal buffers and benchmark at 0.741–0.742 ms median through gather
-plus SIMD-group GEMM. Their P10–P90 intervals stay within 0.740–0.747 ms, with
-a maximum delta of `0.000977` from the direct FP16 implementation. The custom
+load into Metal buffers and benchmark at 0.534–0.550 ms median through the
+shared-coordinate gather plus fused SIMD-group GEMM, with a maximum delta of
+`0.000977` from the direct FP16 implementation. The custom
 offset/mask stage implements Jasna's `10*tanh`, interleaved flipped-flow add,
 and sigmoid mask and passes its CPU oracle with maximum error `0.00195`.
 
@@ -483,8 +641,38 @@ early return. An experiment splitting each output-channel reduction across two
 threads regressed from 1.175 ms to 2.059 ms and was rejected. The replacement
 materializes the 4,096×1,152 deformable im2col matrix, multiplies it by the
 1,152×64 packed checkpoint weights using 8×8 SIMD-group matrix instructions,
-and converts the FP32 accumulator back to NCHW FP16. It works inside the same
-Metal 4 command buffer as the Metal ML recurrence stages.
+and converts the FP32 accumulator back to NCHW FP16. The gather now calculates
+the 144 unique offset/mask coordinates once per output pixel in threadgroup
+memory instead of reloading them for each of eight input channels. Bias,
+FP16 conversion, and NCHW scattering are fused into the matrix dispatch, which
+also removes the 1 MiB FP32 output matrix. Across four real checkpoint weight
+sets, the combined median improved from 0.743–0.749 to 0.701–0.704 ms; the
+stage-separated medians were about 0.347 ms gather and 0.354 ms matrix work.
+The matrix kernel now reuses each loaded 8×8 weight tile across four row blocks,
+producing 32×64 output tiles per threadgroup. Alternating 20-sample comparisons
+across the same four checkpoints measured 0.250–0.254 ms matrix work and
+0.604–0.614 ms combined DCNv2, versus 0.276–0.279 ms and 0.625–0.636 ms for the
+16-row kernel. The change also corrects a three-frame probe dispatch that
+launched twice the required threadgroups. The full four-pass oracle still
+passes at 70.49 dB, and decoded production frames match the 16-row output
+exactly. It works inside the same Metal 4 command buffer as the Metal ML
+recurrence stages.
+
+The gather kernel now precomputes each shared offset location's four input-plane
+neighbor indices and interpolation fractions once per threadgroup. Reusing
+those values across the offset group's eight input channels avoids repeating
+coordinate flooring and boundary checks. Alternating 20-sample runs reduced
+gather from 0.347–0.348 ms to 0.280–0.289 ms and combined DCNv2 from
+0.599–0.607 ms to 0.534–0.550 ms. The full-model oracle and decoded production
+frames remain unchanged.
+
+Production recurrence runs now check restored FP16 outputs for NaN and Infinity
+with a GPU atomic flag before returning the shared buffers. This replaces a
+second Swift scalar pass over 5.9 million values for every 30-frame crop without
+weakening the numerical-failure fallback. On the five-crop production fixture,
+normalized non-GPU graph overhead fell by about 68 ms while model GPU time and
+decoded output remained unchanged. A dedicated Metal test verifies finite,
+Infinity, and NaN inputs.
 
 ## Model conversion
 
@@ -524,3 +712,9 @@ The exporter reproduces the Metal probe's deterministic FP16 input
 quantization, then saves both FP32 and FP16 restored tensors. Oracle data and
 model weights remain excluded from version control. Replace `--frames` and the
 final output-directory component with `30` or another desired clip length.
+
+## License
+
+This Jasna-derived project is distributed under the GNU Affero General Public
+License version 3. See [LICENSE](LICENSE) and [NOTICE](NOTICE). Downloaded model
+weights and third-party assets remain subject to their respective terms.

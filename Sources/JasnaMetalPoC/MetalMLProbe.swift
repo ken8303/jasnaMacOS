@@ -939,7 +939,12 @@ func verifyReconstructedFrame(
     let (predictedTensor, predictedBuffer) = try makeTensor(dimensions: [256, 256, 3, 1])
     let restoredBuffer = try makeSharedBuffer(elements: frameElementCount)
     let branchBuffers = try directions.map { direction in
-        try makeBuffer(values: propagationResults[direction]!.outputValues)
+        guard let result = propagationResults[direction] else {
+            throw DeformConvError.commandFailed(
+                "missing propagation result for \(direction)"
+            )
+        }
+        return try makeBuffer(values: result.outputValues)
     }
     var featurePlaneValue = UInt32(featurePlane)
     var frameElementCountValue = UInt32(frameElementCount)

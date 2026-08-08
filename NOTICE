@@ -1,0 +1,13 @@
+jasnaMacOS
+
+Copyright (c) 2026 ken8303 and contributors.
+
+This project contains adaptations of Jasna by Kruk2:
+https://github.com/Kruk2/jasna
+
+Jasna is distributed under the GNU Affero General Public License version 3.
+This derivative project is distributed under the same license; see LICENSE.
+
+Third-party frameworks, model architectures, checkpoints, and downloaded model
+assets remain subject to their respective authors' terms. Downloaded weights and
+local model environments are not relicensed by this notice.

@@ -15,6 +15,14 @@ OUTPUT_PATH="$3"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SEGMENT_SECONDS="${JASNA_SEGMENT_SECONDS:-60}"
 EYE_BITRATE="${JASNA_EYE_BITRATE:-20000000}"
+SPARSE_MOSAIC="${JASNA_SPARSE_MOSAIC:-0}"
+VR_PROJECTION="${JASNA_VR_PROJECTION:-raw}"
+FAST_ENCODE="${JASNA_FAST_ENCODE:-1}"
+DETECT_BATCH_SIZE="${JASNA_DETECT_BATCH_SIZE:-2}"
+DETECT_DECODE_MODE="${JASNA_DETECT_DECODE_MODE:-sequential}"
+REGION_DURATION="${JASNA_REGION_DURATION:-1.0}"
+SPARSE_BATCH_MODE="${JASNA_SPARSE_BATCH_MODE:-run}"
+SPARSE_BATCH_FILE="${JASNA_SPARSE_BATCH_FILE:-}"
 
 [[ "$EYE" == "left" || "$EYE" == "right" ]] || usage
 [[ -f "$INPUT_PATH" ]] || {
@@ -37,6 +45,30 @@ EYE_BITRATE="${JASNA_EYE_BITRATE:-20000000}"
   echo "error: JASNA_EYE_BITRATE must be an integer bit rate" >&2
   exit 1
 }
+[[ "$VR_PROJECTION" == "raw" || "$VR_PROJECTION" == "fisheye" ]] || {
+  echo "error: JASNA_VR_PROJECTION must be raw or fisheye" >&2
+  exit 1
+}
+[[ "$FAST_ENCODE" == "0" || "$FAST_ENCODE" == "1" ]] || {
+  echo "error: JASNA_FAST_ENCODE must be 0 or 1" >&2
+  exit 1
+}
+[[ "$SPARSE_BATCH_MODE" == "run" || "$SPARSE_BATCH_MODE" == "prepare" \
+  || "$SPARSE_BATCH_MODE" == "finalize" ]] || {
+  echo "error: JASNA_SPARSE_BATCH_MODE must be run, prepare, or finalize" >&2
+  exit 1
+}
+if [[ "$SPARSE_BATCH_MODE" != "run" ]]; then
+  [[ "$SPARSE_MOSAIC" == "1" && -n "$SPARSE_BATCH_FILE" ]] || {
+    echo "error: coordinated sparse mode requires JASNA_SPARSE_BATCH_FILE" >&2
+    exit 1
+  }
+fi
+
+ENCODER_SPEED_ARGS=()
+if [[ "$FAST_ENCODE" == "1" ]]; then
+  ENCODER_SPEED_ARGS=(-realtime 1 -prio_speed 1)
+fi
 
 if command -v ffmpeg >/dev/null 2>&1; then
   FFMPEG_PATH="$(command -v ffmpeg)"
@@ -64,6 +96,13 @@ LOG_PATH="$OUTPUT_DIR/${OUTPUT_STEM}.${EYE}-segments.log"
 SOURCE_DIR="$WORK_DIR/source"
 RESTORED_DIR="$WORK_DIR/restored"
 CACHE_DIR="$WORK_DIR/cache"
+if [[ "$SPARSE_MOSAIC" == "1" ]]; then
+  # v4 uses full 30-frame tracked regions. Keep it separate from the old
+  # six-frame v3 cache so a quality run can never reuse the softer result.
+  RESTORED_DIR="$WORK_DIR/restored-sparse-crop-v4-temporal-$VR_PROJECTION"
+  CACHE_DIR="$WORK_DIR/cache-sparse-crop-v4-temporal-$VR_PROJECTION"
+fi
+OUTPUT_DONE="$RESTORED_DIR/${EYE}-joined.done"
 SOURCE_DONE="$WORK_DIR/source.done"
 MANIFEST_PATH="$WORK_DIR/restored-concat.txt"
 TEMP_OUTPUT="$WORK_DIR/${EYE}-joined.mov"
@@ -78,6 +117,13 @@ echo "Output:           $OUTPUT_PATH"
 echo "Work dir:         $WORK_DIR"
 echo "Log:              $LOG_PATH"
 echo "Segment duration: $SEGMENT_SECONDS seconds"
+echo "Sparse mosaic:    $SPARSE_MOSAIC"
+echo "VR projection:    $VR_PROJECTION"
+echo "Fast encoding:    $FAST_ENCODE"
+if [[ "$SPARSE_MOSAIC" == "1" ]]; then
+  echo "Detector:         $DETECT_DECODE_MODE decode, batch $DETECT_BATCH_SIZE"
+  echo "Temporal clips:   $REGION_DURATION seconds"
+fi
 
 IFS=, read -r SOURCE_WIDTH SOURCE_HEIGHT < <(
   "$FFPROBE_PATH" -v error -select_streams v:0 \
@@ -103,12 +149,16 @@ echo "SBS canvas: ${SOURCE_WIDTH}x${SOURCE_HEIGHT}; selected eye: ${EYE_WIDTH}x$
 video_duration() {
   local candidate="$1"
   local duration
-  duration="$("$FFPROBE_PATH" -v error -select_streams v:0 \
-    -show_entries stream=duration -of default=noprint_wrappers=1:nokey=1 \
+  # Prefer the container timeline. A constant-frame-rate conversion can have
+  # one final video frame beyond the track's reported stream duration while
+  # still matching the MP4/MOV presentation duration exactly.
+  duration="$("$FFPROBE_PATH" -v error -show_entries format=duration \
+    -of default=noprint_wrappers=1:nokey=1 \
     "$candidate" 2>/dev/null)" || return 1
   if [[ -z "$duration" || "$duration" == "N/A" ]]; then
-    duration="$("$FFPROBE_PATH" -v error -show_entries format=duration \
-      -of default=noprint_wrappers=1:nokey=1 "$candidate" 2>/dev/null)" || return 1
+    duration="$("$FFPROBE_PATH" -v error -select_streams v:0 \
+      -show_entries stream=duration -of default=noprint_wrappers=1:nokey=1 \
+      "$candidate" 2>/dev/null)" || return 1
   fi
   [[ "$duration" =~ ^[0-9]+([.][0-9]+)?$ ]] || return 1
   echo "$duration"
@@ -126,7 +176,7 @@ video_duration_matches() {
   local candidate_duration
   candidate_duration="$(video_duration "$candidate")" || return 1
   /usr/bin/awk -v expected="$expected" -v candidate="$candidate_duration" \
-    'BEGIN { delta = expected - candidate; if (delta < 0) delta = -delta; exit !(delta <= 0.01) }'
+    'BEGIN { delta = expected - candidate; if (delta < 0) delta = -delta; exit !(delta <= 0.05) }'
 }
 
 completed_eye_output() {
@@ -155,6 +205,7 @@ if [[ ! -f "$SOURCE_DONE" ]]; then
     -vf "crop=${EYE_WIDTH}:${SOURCE_HEIGHT}:${CROP_X}:0,fps=30" \
     -an \
     -c:v hevc_videotoolbox \
+    "${ENCODER_SPEED_ARGS[@]}" \
     -pix_fmt yuv420p \
     -b:v "$EYE_BITRATE" \
     -maxrate "$((EYE_BITRATE * 3 / 2))" \
@@ -181,6 +232,59 @@ SOURCE_SEGMENTS=("$SOURCE_DIR"/"$EYE"-*.mov)
 
 echo "Stage 2/3: restoring ${#SOURCE_SEGMENTS[@]} $EYE-eye segment(s)"
 RESTORED_SEGMENTS=()
+SPARSE_BATCH_ARGS=()
+if [[ "$SPARSE_MOSAIC" == "1" && "$SPARSE_BATCH_MODE" != "finalize" ]]; then
+  for SOURCE_SEGMENT in "${SOURCE_SEGMENTS[@]}"; do
+    SEGMENT_NAME="$(basename "$SOURCE_SEGMENT")"
+    SEGMENT_STEM="${SEGMENT_NAME%.*}"
+    RESTORED_SEGMENT="$RESTORED_DIR/${SEGMENT_STEM}-restored.mov"
+    SEGMENT_DONE="$RESTORED_DIR/${SEGMENT_STEM}.done"
+    SEGMENT_CACHE="$CACHE_DIR/$SEGMENT_STEM.jasna-work"
+    SEGMENT_WINDOWS="$RESTORED_DIR/${SEGMENT_STEM}.windows"
+    MOSAIC_MANIFEST="$RESTORED_DIR/${SEGMENT_STEM}-mosaic-regions.json"
+    SEGMENT_DURATION="$(video_duration "$SOURCE_SEGMENT")"
+
+    if [[ ! -f "$SEGMENT_DONE" ]] && video_duration_matches "$RESTORED_SEGMENT" "$SEGMENT_DURATION"; then
+      echo "Recovered completed marker for $SEGMENT_NAME"
+      /usr/bin/touch "$SEGMENT_DONE"
+    fi
+    if [[ ! -f "$SEGMENT_DONE" ]]; then
+      mkdir -p "$SEGMENT_CACHE" "$SEGMENT_WINDOWS"
+      if [[ ! -s "$MOSAIC_MANIFEST" ]]; then
+        "$ROOT_DIR/script/scan_mosaic_regions.sh" "$SOURCE_SEGMENT" "$MOSAIC_MANIFEST"
+      else
+        echo "Reusing mosaic-region manifest: $MOSAIC_MANIFEST"
+      fi
+      SPARSE_BATCH_ARGS+=(
+        "$SOURCE_SEGMENT" "$SEGMENT_WINDOWS" "$MOSAIC_MANIFEST" "$SEGMENT_CACHE"
+      )
+    fi
+  done
+  if [[ "$SPARSE_BATCH_MODE" == "prepare" ]]; then
+    for ((ARG_INDEX = 0; ARG_INDEX < ${#SPARSE_BATCH_ARGS[@]}; ARG_INDEX += 4)); do
+      for ((FIELD_INDEX = ARG_INDEX; FIELD_INDEX < ARG_INDEX + 4; FIELD_INDEX++)); do
+        [[ "${SPARSE_BATCH_ARGS[$FIELD_INDEX]}" != *$'\t'* \
+          && "${SPARSE_BATCH_ARGS[$FIELD_INDEX]}" != *$'\n'* ]] || {
+          echo "error: restoration paths cannot contain tabs or newlines" >&2
+          exit 1
+        }
+      done
+      printf '%s\t%s\t%s\t%s\n' \
+        "${SPARSE_BATCH_ARGS[$ARG_INDEX]}" \
+        "${SPARSE_BATCH_ARGS[$((ARG_INDEX + 1))]}" \
+        "${SPARSE_BATCH_ARGS[$((ARG_INDEX + 2))]}" \
+        "${SPARSE_BATCH_ARGS[$((ARG_INDEX + 3))]}" \
+        >> "$SPARSE_BATCH_FILE"
+    done
+    echo "Prepared $((${#SPARSE_BATCH_ARGS[@]} / 4)) pending segment(s) for shared restoration"
+    exit 0
+  elif (( ${#SPARSE_BATCH_ARGS[@]} > 0 )); then
+    echo "Restoring $((${#SPARSE_BATCH_ARGS[@]} / 4)) pending segment(s) with one retained Metal ML graph"
+    "$ROOT_DIR/script/build_and_run.sh" --restore-eye-windows-sparse-batch \
+      "${SPARSE_BATCH_ARGS[@]}"
+  fi
+fi
+
 for SOURCE_SEGMENT in "${SOURCE_SEGMENTS[@]}"; do
   SEGMENT_NAME="$(basename "$SOURCE_SEGMENT")"
   SEGMENT_STEM="${SEGMENT_NAME%.*}"
@@ -189,6 +293,7 @@ for SOURCE_SEGMENT in "${SOURCE_SEGMENTS[@]}"; do
   SEGMENT_CACHE="$CACHE_DIR/$SEGMENT_STEM.jasna-work"
   SEGMENT_WINDOWS="$RESTORED_DIR/${SEGMENT_STEM}.windows"
   SEGMENT_MANIFEST="$RESTORED_DIR/${SEGMENT_STEM}-windows.txt"
+  MOSAIC_MANIFEST="$RESTORED_DIR/${SEGMENT_STEM}-mosaic-regions.json"
   TEMP_RESTORED_SEGMENT="$RESTORED_DIR/.${SEGMENT_STEM}-joining.mov"
   SEGMENT_DURATION="$(video_duration "$SOURCE_SEGMENT")"
 
@@ -200,9 +305,13 @@ for SOURCE_SEGMENT in "${SOURCE_SEGMENTS[@]}"; do
   if [[ ! -f "$SEGMENT_DONE" ]]; then
     echo "Restoring $SEGMENT_NAME (${SEGMENT_DURATION}s)"
     mkdir -p "$SEGMENT_CACHE" "$SEGMENT_WINDOWS"
-    JASNA_WORK_DIR="$SEGMENT_CACHE" \
-      "$ROOT_DIR/script/build_and_run.sh" --restore-eye-windows \
-        "$SOURCE_SEGMENT" "$SEGMENT_WINDOWS"
+    if [[ "$SPARSE_MOSAIC" == "1" ]]; then
+      echo "Using sparse windows completed by the retained-graph batch"
+    else
+      JASNA_WORK_DIR="$SEGMENT_CACHE" \
+        "$ROOT_DIR/script/build_and_run.sh" --restore-eye-windows \
+          "$SOURCE_SEGMENT" "$SEGMENT_WINDOWS"
+    fi
 
     WINDOW_OUTPUTS=("$SEGMENT_WINDOWS"/window-[0-9][0-9][0-9][0-9][0-9].mov)
     [[ -e "${WINDOW_OUTPUTS[0]}" ]] || {
@@ -245,7 +354,7 @@ for SOURCE_SEGMENT in "${SOURCE_SEGMENTS[@]}"; do
   RESTORED_SEGMENTS+=("$RESTORED_SEGMENT")
 done
 
-if completed_eye_output "$OUTPUT_PATH"; then
+if [[ -f "$OUTPUT_DONE" ]] && completed_eye_output "$OUTPUT_PATH"; then
   echo "Stage 3/3: joined $EYE-eye output already complete"
   echo "Segmented $EYE-eye restoration: PASS"
   echo "Output: $OUTPUT_PATH"
@@ -288,6 +397,7 @@ if [[ -e "$OUTPUT_PATH" ]]; then
   echo "Archived previous output: $OUTPUT_ARCHIVE"
 fi
 mv "$TEMP_OUTPUT" "$OUTPUT_PATH"
+/usr/bin/touch "$OUTPUT_DONE"
 
 FINAL_INFO="$("$FFPROBE_PATH" \
   -v error \

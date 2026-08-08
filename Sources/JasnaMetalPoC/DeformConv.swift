@@ -46,7 +46,13 @@ enum DeformConvError: Error, CustomStringConvertible {
     case invalidArrayCount(name: String, expected: Int, actual: Int)
     case metalUnavailable
     case shaderResourceMissing
+    case nonFiniteOutput(String)
     case commandFailed(String)
+
+    var isRecoverableNumericalFailure: Bool {
+        if case .nonFiniteOutput = self { return true }
+        return false
+    }
 
     var description: String {
         switch self {
@@ -58,6 +64,8 @@ enum DeformConvError: Error, CustomStringConvertible {
             return "No Metal device is available"
         case .shaderResourceMissing:
             return "The deform_conv.metal resource is missing"
+        case let .nonFiniteOutput(message):
+            return "Metal model produced non-finite output: \(message)"
         case let .commandFailed(message):
             return "Metal command failed: \(message)"
         }
