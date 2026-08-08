@@ -344,119 +344,180 @@ enum SideBySideRestoration {
             sourceDimensions: inputInfo.dimensions,
             cropX: 0
         )
+        let encoderWindowsPerSegment = min(
+            windowFrameCounts.count,
+            max(
+                1,
+                Int(
+                    ProcessInfo.processInfo.environment[
+                        "JASNA_ENCODER_WINDOWS_PER_SEGMENT"
+                    ] ?? ""
+                ) ?? 5
+            )
+        )
+        report(
+            "HEVC encoder segment: up to \(encoderWindowsPerSegment) recurrence window(s)"
+        )
         var completedWindows = 0
         var restoredRegionWindows = 0
         var skippedTileWindows = 0
-        for (windowIndex, outputCount) in windowFrameCounts.enumerated() {
-            let windowStart = windowIndex * SideBySideVideoPlan.temporalWindowFrames
-            let frameRange = windowStart..<(windowStart + outputCount)
-            let activeRegions = manifest.regions(intersecting: frameRange)
+        var windowIndex = 0
+        while windowIndex < windowFrameCounts.count {
             let outputURL = windowsDirectoryURL.appendingPathComponent(
                 String(format: "window-%05d.mov", windowIndex + 1)
             )
+            let segmentEnd = encoderSegmentEnd(
+                windowIndex: windowIndex,
+                windowCount: windowFrameCounts.count,
+                maximumWindows: encoderWindowsPerSegment
+            ) { candidate in
+                let candidateURL = windowsDirectoryURL.appendingPathComponent(
+                    String(format: "window-%05d.mov", candidate + 1)
+                )
+                return FileManager.default.fileExists(atPath: candidateURL.path)
+            }
+            let segmentFrameCount = windowFrameCounts[windowIndex..<segmentEnd].reduce(0, +)
             if await validWindowOutput(
                 outputURL,
                 dimensions: plan.dimensions,
-                frameCount: outputCount
+                frameCount: segmentFrameCount
             ) {
                 report(
+                    "Windows \(windowIndex + 1)-\(segmentEnd)/\(windowFrameCounts.count): "
+                        + "encoded segment already complete"
+                )
+                completedWindows += segmentEnd - windowIndex
+                windowIndex = segmentEnd
+                continue
+            }
+            if segmentEnd > windowIndex + 1,
+               await validWindowOutput(
+                   outputURL,
+                   dimensions: plan.dimensions,
+                   frameCount: windowFrameCounts[windowIndex]
+               )
+            {
+                report(
                     "Window \(windowIndex + 1)/\(windowFrameCounts.count): "
-                        + "encoded output already complete"
+                        + "legacy one-window output already complete"
                 )
                 completedWindows += 1
+                windowIndex += 1
                 continue
             }
             if FileManager.default.fileExists(atPath: outputURL.path) {
                 let archived = try archiveInterruptedOutput(outputURL)
                 report(
-                    "Window \(windowIndex + 1)/\(windowFrameCounts.count): "
+                    "Windows \(windowIndex + 1)-\(segmentEnd)/\(windowFrameCounts.count): "
                         + "archived incomplete output at \(archived.path)"
                 )
             }
 
-            report(
-                "Window \(windowIndex + 1)/\(windowFrameCounts.count): decoding "
-                    + "\(outputCount) frames; mosaic regions \(activeRegions.count), "
-                    + "model crops \(activeRegions.count)"
-            )
-            let baseFrames = try (0..<outputCount).map {
-                try decoder.copyFrame(outputIndex: windowStart + $0)
-            }
-            let attachments = baseFrames.map { CVBufferCopyAttachments($0, .shouldPropagate) }
-            var modelFrames = baseFrames
-            while modelFrames.count < 3 {
-                guard let last = modelFrames.last else { throw DeformConvError.invalidShape }
-                modelFrames.append(last)
-            }
-            let cacheVariant = sparseRegionCacheVariant(
-                regions: activeRegions, projection: projection
-            )
-            let samplingMaps = activeRegions.map {
-                MosaicCropSamplingMap(
-                    region: $0,
-                    eyeWidth: plan.dimensions.width,
-                    eyeHeight: plan.dimensions.height,
-                    projection: projection
-                )
-            }
-            let window = try processRegionWindow(
-                device: device,
-                plan: plan,
-                regions: activeRegions,
-                decodedFrames: modelFrames,
-                outputCount: outputCount,
-                windowIndex: windowIndex,
-                windowCount: windowFrameCounts.count,
-                modelsURL: modelsURL,
-                weightsURL: weightsURL,
-                cacheVariant: cacheVariant,
-                projection: projection,
-                samplingMaps: samplingMaps,
-                workDirectoryURL: workDirectoryURL
-            )
             let writer = try RestoredFrameWriter(device: device, outputURL: outputURL, plan: plan)
-            let compositeStarted = ContinuousClock.now
-            try await writer.appendRegionCachedFrames(
-                cacheURLs: window.cacheURLs,
-                attachments: attachments,
-                startFrame: 0,
-                progressStartFrame: windowStart,
-                progressFrameCount: manifest.frameCount,
-                plan: plan,
-                baseFrames: baseFrames,
-                regions: activeRegions,
-                projection: projection,
-                samplingMaps: samplingMaps
-            )
-            let compositeMilliseconds = elapsedMilliseconds(since: compositeStarted)
+            var segmentCacheDirectories = [URL]()
+            var segmentOutputFrame = 0
+            for currentWindowIndex in windowIndex..<segmentEnd {
+                let outputCount = windowFrameCounts[currentWindowIndex]
+                let windowStart = currentWindowIndex * SideBySideVideoPlan.temporalWindowFrames
+                let frameRange = windowStart..<(windowStart + outputCount)
+                let activeRegions = manifest.regions(intersecting: frameRange)
+                report(
+                    "Window \(currentWindowIndex + 1)/\(windowFrameCounts.count): decoding "
+                        + "\(outputCount) frames; mosaic regions \(activeRegions.count), "
+                        + "model crops \(activeRegions.count)"
+                )
+                let baseFrames = try (0..<outputCount).map {
+                    try decoder.copyFrame(outputIndex: windowStart + $0)
+                }
+                let attachments = baseFrames.map {
+                    CVBufferCopyAttachments($0, .shouldPropagate)
+                }
+                var modelFrames = baseFrames
+                while modelFrames.count < 3 {
+                    guard let last = modelFrames.last else {
+                        throw DeformConvError.invalidShape
+                    }
+                    modelFrames.append(last)
+                }
+                let cacheVariant = sparseRegionCacheVariant(
+                    regions: activeRegions, projection: projection
+                )
+                let samplingMaps = activeRegions.map {
+                    MosaicCropSamplingMap(
+                        region: $0,
+                        eyeWidth: plan.dimensions.width,
+                        eyeHeight: plan.dimensions.height,
+                        projection: projection
+                    )
+                }
+                let window = try processRegionWindow(
+                    device: device,
+                    plan: plan,
+                    regions: activeRegions,
+                    decodedFrames: modelFrames,
+                    outputCount: outputCount,
+                    windowIndex: currentWindowIndex,
+                    windowCount: windowFrameCounts.count,
+                    modelsURL: modelsURL,
+                    weightsURL: weightsURL,
+                    cacheVariant: cacheVariant,
+                    projection: projection,
+                    samplingMaps: samplingMaps,
+                    workDirectoryURL: workDirectoryURL
+                )
+                segmentCacheDirectories.append(window.cacheDirectory)
+                let compositeStarted = ContinuousClock.now
+                try await writer.appendRegionCachedFrames(
+                    cacheURLs: window.cacheURLs,
+                    attachments: attachments,
+                    startFrame: segmentOutputFrame,
+                    progressStartFrame: windowStart,
+                    progressFrameCount: manifest.frameCount,
+                    plan: plan,
+                    baseFrames: baseFrames,
+                    regions: activeRegions,
+                    projection: projection,
+                    samplingMaps: samplingMaps
+                )
+                let compositeMilliseconds = elapsedMilliseconds(since: compositeStarted)
+                report(
+                    "Window \(currentWindowIndex + 1)/\(windowFrameCounts.count): "
+                        + "compositor/writer "
+                        + "\(String(format: "%.3f", compositeMilliseconds)) ms"
+                )
+                segmentOutputFrame += outputCount
+                if activeRegions.isEmpty {
+                    skippedTileWindows += 1
+                } else {
+                    restoredRegionWindows += activeRegions.count
+                }
+            }
             let finishStarted = ContinuousClock.now
             try await writer.finish()
             let finishMilliseconds = elapsedMilliseconds(since: finishStarted)
             report(
-                "Window \(windowIndex + 1)/\(windowFrameCounts.count): compositor/writer "
-                    + "\(String(format: "%.3f", compositeMilliseconds)) ms, encoder finish "
+                "Windows \(windowIndex + 1)-\(segmentEnd)/\(windowFrameCounts.count): "
+                    + "encoder finish "
                     + "\(String(format: "%.3f", finishMilliseconds)) ms"
             )
             guard await validWindowOutput(
                 outputURL,
                 dimensions: plan.dimensions,
-                frameCount: outputCount
+                frameCount: segmentFrameCount
             ) else {
                 throw DeformConvError.commandFailed(
-                    "encoded sparse window \(windowIndex + 1) failed validation"
+                    "encoded sparse segment \(windowIndex + 1)-\(segmentEnd) failed validation"
                 )
             }
-            try FileManager.default.removeItem(at: window.cacheDirectory)
-            if activeRegions.isEmpty {
-                skippedTileWindows += 1
-            } else {
-                restoredRegionWindows += activeRegions.count
+            for cacheDirectory in segmentCacheDirectories {
+                try FileManager.default.removeItem(at: cacheDirectory)
             }
-            completedWindows += 1
+            completedWindows += segmentEnd - windowIndex
             report(
-                "Window \(windowIndex + 1)/\(windowFrameCounts.count): "
-                    + "sparse output encoded, validated, and cache removed"
+                "Windows \(windowIndex + 1)-\(segmentEnd)/\(windowFrameCounts.count): "
+                    + "sparse segment encoded, validated, and caches removed"
             )
+            windowIndex = segmentEnd
         }
         report(
             "Sparse restoration completed: \(completedWindows) windows, "
@@ -464,6 +525,17 @@ enum SideBySideRestoration {
                 + "\(skippedTileWindows) clean windows bypassed"
         )
         return completedWindows
+    }
+
+    static func encoderSegmentEnd(
+        windowIndex: Int,
+        windowCount: Int,
+        maximumWindows: Int,
+        hasExistingOutput: (Int) -> Bool
+    ) -> Int {
+        let preferredEnd = min(windowCount, windowIndex + max(1, maximumWindows))
+        return ((windowIndex + 1)..<preferredEnd).first(where: hasExistingOutput)
+            ?? preferredEnd
     }
 
     private static func validWindowOutput(

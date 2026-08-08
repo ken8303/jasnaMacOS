@@ -4,7 +4,8 @@ set -euo pipefail
 usage() {
   echo "usage: $0 INPUT_SBS_VIDEO OUTPUT_SBS_VIDEO [START_TIME]" >&2
   echo "example: $0 input.mp4 restored-test.mov 00:12:00" >&2
-  echo "optional: JASNA_TEST_SECONDS=30 JASNA_EYE_BITRATE=20000000 JASNA_VR_BITRATE=40000000" >&2
+  echo "optional: JASNA_TEST_SECONDS=30 JASNA_ENCODER_WINDOWS_PER_SEGMENT=5" >&2
+  echo "          JASNA_EYE_BITRATE=20000000 JASNA_VR_BITRATE=40000000" >&2
   exit 2
 }
 

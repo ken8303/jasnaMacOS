@@ -70,3 +70,31 @@ import Testing
         ) == [0..<5]
     )
 }
+
+@available(macOS 27.0, *)
+@Test func encoderSegmentsStopBeforeExistingLegacyOutputs() {
+    #expect(
+        SideBySideRestoration.encoderSegmentEnd(
+            windowIndex: 0,
+            windowCount: 30,
+            maximumWindows: 5,
+            hasExistingOutput: { _ in false }
+        ) == 5
+    )
+    #expect(
+        SideBySideRestoration.encoderSegmentEnd(
+            windowIndex: 5,
+            windowCount: 30,
+            maximumWindows: 5,
+            hasExistingOutput: { $0 == 8 }
+        ) == 8
+    )
+    #expect(
+        SideBySideRestoration.encoderSegmentEnd(
+            windowIndex: 28,
+            windowCount: 30,
+            maximumWindows: 5,
+            hasExistingOutput: { _ in false }
+        ) == 30
+    )
+}

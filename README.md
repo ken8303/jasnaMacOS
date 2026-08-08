@@ -209,6 +209,16 @@ submission, and encoder finish. These end-to-end phases determine whether the
 next optimization should pipeline CPU preparation, reduce cache traffic, or
 remain focused on the Metal graph without changing restoration quality.
 
+Sparse output keeps the one-second recurrence boundaries but, by default, feeds
+five consecutive windows to one HEVC writer. This reduces hardware-encoder
+startup and drain work while preserving restartability: model caches remain
+per-window, and an interruption rebuilds at most the current five-second output
+segment. Existing one-window outputs are detected and reused. Set
+`JASNA_ENCODER_WINDOWS_PER_SEGMENT=1` for the previous behavior or choose a
+different positive segment size. A three-window 4096×4096 fixture reduced
+encoder-finish time from 1.431 seconds to 0.497 seconds and produced one
+validated 90-frame, 30 fps segment.
+
 Metal ML crop execution is serialized. The first 30-frame crop builds the
 retained graph and every later crop reuses it; attempting to construct two
 first-use graphs concurrently proved unstable in the macOS 27 beta runtime.
