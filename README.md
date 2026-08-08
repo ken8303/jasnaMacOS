@@ -304,6 +304,12 @@ interval without an unnecessary 8K re-encode. VideoToolbox
 speed-priority mode is enabled by default; set `JASNA_FAST_ENCODE=0` to compare
 its output with the slower quality-priority encoder. Set
 `JASNA_FAST_SOURCE_COPY=0` to force regeneration of the 30 fps test source.
+Paired eye segments now restore directly into one 8192×4096 HEVC stream. The
+Metal compositor assembles both eye surfaces and applies their fisheye deltas in
+place, so the final join copies video packets and audio instead of encoding two
+eye movies and then encoding their SBS stack again. Each direct SBS segment is
+still independently restartable and remains in the persistent work directory.
+Set `JASNA_DIRECT_SBS_OUTPUT=0` to compare with the legacy three-encode path.
 Sparse mosaic scans decode HEVC sequentially and infer two sampled frames at a
 time. Set `JASNA_DETECT_BATCH_SIZE=1` to minimize memory, or
 `JASNA_DETECT_DECODE_MODE=seek` to compare with the former random-seek path.

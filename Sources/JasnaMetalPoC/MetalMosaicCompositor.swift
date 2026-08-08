@@ -102,6 +102,28 @@ final class MetalMosaicCompositor: @unchecked Sendable {
         )
     }
 
+    func compositeInPlace(
+        pixelBuffer: CVPixelBuffer,
+        dimensions: VideoDimensions,
+        inputs: [MetalMosaicCompositeInput]
+    ) throws {
+        guard prefersTextureSurfaces,
+              CVPixelBufferGetPixelFormatType(pixelBuffer) == kCVPixelFormatType_32BGRA,
+              CVPixelBufferGetWidth(pixelBuffer) == dimensions.width,
+              CVPixelBufferGetHeight(pixelBuffer) == dimensions.height,
+              try compositeUsingTextures(
+                  basePixelBuffer: nil,
+                  outputPixelBuffer: pixelBuffer,
+                  dimensions: dimensions,
+                  inputs: inputs
+              )
+        else {
+            throw DeformConvError.commandFailed(
+                "in-place mosaic compositing requires a Metal texture surface"
+            )
+        }
+    }
+
     private func compositeUsingBufferCopies(
         basePixelBuffer: CVPixelBuffer,
         outputPixelBuffer: CVPixelBuffer,
@@ -194,32 +216,35 @@ final class MetalMosaicCompositor: @unchecked Sendable {
     }
 
     private func compositeUsingTextures(
-        basePixelBuffer: CVPixelBuffer,
+        basePixelBuffer: CVPixelBuffer?,
         outputPixelBuffer: CVPixelBuffer,
         dimensions: VideoDimensions,
         inputs: [MetalMosaicCompositeInput]
     ) throws -> Bool {
-        guard let source = makeTexture(
-                  pixelBuffer: basePixelBuffer, dimensions: dimensions
-              ),
+        let source = basePixelBuffer.flatMap {
+            makeTexture(pixelBuffer: $0, dimensions: dimensions)
+        }
+        guard (basePixelBuffer == nil || source != nil),
               let destination = makeTexture(
                   pixelBuffer: outputPixelBuffer, dimensions: dimensions
               ),
-              let commandBuffer = queue.makeCommandBuffer(),
-              let blitEncoder = commandBuffer.makeBlitCommandEncoder()
+              let commandBuffer = queue.makeCommandBuffer()
         else { return false }
-        blitEncoder.copy(
-            from: source.texture,
-            sourceSlice: 0,
-            sourceLevel: 0,
-            sourceOrigin: .init(x: 0, y: 0, z: 0),
-            sourceSize: .init(width: dimensions.width, height: dimensions.height, depth: 1),
-            to: destination.texture,
-            destinationSlice: 0,
-            destinationLevel: 0,
-            destinationOrigin: .init(x: 0, y: 0, z: 0)
-        )
-        blitEncoder.endEncoding()
+        if let source {
+            guard let blitEncoder = commandBuffer.makeBlitCommandEncoder() else { return false }
+            blitEncoder.copy(
+                from: source.texture,
+                sourceSlice: 0,
+                sourceLevel: 0,
+                sourceOrigin: .init(x: 0, y: 0, z: 0),
+                sourceSize: .init(width: dimensions.width, height: dimensions.height, depth: 1),
+                to: destination.texture,
+                destinationSlice: 0,
+                destinationLevel: 0,
+                destinationOrigin: .init(x: 0, y: 0, z: 0)
+            )
+            blitEncoder.endEncoding()
+        }
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return false }
         encoder.setComputePipelineState(texturePipeline)
         encoder.setTexture(destination.texture, index: 0)
@@ -270,7 +295,7 @@ final class MetalMosaicCompositor: @unchecked Sendable {
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
         if let error = commandBuffer.error { throw error }
-        withExtendedLifetime((source.reference, destination.reference, heldBuffers)) {}
+        withExtendedLifetime((source?.reference, destination.reference, heldBuffers)) {}
         return true
     }
 

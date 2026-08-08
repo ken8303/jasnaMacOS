@@ -582,6 +582,59 @@ func runJasnaCLI() async throws {
         print("VR projection: \(projection.rawValue)")
         print("Completed jobs: \(jobCount)")
     }
+    try await commandLine.dispatch(.restoreStereoSparseBatch) { batchIndex in
+        let values = Array(commandLine.arguments[(batchIndex + 1)...])
+        guard values.count >= 10, (values.count - 3).isMultiple(of: 7) else {
+            throw DeformConvError.commandFailed(
+                "--restore-stereo-sparse-batch requires groups of left input, right input, "
+                    + "output, left manifest, right manifest, left work directory, and "
+                    + "right work directory, followed by MetalML, DeformConv, and projection"
+            )
+        }
+        guard #available(macOS 27.0, *) else {
+            throw DeformConvError.commandFailed("direct sparse SBS restoration requires macOS 27")
+        }
+        let fixedArgumentStart = values.count - 3
+        let modelsURL = URL(fileURLWithPath: values[fixedArgumentStart])
+        let weightsURL = URL(fileURLWithPath: values[fixedArgumentStart + 1])
+        guard let projection = VRMosaicProjection(rawValue: values[fixedArgumentStart + 2]) else {
+            throw DeformConvError.commandFailed(
+                "unknown sparse VR projection '\(values[fixedArgumentStart + 2])'; "
+                    + "use raw or fisheye"
+            )
+        }
+        let jobCount = fixedArgumentStart / 7
+        for jobIndex in 0..<jobCount {
+            let offset = jobIndex * 7
+            print(
+                "Direct SBS batch job \(jobIndex + 1)/\(jobCount): "
+                    + "\(values[offset]) + \(values[offset + 1])"
+            )
+            let count = try await SideBySideRestoration.restoreSparseStereoEyeSegment(
+                device: runner.device,
+                leftInputURL: URL(fileURLWithPath: values[offset]),
+                rightInputURL: URL(fileURLWithPath: values[offset + 1]),
+                outputURL: URL(fileURLWithPath: values[offset + 2]),
+                leftManifestURL: URL(fileURLWithPath: values[offset + 3]),
+                rightManifestURL: URL(fileURLWithPath: values[offset + 4]),
+                modelsURL: modelsURL,
+                weightsURL: weightsURL,
+                projection: projection,
+                leftWorkDirectoryURL: URL(
+                    fileURLWithPath: values[offset + 5], isDirectory: true
+                ),
+                rightWorkDirectoryURL: URL(
+                    fileURLWithPath: values[offset + 6], isDirectory: true
+                )
+            )
+            print(
+                "Direct SBS batch job \(jobIndex + 1)/\(jobCount): PASS, "
+                    + "\(count) windows"
+            )
+        }
+        print("Direct sparse SBS batch: PASS")
+        print("Completed jobs: \(jobCount)")
+    }
     try await commandLine.dispatch(.restoreEyeWindowsSparse) { sparseWindowsIndex in
         guard commandLine.arguments.indices.contains(sparseWindowsIndex + 5) else {
             throw DeformConvError.commandFailed(

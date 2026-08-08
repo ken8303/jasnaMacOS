@@ -315,6 +315,203 @@ extension SideBySideRestoration {
         return completedWindows
     }
 
+    static func restoreSparseStereoEyeSegment(
+        device: MTLDevice,
+        leftInputURL: URL,
+        rightInputURL: URL,
+        outputURL: URL,
+        leftManifestURL: URL,
+        rightManifestURL: URL,
+        modelsURL: URL,
+        weightsURL: URL,
+        projection: VRMosaicProjection,
+        leftWorkDirectoryURL: URL,
+        rightWorkDirectoryURL: URL
+    ) async throws -> Int {
+        let leftInfo = try await SideBySideVideoIO.inspect(url: leftInputURL)
+        let rightInfo = try await SideBySideVideoIO.inspect(url: rightInputURL)
+        guard leftInfo.dimensions == rightInfo.dimensions,
+              abs(leftInfo.nominalFramesPerSecond - rightInfo.nominalFramesPerSecond) < 0.01,
+              abs(leftInfo.durationSeconds - rightInfo.durationSeconds) < 0.01
+        else {
+            throw DeformConvError.commandFailed(
+                "direct SBS left/right source segments do not match"
+            )
+        }
+        let eyePlan = try SideBySideVideoPlan(
+            width: leftInfo.dimensions.width,
+            height: leftInfo.dimensions.height,
+            sourceFramesPerSecond: leftInfo.nominalFramesPerSecond,
+            durationSeconds: leftInfo.durationSeconds,
+            eyeLayout: .singleEye
+        )
+        let stereoPlan = try SideBySideVideoPlan(
+            width: leftInfo.dimensions.width * 2,
+            height: leftInfo.dimensions.height,
+            sourceFramesPerSecond: leftInfo.nominalFramesPerSecond,
+            durationSeconds: leftInfo.durationSeconds
+        )
+        let leftManifest = try MosaicRegionManifest.load(from: leftManifestURL)
+        let rightManifest = try MosaicRegionManifest.load(from: rightManifestURL)
+        try leftManifest.validate(for: eyePlan)
+        try rightManifest.validate(for: eyePlan)
+        guard leftManifest.frameCount == rightManifest.frameCount else {
+            throw DeformConvError.commandFailed(
+                "direct SBS left/right manifests have different frame counts"
+            )
+        }
+        let windowCount = (leftManifest.frameCount
+            + SideBySideVideoPlan.temporalWindowFrames - 1)
+            / SideBySideVideoPlan.temporalWindowFrames
+        if await validWindowOutput(
+            outputURL,
+            dimensions: stereoPlan.dimensions,
+            frameCount: leftManifest.frameCount
+        ) {
+            report("Direct SBS segment already complete: \(outputURL.path)")
+            return windowCount
+        }
+        if FileManager.default.fileExists(atPath: outputURL.path) {
+            let archived = try archiveInterruptedOutput(outputURL)
+            report("Archived interrupted direct SBS segment at \(archived.path)")
+        }
+        try FileManager.default.createDirectory(
+            at: outputURL.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        let leftDecoder = try await FrameDecoder(
+            inputURL: leftInputURL,
+            plan: eyePlan,
+            sourceDimensions: leftInfo.dimensions
+        )
+        let rightDecoder = try await FrameDecoder(
+            inputURL: rightInputURL,
+            plan: eyePlan,
+            sourceDimensions: rightInfo.dimensions
+        )
+        let writer = try RestoredFrameWriter(
+            device: device, outputURL: outputURL, plan: stereoPlan
+        )
+        var completedCacheDirectories = [URL]()
+        report(
+            "Direct SBS segment: \(stereoPlan.dimensions.width)×"
+                + "\(stereoPlan.dimensions.height), \(leftManifest.frameCount) frames, "
+                + "\(windowCount) windows"
+        )
+        for windowIndex in 0..<windowCount {
+            let windowStart = windowIndex * SideBySideVideoPlan.temporalWindowFrames
+            let outputCount = min(
+                SideBySideVideoPlan.temporalWindowFrames,
+                leftManifest.frameCount - windowStart
+            )
+            let frameRange = windowStart..<(windowStart + outputCount)
+            let leftRegions = leftManifest.regions(intersecting: frameRange)
+            let rightRegions = rightManifest.regions(intersecting: frameRange)
+            report(
+                "Direct SBS window \(windowIndex + 1)/\(windowCount): "
+                    + "decoding \(outputCount) frames; left/right crops "
+                    + "\(leftRegions.count)/\(rightRegions.count)"
+            )
+            var leftFrames = try (0..<outputCount).map {
+                try leftDecoder.copyFrame(outputIndex: windowStart + $0)
+            }
+            var rightFrames = try (0..<outputCount).map {
+                try rightDecoder.copyFrame(outputIndex: windowStart + $0)
+            }
+            let leftOutputFrames = leftFrames
+            let rightOutputFrames = rightFrames
+            while leftFrames.count < 3 {
+                guard let last = leftFrames.last else { throw DeformConvError.invalidShape }
+                leftFrames.append(last)
+            }
+            while rightFrames.count < 3 {
+                guard let last = rightFrames.last else { throw DeformConvError.invalidShape }
+                rightFrames.append(last)
+            }
+            let leftSamplingMaps = leftRegions.map {
+                MosaicCropSamplingMap(
+                    region: $0,
+                    eyeWidth: eyePlan.dimensions.width,
+                    eyeHeight: eyePlan.dimensions.height,
+                    projection: projection
+                )
+            }
+            let rightSamplingMaps = rightRegions.map {
+                MosaicCropSamplingMap(
+                    region: $0,
+                    eyeWidth: eyePlan.dimensions.width,
+                    eyeHeight: eyePlan.dimensions.height,
+                    projection: projection
+                )
+            }
+            let leftWindow = try processRegionWindow(
+                device: device,
+                plan: eyePlan,
+                regions: leftRegions,
+                decodedFrames: leftFrames,
+                outputCount: outputCount,
+                windowIndex: windowIndex,
+                windowCount: windowCount,
+                modelsURL: modelsURL,
+                weightsURL: weightsURL,
+                cacheVariant: sparseRegionCacheVariant(
+                    regions: leftRegions, projection: projection
+                ),
+                projection: projection,
+                samplingMaps: leftSamplingMaps,
+                workDirectoryURL: leftWorkDirectoryURL
+            )
+            let rightWindow = try processRegionWindow(
+                device: device,
+                plan: eyePlan,
+                regions: rightRegions,
+                decodedFrames: rightFrames,
+                outputCount: outputCount,
+                windowIndex: windowIndex,
+                windowCount: windowCount,
+                modelsURL: modelsURL,
+                weightsURL: weightsURL,
+                cacheVariant: sparseRegionCacheVariant(
+                    regions: rightRegions, projection: projection
+                ),
+                projection: projection,
+                samplingMaps: rightSamplingMaps,
+                workDirectoryURL: rightWorkDirectoryURL
+            )
+            completedCacheDirectories += [
+                leftWindow.cacheDirectory, rightWindow.cacheDirectory,
+            ]
+            try await writer.appendStereoRegionCachedFrames(
+                leftCacheURLs: leftWindow.cacheURLs,
+                rightCacheURLs: rightWindow.cacheURLs,
+                leftBaseFrames: leftOutputFrames,
+                rightBaseFrames: rightOutputFrames,
+                leftRegions: leftRegions,
+                rightRegions: rightRegions,
+                leftSamplingMaps: leftSamplingMaps,
+                rightSamplingMaps: rightSamplingMaps,
+                startFrame: windowStart,
+                progressStartFrame: windowStart,
+                plan: stereoPlan,
+                projection: projection
+            )
+        }
+        try await writer.finish()
+        guard await validWindowOutput(
+            outputURL,
+            dimensions: stereoPlan.dimensions,
+            frameCount: leftManifest.frameCount
+        ) else {
+            throw DeformConvError.commandFailed("direct SBS segment failed validation")
+        }
+        for directory in completedCacheDirectories {
+            try FileManager.default.removeItem(at: directory)
+        }
+        report(
+            "Direct SBS segment encoded and validated: \(outputURL.path)"
+        )
+        return windowCount
+    }
+
     private static func processRegionWindow(
         device: MTLDevice,
         plan: SideBySideVideoPlan,

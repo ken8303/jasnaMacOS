@@ -7,6 +7,7 @@ usage() {
   echo "optional: JASNA_TEST_SECONDS=30 (maximum 300)" >&2
   echo "          JASNA_ENCODER_WINDOWS_PER_SEGMENT=120" >&2
   echo "          JASNA_EYE_BITRATE=20000000 JASNA_VR_BITRATE=40000000" >&2
+  echo "          JASNA_DIRECT_SBS_OUTPUT=1 (set 0 for the legacy three-encode path)" >&2
   exit 2
 }
 
@@ -21,6 +22,7 @@ EYE_BITRATE="${JASNA_EYE_BITRATE:-20000000}"
 VR_BITRATE="${JASNA_VR_BITRATE:-40000000}"
 FAST_ENCODE="${JASNA_FAST_ENCODE:-1}"
 FAST_SOURCE_COPY="${JASNA_FAST_SOURCE_COPY:-auto}"
+DIRECT_SBS_OUTPUT="${JASNA_DIRECT_SBS_OUTPUT:-1}"
 
 [[ -f "$INPUT_PATH" ]] || {
   echo "error: input video not found: $INPUT_PATH" >&2
@@ -51,6 +53,10 @@ TEST_SEGMENT_SECONDS="$TEST_SECONDS"
 }
 [[ "$FAST_SOURCE_COPY" == "auto" || "$FAST_SOURCE_COPY" == "0" || "$FAST_SOURCE_COPY" == "1" ]] || {
   echo "error: JASNA_FAST_SOURCE_COPY must be auto, 0, or 1" >&2
+  exit 1
+}
+[[ "$DIRECT_SBS_OUTPUT" == "0" || "$DIRECT_SBS_OUTPUT" == "1" ]] || {
+  echo "error: JASNA_DIRECT_SBS_OUTPUT must be 0 or 1" >&2
   exit 1
 }
 
@@ -94,6 +100,8 @@ RIGHT_OUTPUT="$WORK_DIR/right-restored.mov"
 FINAL_TEMP="$WORK_DIR/.joined-sbs-writing.${OUTPUT_NAME##*.}"
 LOG_PATH="$OUTPUT_DIR/${OUTPUT_STEM}.jasna-vr30.log"
 SHARED_BATCH_PATH="$WORK_DIR/pending-eye-restorations.tsv"
+DIRECT_SEGMENT_DIR="$WORK_DIR/direct-sbs-segments"
+DIRECT_CONCAT_PATH="$WORK_DIR/direct-sbs-concat.txt"
 
 mkdir -p "$SOURCE_DIR"
 RUN_CONFIG="input=$INPUT_PATH
@@ -103,6 +111,7 @@ eye_bitrate=$EYE_BITRATE
 vr_bitrate=$VR_BITRATE
 fast_encode=$FAST_ENCODE
 fast_source_copy=$FAST_SOURCE_COPY
+direct_sbs_output=$DIRECT_SBS_OUTPUT
 projection=fisheye"
 if [[ -s "$RUN_CONFIG_PATH" && "$(<"$RUN_CONFIG_PATH")" != "$RUN_CONFIG" ]]; then
   echo "error: this output path belongs to a different test configuration" >&2
@@ -124,6 +133,7 @@ echo "Work dir:    $WORK_DIR"
 echo "Log:         $LOG_PATH"
 echo "Projection:  fisheye"
 echo "Fast encode: $FAST_ENCODE"
+echo "Direct SBS:  $DIRECT_SBS_OUTPUT"
 
 video_duration() {
   "$FFPROBE_PATH" -v error -show_entries format=duration \
@@ -309,6 +319,12 @@ JASNA_VR_PROJECTION=fisheye \
     "$TEST_INPUT" right "$RIGHT_OUTPUT"
 
 SHARED_BATCH_ARGS=()
+LEFT_JOB_INPUTS=()
+LEFT_JOB_MANIFESTS=()
+LEFT_JOB_CACHES=()
+RIGHT_JOB_INPUTS=()
+RIGHT_JOB_MANIFESTS=()
+RIGHT_JOB_CACHES=()
 while IFS=$'\t' read -r JOB_INPUT JOB_WINDOWS JOB_MANIFEST JOB_CACHE JOB_EXTRA; do
   [[ -n "$JOB_INPUT" ]] || continue
   [[ -n "$JOB_WINDOWS" && -n "$JOB_MANIFEST" && -n "$JOB_CACHE" && -z "$JOB_EXTRA" ]] || {
@@ -316,9 +332,104 @@ while IFS=$'\t' read -r JOB_INPUT JOB_WINDOWS JOB_MANIFEST JOB_CACHE JOB_EXTRA; 
     exit 1
   }
   SHARED_BATCH_ARGS+=("$JOB_INPUT" "$JOB_WINDOWS" "$JOB_MANIFEST" "$JOB_CACHE")
+  case "$(basename "$JOB_INPUT")" in
+    left-*)
+      LEFT_JOB_INPUTS+=("$JOB_INPUT")
+      LEFT_JOB_MANIFESTS+=("$JOB_MANIFEST")
+      LEFT_JOB_CACHES+=("$JOB_CACHE")
+      ;;
+    right-*)
+      RIGHT_JOB_INPUTS+=("$JOB_INPUT")
+      RIGHT_JOB_MANIFESTS+=("$JOB_MANIFEST")
+      RIGHT_JOB_CACHES+=("$JOB_CACHE")
+      ;;
+    *)
+      echo "error: unable to identify eye for coordinated input: $JOB_INPUT" >&2
+      exit 1
+      ;;
+  esac
 done < "$SHARED_BATCH_PATH"
 
-if (( ${#SHARED_BATCH_ARGS[@]} > 0 )); then
+if [[ "$DIRECT_SBS_OUTPUT" == "1" ]]; then
+  (( ${#LEFT_JOB_INPUTS[@]} == ${#RIGHT_JOB_INPUTS[@]} )) || {
+    echo "error: direct SBS restoration requires matching left/right segments" >&2
+    exit 1
+  }
+  (( ${#LEFT_JOB_INPUTS[@]} > 0 )) || {
+    echo "error: no paired eye segments were prepared for direct SBS restoration" >&2
+    exit 1
+  }
+  mkdir -p "$DIRECT_SEGMENT_DIR"
+  DIRECT_BATCH_ARGS=()
+  DIRECT_SEGMENTS=()
+  for ((JOB_INDEX = 0; JOB_INDEX < ${#LEFT_JOB_INPUTS[@]}; JOB_INDEX++)); do
+    DIRECT_SEGMENT="$DIRECT_SEGMENT_DIR/$(printf 'segment-%05d.mov' "$JOB_INDEX")"
+    DIRECT_SEGMENTS+=("$DIRECT_SEGMENT")
+    DIRECT_BATCH_ARGS+=(
+      "${LEFT_JOB_INPUTS[$JOB_INDEX]}"
+      "${RIGHT_JOB_INPUTS[$JOB_INDEX]}"
+      "$DIRECT_SEGMENT"
+      "${LEFT_JOB_MANIFESTS[$JOB_INDEX]}"
+      "${RIGHT_JOB_MANIFESTS[$JOB_INDEX]}"
+      "${LEFT_JOB_CACHES[$JOB_INDEX]}"
+      "${RIGHT_JOB_CACHES[$JOB_INDEX]}"
+    )
+  done
+  echo "Restoring ${#DIRECT_SEGMENTS[@]} paired segment(s) directly to 8K SBS"
+  JASNA_VIDEO_BITRATE="$VR_BITRATE" \
+  JASNA_VR_PROJECTION=fisheye \
+    "$ROOT_DIR/script/build_and_run.sh" --restore-stereo-sparse-batch \
+      "${DIRECT_BATCH_ARGS[@]}"
+
+  : > "$DIRECT_CONCAT_PATH"
+  for DIRECT_SEGMENT in "${DIRECT_SEGMENTS[@]}"; do
+    [[ -s "$DIRECT_SEGMENT" ]] || {
+      echo "error: direct SBS segment is missing: $DIRECT_SEGMENT" >&2
+      exit 1
+    }
+    ESCAPED_SEGMENT="${DIRECT_SEGMENT//\'/\'\\\'\'}"
+    printf "file '%s'\n" "$ESCAPED_SEGMENT" >> "$DIRECT_CONCAT_PATH"
+  done
+  if duration_matches "$OUTPUT_PATH" "$TEST_DURATION"; then
+    echo "Final direct SBS output already complete"
+  else
+    if [[ -e "$FINAL_TEMP" ]]; then
+      mv "$FINAL_TEMP" "$WORK_DIR/direct-sbs.interrupted-$(date '+%Y%m%d-%H%M%S').mov"
+    fi
+    if [[ -e "$OUTPUT_PATH" ]]; then
+      mv "$OUTPUT_PATH" \
+        "$OUTPUT_DIR/${OUTPUT_STEM}.previous-$(date '+%Y%m%d-%H%M%S').${OUTPUT_NAME##*.}"
+    fi
+    echo "Joining direct SBS segments and copying source audio without video re-encoding"
+    "$FFMPEG_PATH" \
+      -hide_banner \
+      -f concat -safe 0 -i "$DIRECT_CONCAT_PATH" \
+      -i "$TEST_INPUT" \
+      -map '0:v:0' \
+      -map '1:a?' \
+      -map_metadata 1 \
+      -map_chapters 1 \
+      -c copy \
+      -movflags +faststart \
+      -shortest \
+      -n \
+      "$FINAL_TEMP"
+    duration_matches "$FINAL_TEMP" "$TEST_DURATION" || {
+      echo "error: direct SBS output duration does not match the test source" >&2
+      exit 1
+    }
+    mv "$FINAL_TEMP" "$OUTPUT_PATH"
+  fi
+  FINAL_INFO="$("$FFPROBE_PATH" -v error -select_streams v:0 \
+    -show_entries stream=codec_name,width,height,avg_frame_rate,nb_frames \
+    -show_entries format=duration,size -of default=noprint_wrappers=1 "$OUTPUT_PATH")"
+  echo "Sparse ${TEST_SECONDS}-second direct SBS VR test: PASS"
+  echo "$FINAL_INFO"
+  echo "Output: $OUTPUT_PATH"
+  echo "Log:    $LOG_PATH"
+  echo "Persistent segments and caches: $WORK_DIR"
+  exit 0
+elif (( ${#SHARED_BATCH_ARGS[@]} > 0 )); then
   echo "Restoring $((${#SHARED_BATCH_ARGS[@]} / 4)) left/right segment job(s) with one retained Metal ML graph"
   JASNA_VR_PROJECTION=fisheye \
     "$ROOT_DIR/script/build_and_run.sh" --restore-eye-windows-sparse-batch \

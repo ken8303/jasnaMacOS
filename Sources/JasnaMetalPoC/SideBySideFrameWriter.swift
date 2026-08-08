@@ -263,7 +263,13 @@ extension SideBySideRestoration {
             metalCompositor = ProcessInfo.processInfo.environment["JASNA_METAL_COMPOSITOR"] == "0"
                 ? nil : try? MetalMosaicCompositor(device: device)
             writer = try AVAssetWriter(outputURL: outputURL, fileType: .mov)
-            let bitRate = min(160_000_000, max(8_000_000, plan.dimensions.pixelCount * 5 / 2))
+            let automaticBitRate = plan.dimensions.pixelCount * 5 / 2
+            let configuredBitRate = Int(
+                ProcessInfo.processInfo.environment["JASNA_VIDEO_BITRATE"] ?? ""
+            )
+            let bitRate = min(
+                160_000_000, max(8_000_000, configuredBitRate ?? automaticBitRate)
+            )
             input = AVAssetWriterInput(
                 mediaType: .video,
                 outputSettings: [
@@ -487,6 +493,212 @@ extension SideBySideRestoration {
                     )
                 }
                 nextFrame = batchEnd
+            }
+        }
+
+        func appendStereoRegionCachedFrames(
+            leftCacheURLs: [URL],
+            rightCacheURLs: [URL],
+            leftBaseFrames: [CVPixelBuffer],
+            rightBaseFrames: [CVPixelBuffer],
+            leftRegions: [MosaicRegion],
+            rightRegions: [MosaicRegion],
+            leftSamplingMaps: [MosaicCropSamplingMap],
+            rightSamplingMaps: [MosaicCropSamplingMap],
+            startFrame: Int,
+            progressStartFrame: Int,
+            plan: SideBySideVideoPlan,
+            projection: VRMosaicProjection
+        ) async throws {
+            let frameCount = leftCacheURLs.count
+            guard frameCount == rightCacheURLs.count,
+                  frameCount == leftBaseFrames.count,
+                  frameCount == rightBaseFrames.count,
+                  leftRegions.count == leftSamplingMaps.count,
+                  rightRegions.count == rightSamplingMaps.count,
+                  plan.eyeLayout == .sideBySide
+            else { throw DeformConvError.invalidShape }
+            guard let pool = adaptor.pixelBufferPool else {
+                throw DeformConvError.commandFailed("video writer has no pixel-buffer pool")
+            }
+            report(
+                "Direct SBS compositing \(frameCount) frame(s), left/right regions "
+                    + "\(leftRegions.count)/\(rightRegions.count)"
+            )
+            for localFrame in 0..<frameCount {
+                let frameStarted = ContinuousClock.now
+                while !input.isReadyForMoreMediaData {
+                    if writer.status == .failed {
+                        throw writer.error ?? DeformConvError.commandFailed("video writer failed")
+                    }
+                    try await Task.sleep(for: .milliseconds(1))
+                }
+                var optionalOutput: CVPixelBuffer?
+                let status = CVPixelBufferPoolCreatePixelBuffer(nil, pool, &optionalOutput)
+                guard status == kCVReturnSuccess, let outputBuffer = optionalOutput else {
+                    throw DeformConvError.commandFailed("failed allocating direct SBS frame")
+                }
+                let absoluteFrame = progressStartFrame + localFrame
+                let leftInputs = try Self.readCompositeInputs(
+                    cacheURL: leftCacheURLs[localFrame],
+                    baseFrame: leftBaseFrames[localFrame],
+                    regions: leftRegions,
+                    samplingMaps: leftSamplingMaps,
+                    absoluteFrame: absoluteFrame,
+                    xOffset: 0
+                )
+                let rightInputs = try Self.readCompositeInputs(
+                    cacheURL: rightCacheURLs[localFrame],
+                    baseFrame: rightBaseFrames[localFrame],
+                    regions: rightRegions,
+                    samplingMaps: rightSamplingMaps,
+                    absoluteFrame: absoluteFrame,
+                    xOffset: plan.eyeDimensions.width
+                )
+                try Self.copyStereoPixelBuffers(
+                    left: leftBaseFrames[localFrame],
+                    right: rightBaseFrames[localFrame],
+                    destination: outputBuffer,
+                    dimensions: plan.dimensions
+                )
+                if projection == .fisheye, let metalCompositor {
+                    try metalCompositor.compositeInPlace(
+                        pixelBuffer: outputBuffer,
+                        dimensions: plan.dimensions,
+                        inputs: leftInputs + rightInputs
+                    )
+                } else {
+                    guard projection == .raw else {
+                        throw DeformConvError.commandFailed(
+                            "direct fisheye SBS output requires the Metal compositor"
+                        )
+                    }
+                    var accumulator = try MosaicRegionFrameAccumulator(
+                        basePixelBuffer: outputBuffer, dimensions: plan.dimensions
+                    )
+                    for composite in leftInputs + rightInputs {
+                        try accumulator.composite(
+                            region: composite.region,
+                            planarRGB: composite.restored,
+                            originalPlanarRGB: projection == .fisheye
+                                ? composite.original : nil,
+                            projection: .raw
+                        )
+                    }
+                    try accumulator.writeBGRA(to: outputBuffer)
+                }
+                if let attachments = CVBufferCopyAttachments(
+                    leftBaseFrames[localFrame], .shouldPropagate
+                ) {
+                    CVBufferSetAttachments(outputBuffer, attachments, .shouldPropagate)
+                }
+                let presentationTime = CMTime(
+                    value: CMTimeValue(startFrame + localFrame), timescale: 30
+                )
+                guard adaptor.append(outputBuffer, withPresentationTime: presentationTime) else {
+                    throw writer.error
+                        ?? DeformConvError.commandFailed("failed encoding direct SBS frame")
+                }
+                report(
+                    "Queued direct SBS frame \(absoluteFrame + 1)/"
+                        + "\(plan.frameRate.outputFrameCount); composite "
+                        + "\(String(format: "%.3f", SideBySideRestoration.elapsedMilliseconds(since: frameStarted))) ms"
+                )
+            }
+        }
+
+        private static func readCompositeInputs(
+            cacheURL: URL,
+            baseFrame: CVPixelBuffer,
+            regions: [MosaicRegion],
+            samplingMaps: [MosaicCropSamplingMap],
+            absoluteFrame: Int,
+            xOffset: Int
+        ) throws -> [MetalMosaicCompositeInput] {
+            let cache = try FileHandle(forReadingFrom: cacheURL)
+            defer { try? cache.close() }
+            var result = [MetalMosaicCompositeInput]()
+            result.reserveCapacity(regions.count)
+            for (index, region) in regions.enumerated() {
+                guard region.frameRange.contains(absoluteFrame) else {
+                    try cache.seek(toOffset: UInt64((index + 1) * tileBytes))
+                    continue
+                }
+                guard let data = try cache.read(upToCount: tileBytes), data.count == tileBytes else {
+                    throw DeformConvError.commandFailed(
+                        "direct SBS mosaic-crop cache is truncated"
+                    )
+                }
+                var restored = [Float16](repeating: 0, count: tileElements)
+                _ = restored.withUnsafeMutableBytes { data.copyBytes(to: $0) }
+                let original = try samplingMaps[index].extractPlanarRGB(from: baseFrame)
+                result.append(MetalMosaicCompositeInput(
+                    region: translated(region, xOffset: xOffset),
+                    restored: restored,
+                    original: original,
+                    samples: samplingMaps[index].compositeSamples
+                ))
+            }
+            return result
+        }
+
+        private static func translated(_ region: MosaicRegion, xOffset: Int) -> MosaicRegion {
+            guard xOffset != 0 else { return region }
+            return MosaicRegion(
+                startFrame: region.startFrame,
+                endFrame: region.endFrame,
+                x: region.x + xOffset,
+                y: region.y,
+                width: region.width,
+                height: region.height,
+                confidence: region.confidence,
+                blendX: region.blendX.map { $0 + xOffset },
+                blendY: region.blendY,
+                blendWidth: region.blendWidth,
+                blendHeight: region.blendHeight
+            )
+        }
+
+        private static func copyStereoPixelBuffers(
+            left: CVPixelBuffer,
+            right: CVPixelBuffer,
+            destination: CVPixelBuffer,
+            dimensions: VideoDimensions
+        ) throws {
+            let eyeWidth = dimensions.width / 2
+            guard dimensions.width.isMultiple(of: 2),
+                  CVPixelBufferGetWidth(left) == eyeWidth,
+                  CVPixelBufferGetWidth(right) == eyeWidth,
+                  CVPixelBufferGetHeight(left) == dimensions.height,
+                  CVPixelBufferGetHeight(right) == dimensions.height,
+                  CVPixelBufferGetWidth(destination) == dimensions.width,
+                  CVPixelBufferGetHeight(destination) == dimensions.height
+            else { throw DeformConvError.invalidShape }
+            CVPixelBufferLockBaseAddress(left, .readOnly)
+            CVPixelBufferLockBaseAddress(right, .readOnly)
+            CVPixelBufferLockBaseAddress(destination, [])
+            defer {
+                CVPixelBufferUnlockBaseAddress(destination, [])
+                CVPixelBufferUnlockBaseAddress(right, .readOnly)
+                CVPixelBufferUnlockBaseAddress(left, .readOnly)
+            }
+            guard let leftBase = CVPixelBufferGetBaseAddress(left),
+                  let rightBase = CVPixelBufferGetBaseAddress(right),
+                  let destinationBase = CVPixelBufferGetBaseAddress(destination)
+            else { throw DeformConvError.commandFailed("direct SBS frame is not CPU accessible") }
+            let eyeBytes = eyeWidth * 4
+            for row in 0..<dimensions.height {
+                let destinationRow = destinationBase.advanced(
+                    by: row * CVPixelBufferGetBytesPerRow(destination)
+                )
+                destinationRow.copyMemory(
+                    from: leftBase.advanced(by: row * CVPixelBufferGetBytesPerRow(left)),
+                    byteCount: eyeBytes
+                )
+                destinationRow.advanced(by: eyeBytes).copyMemory(
+                    from: rightBase.advanced(by: row * CVPixelBufferGetBytesPerRow(right)),
+                    byteCount: eyeBytes
+                )
             }
         }
 
