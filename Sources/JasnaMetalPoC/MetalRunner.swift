@@ -704,7 +704,9 @@ final class MetalDeformConv {
               shape.kernelWidth == 3,
               shape.groups == 1,
               shape.offsetGroups > 0,
-              (shape.outputHeight * shape.outputWidth).isMultiple(of: 16),
+              (shape.outputHeight * shape.outputWidth).isMultiple(
+                  of: MetalShader.fusedGEMMRowsPerTile
+              ),
               buffers.count == 7,
               let commandBuffer = queue.makeCommandBuffer(),
               let gatherEncoder = commandBuffer.makeComputeCommandEncoder()
@@ -734,7 +736,7 @@ final class MetalDeformConv {
         gemmEncoder.setBuffer(buffers[6], offset: 0, index: 3)
         gemmEncoder.setBytes(&metalShape, length: MemoryLayout<MetalShape>.stride, index: 4)
         gemmEncoder.dispatchThreadgroups(
-            MTLSize(width: rows / 16, height: 1, depth: 1),
+            MTLSize(width: rows / MetalShader.fusedGEMMRowsPerTile, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(
                 width: 8 * fp16JasnaFusedSIMDGroupGEMMPipeline.threadExecutionWidth,
                 height: 1,
@@ -791,7 +793,9 @@ final class MetalDeformConv {
     ) throws -> Double {
         guard shape.batch == 1,
               shape.outputChannels == 64,
-              (shape.outputHeight * shape.outputWidth).isMultiple(of: 16),
+              (shape.outputHeight * shape.outputWidth).isMultiple(
+                  of: MetalShader.fusedGEMMRowsPerTile
+              ),
               buffers.count == 7,
               let commandBuffer = queue.makeCommandBuffer(),
               let encoder = commandBuffer.makeComputeCommandEncoder()
@@ -804,7 +808,12 @@ final class MetalDeformConv {
         var metalShape = MetalShape(shape)
         encoder.setBytes(&metalShape, length: MemoryLayout<MetalShape>.stride, index: 4)
         encoder.dispatchThreadgroups(
-            MTLSize(width: shape.batch * shape.outputHeight * shape.outputWidth / 16, height: 1, depth: 1),
+            MTLSize(
+                width: shape.batch * shape.outputHeight * shape.outputWidth
+                    / MetalShader.fusedGEMMRowsPerTile,
+                height: 1,
+                depth: 1
+            ),
             threadsPerThreadgroup: MTLSize(
                 width: 8 * fp16JasnaFusedSIMDGroupGEMMPipeline.threadExecutionWidth,
                 height: 1,

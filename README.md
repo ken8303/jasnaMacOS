@@ -423,10 +423,10 @@ boundary, and allocate the complete buffer-backed clip arena:
 
 On a 10-GPU-core Apple M4 with Xcode 27 beta 4, 20-sample runs across all four
 checkpoint directions measured the shared-coordinate gather plus fused
-SIMD-group-GEMM FP16 deformable convolution at 0.701–0.704 ms median. The tiled
-scalar reduction measured 1.175–1.186 ms, the first SIMD version about 9.1 ms,
-and the direct baseline about 16.2 ms. The Metal-4-compatible path is about 40%
-faster than tiled and 23× faster than the direct kernel at the median. Its
+SIMD-group-GEMM FP16 deformable convolution at 0.604–0.614 ms median. The tiled
+scalar reduction measured 1.178–1.186 ms, the first SIMD version about 9.1 ms,
+and the direct baseline about 16.2 ms. The Metal-4-compatible path is about 49%
+faster than tiled and 26–27× faster than the direct kernel at the median. Its
 maximum FP16 difference from the baseline was `0.000977`, and its FP32
 implementation passed the CPU oracle with a maximum absolute error of about
 `3e-8`.
@@ -456,7 +456,7 @@ usage.
 convolution parameter sets from the public checkpoint and writes the packed
 FP16 `[input channel, kernel element, output channel]` layout consumed directly
 by the Metal kernels. Each direction is 147,584 bytes including bias. All four
-load into Metal buffers and benchmark at 0.701–0.704 ms median through the
+load into Metal buffers and benchmark at 0.604–0.614 ms median through the
 shared-coordinate gather plus fused SIMD-group GEMM, with a maximum delta of
 `0.000977` from the direct FP16 implementation. The custom
 offset/mask stage implements Jasna's `10*tanh`, interleaved flipped-flow add,
@@ -648,12 +648,15 @@ FP16 conversion, and NCHW scattering are fused into the matrix dispatch, which
 also removes the 1 MiB FP32 output matrix. Across four real checkpoint weight
 sets, the combined median improved from 0.743–0.749 to 0.701–0.704 ms; the
 stage-separated medians were about 0.347 ms gather and 0.354 ms matrix work.
-The matrix kernel now reuses each loaded 8×8 weight tile across two row blocks,
-producing 16×64 output tiles per threadgroup. Across the same four checkpoints,
-matrix work fell to 0.276 ms and combined DCNv2 to 0.625–0.626 ms—about 22% and
-11% faster respectively. The full four-pass oracle still passes at 70.49 dB,
-and decoded production frames match the earlier 8-row output exactly. It works
-inside the same Metal 4 command buffer as the Metal ML recurrence stages.
+The matrix kernel now reuses each loaded 8×8 weight tile across four row blocks,
+producing 32×64 output tiles per threadgroup. Alternating 20-sample comparisons
+across the same four checkpoints measured 0.250–0.254 ms matrix work and
+0.604–0.614 ms combined DCNv2, versus 0.276–0.279 ms and 0.625–0.636 ms for the
+16-row kernel. The change also corrects a three-frame probe dispatch that
+launched twice the required threadgroups. The full four-pass oracle still
+passes at 70.49 dB, and decoded production frames match the 16-row output
+exactly. It works inside the same Metal 4 command buffer as the Metal ML
+recurrence stages.
 
 ## Model conversion
 

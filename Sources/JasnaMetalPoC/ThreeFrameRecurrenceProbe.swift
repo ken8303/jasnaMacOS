@@ -507,7 +507,8 @@ func verifyThreeFrameRecurrence(
             )
             dispatch1D(
                 alignment, pipeline: gemmPipeline,
-                arguments: gemmArguments, count: plane / 8,
+                arguments: gemmArguments,
+                count: plane / MetalShader.fusedGEMMRowsPerTile,
                 threads: 8 * gemmPipeline.threadExecutionWidth, threadgroups: true
             )
             alignment.barrier(

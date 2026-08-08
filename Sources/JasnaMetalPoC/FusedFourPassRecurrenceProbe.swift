@@ -614,7 +614,8 @@ func verifyFusedFourPassRecurrence(
                 )
                 Support.dispatch1D(
                     alignment, pipeline: gemmPipeline,
-                    arguments: branch.gemmArguments, count: plane / 16,
+                    arguments: branch.gemmArguments,
+                    count: plane / MetalShader.fusedGEMMRowsPerTile,
                     threads: 8 * gemmPipeline.threadExecutionWidth, threadgroups: true
                 )
                 alignment.barrier(
