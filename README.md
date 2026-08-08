@@ -423,10 +423,10 @@ boundary, and allocate the complete buffer-backed clip arena:
 
 On a 10-GPU-core Apple M4 with Xcode 27 beta 4, 20-sample runs across all four
 checkpoint directions measured the shared-coordinate gather plus fused
-SIMD-group-GEMM FP16 deformable convolution at 0.604–0.614 ms median. The tiled
+SIMD-group-GEMM FP16 deformable convolution at 0.534–0.550 ms median. The tiled
 scalar reduction measured 1.178–1.186 ms, the first SIMD version about 9.1 ms,
-and the direct baseline about 16.2 ms. The Metal-4-compatible path is about 49%
-faster than tiled and 26–27× faster than the direct kernel at the median. Its
+and the direct baseline about 16.2 ms. The Metal-4-compatible path is about 54%
+faster than tiled and 29–30× faster than the direct kernel at the median. Its
 maximum FP16 difference from the baseline was `0.000977`, and its FP32
 implementation passed the CPU oracle with a maximum absolute error of about
 `3e-8`.
@@ -456,7 +456,7 @@ usage.
 convolution parameter sets from the public checkpoint and writes the packed
 FP16 `[input channel, kernel element, output channel]` layout consumed directly
 by the Metal kernels. Each direction is 147,584 bytes including bias. All four
-load into Metal buffers and benchmark at 0.604–0.614 ms median through the
+load into Metal buffers and benchmark at 0.534–0.550 ms median through the
 shared-coordinate gather plus fused SIMD-group GEMM, with a maximum delta of
 `0.000977` from the direct FP16 implementation. The custom
 offset/mask stage implements Jasna's `10*tanh`, interleaved flipped-flow add,
@@ -657,6 +657,14 @@ launched twice the required threadgroups. The full four-pass oracle still
 passes at 70.49 dB, and decoded production frames match the 16-row output
 exactly. It works inside the same Metal 4 command buffer as the Metal ML
 recurrence stages.
+
+The gather kernel now precomputes each shared offset location's four input-plane
+neighbor indices and interpolation fractions once per threadgroup. Reusing
+those values across the offset group's eight input channels avoids repeating
+coordinate flooring and boundary checks. Alternating 20-sample runs reduced
+gather from 0.347–0.348 ms to 0.280–0.289 ms and combined DCNv2 from
+0.599–0.607 ms to 0.534–0.550 ms. The full-model oracle and decoded production
+frames remain unchanged.
 
 ## Model conversion
 

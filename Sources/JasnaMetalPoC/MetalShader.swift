@@ -317,8 +317,8 @@ kernel void deform_conv2d_fp16_jasna_gather(
     uint channelsPerOffsetGroup = 128 / s.offsetGroups;
     uint offsetBase = n * 2 * s.offsetGroups * 9 * outputPlane;
     uint inputPlane = s.inputHeight * s.inputWidth;
-    threadgroup float sampleY[offsetSampleCount];
-    threadgroup float sampleX[offsetSampleCount];
+    threadgroup int4 sampleNeighbor[offsetSampleCount];
+    threadgroup float2 sampleFraction[offsetSampleCount];
     threadgroup float sampleMask[offsetSampleCount];
     for (
         uint offsetSample = tid;
@@ -329,12 +329,27 @@ kernel void deform_conv2d_fp16_jasna_gather(
         uint ky = k / 3;
         uint kx = k % 3;
         uint offsetChannel = 2 * offsetSample;
-        sampleY[offsetSample] = float(int(oy * s.strideHeight + ky * s.dilationHeight)
+        float y = float(int(oy * s.strideHeight + ky * s.dilationHeight)
             - int(s.padHeight))
             + float(offset[offsetBase + offsetChannel * outputPlane + spatial]);
-        sampleX[offsetSample] = float(int(ox * s.strideWidth + kx * s.dilationWidth)
+        float x = float(int(ox * s.strideWidth + kx * s.dilationWidth)
             - int(s.padWidth))
             + float(offset[offsetBase + (offsetChannel + 1) * outputPlane + spatial]);
+        int y0 = int(floor(y));
+        int x0 = int(floor(x));
+        int y1 = y0 + 1;
+        int x1 = x0 + 1;
+        sampleNeighbor[offsetSample] = int4(
+            y0 >= 0 && y0 < int(s.inputHeight) && x0 >= 0 && x0 < int(s.inputWidth)
+                ? y0 * int(s.inputWidth) + x0 : -1,
+            y0 >= 0 && y0 < int(s.inputHeight) && x1 >= 0 && x1 < int(s.inputWidth)
+                ? y0 * int(s.inputWidth) + x1 : -1,
+            y1 >= 0 && y1 < int(s.inputHeight) && x0 >= 0 && x0 < int(s.inputWidth)
+                ? y1 * int(s.inputWidth) + x0 : -1,
+            y1 >= 0 && y1 < int(s.inputHeight) && x1 >= 0 && x1 < int(s.inputWidth)
+                ? y1 * int(s.inputWidth) + x1 : -1
+        );
+        sampleFraction[offsetSample] = float2(y - float(y0), x - float(x0));
         sampleMask[offsetSample] = float(
             mask[n * s.offsetGroups * 9 * outputPlane
                 + offsetSample * outputPlane + spatial]
@@ -346,11 +361,19 @@ kernel void deform_conv2d_fp16_jasna_gather(
         uint k = sampleIndex % 9;
         uint offsetGroup = ic / channelsPerOffsetGroup;
         uint offsetSample = offsetGroup * 9 + k;
-        float sampled = sample_fp16(
-            input, (n * 128 + ic) * inputPlane,
-            s.inputHeight, s.inputWidth,
-            sampleY[offsetSample], sampleX[offsetSample]
-        );
+        uint inputBase = (n * 128 + ic) * inputPlane;
+        int4 neighbor = sampleNeighbor[offsetSample];
+        float2 fraction = sampleFraction[offsetSample];
+        float v00 = neighbor.x >= 0 ? float(input[inputBase + uint(neighbor.x)]) : 0.0f;
+        float v01 = neighbor.y >= 0 ? float(input[inputBase + uint(neighbor.y)]) : 0.0f;
+        float v10 = neighbor.z >= 0 ? float(input[inputBase + uint(neighbor.z)]) : 0.0f;
+        float v11 = neighbor.w >= 0 ? float(input[inputBase + uint(neighbor.w)]) : 0.0f;
+        float ly = fraction.x;
+        float lx = fraction.y;
+        float sampled = v00 * (1.0f - ly) * (1.0f - lx)
+            + v01 * (1.0f - ly) * lx
+            + v10 * ly * (1.0f - lx)
+            + v11 * ly * lx;
         gathered[row * sampleCount + sampleIndex] = half(
             sampled * sampleMask[offsetSample]
         );
