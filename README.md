@@ -316,6 +316,14 @@ sampling every 0.2 seconds, was rejected because each missed five or six
 restoration regions from the quality baseline. A shared decode feeding two eye
 encoders improved a 10-second preparation fixture by only 5.6%, so the simpler
 restartable per-eye preparation remains the production path.
+An opt-in Core ML export of the same segmentation checkpoint was also rejected:
+with a fixed 2048-pixel batch-1 input it took 73.0 seconds (69.3 seconds of
+inference), about 9% slower than the accepted PyTorch/MPS path. It produced the
+same total of 128 restoration regions, but FP16 box differences changed temporal
+tracking and left two baseline blend regions without a same-window overlap. The
+scanner now declares the segmentation task explicitly so exported backends can
+be evaluated without silently interpreting mask coefficients as detections, but
+the `.pt` model remains the production default.
 Fisheye sampling coordinates and interpolation weights are calculated once per
 mosaic region and reused across its active frames.
 Inactive region/frame cache slots are sparse file holes and are skipped during

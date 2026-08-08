@@ -195,7 +195,9 @@ def main() -> int:
     args = parse_args()
     if not args.input_video.is_file():
         raise SystemExit(f"input video not found: {args.input_video}")
-    if not args.model.is_file():
+    # Core ML exports are directory-backed .mlpackage bundles, whereas the
+    # PyTorch detector is a regular .pt file.
+    if not args.model.exists():
         raise SystemExit(f"mosaic detector not found: {args.model}")
     if (
         args.sample_stride <= 0
@@ -237,7 +239,9 @@ def main() -> int:
         f"on {device}; {args.decode_mode} decode, batch {args.batch_size}",
         flush=True,
     )
-    model = YOLO(str(args.model))
+    # Exported Core ML packages do not reliably retain enough metadata for
+    # Ultralytics to infer that this checkpoint is a segmentation model.
+    model = YOLO(str(args.model), task="segment")
     stride_frames = max(1, int(round(args.sample_stride * source_fps)))
     region_frames = max(stride_frames, int(round(args.region_duration * source_fps)))
     padding_frames = int(round(args.temporal_padding * source_fps))
