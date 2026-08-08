@@ -396,7 +396,7 @@ FINAL_INFO="$("$FFPROBE_PATH" \
   -of default=noprint_wrappers=1 \
   "$OUTPUT_PATH")"
 
-echo "Sparse 30-second VR test: PASS"
+echo "Sparse ${TEST_SECONDS}-second VR test: PASS"
 echo "$FINAL_INFO"
 echo "Output:   $OUTPUT_PATH"
 echo "Left eye: $LEFT_OUTPUT"

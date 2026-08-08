@@ -307,6 +307,15 @@ its output with the slower quality-priority encoder. Set
 Sparse mosaic scans decode HEVC sequentially and infer two sampled frames at a
 time. Set `JASNA_DETECT_BATCH_SIZE=1` to minimize memory, or
 `JASNA_DETECT_DECODE_MODE=seek` to compare with the former random-seek path.
+Detector logs separate neural inference from decode/batching time. On a
+60-second 4096×4096 M4 fixture, the accepted 2048-pixel, 0.1-second-stride,
+batch-2 scan took 66.9 seconds: 62.6 seconds inference and 4.3 seconds decode.
+Batch 4 regressed to 75.0 seconds; an alternating repeat kept batch 2 ahead of
+batch 1 by 67.95 to 70.90 seconds. Reducing inference size to 1792 or 1536, or
+sampling every 0.2 seconds, was rejected because each missed five or six
+restoration regions from the quality baseline. A shared decode feeding two eye
+encoders improved a 10-second preparation fixture by only 5.6%, so the simpler
+restartable per-eye preparation remains the production path.
 Fisheye sampling coordinates and interpolation weights are calculated once per
 mosaic region and reused across its active frames.
 Inactive region/frame cache slots are sparse file holes and are skipped during

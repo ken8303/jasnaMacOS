@@ -271,10 +271,13 @@ def main() -> int:
             )
 
     scanned_samples = 0
+    inference_seconds = 0.0
 
     def process_batch(frames, frame_indices):
-        nonlocal scanned_samples
+        nonlocal inference_seconds, scanned_samples
+        inference_started = time.perf_counter()
         predictions = predict(frames)
+        inference_seconds += time.perf_counter() - inference_started
         if len(predictions) != len(frame_indices):
             raise RuntimeError(
                 f"detector returned {len(predictions)} results for "
@@ -418,6 +421,11 @@ def main() -> int:
     print(
         f"Detector scan: {scan_seconds:.3f}s, "
         f"{scanned_samples / scan_seconds:.2f} sampled frames/s",
+        flush=True,
+    )
+    print(
+        f"Detector phases: inference {inference_seconds:.3f}s, "
+        f"decode/batching {max(0.0, scan_seconds - inference_seconds):.3f}s",
         flush=True,
     )
     return 0
