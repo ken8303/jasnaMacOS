@@ -125,6 +125,7 @@ extension SideBySideRestoration {
                 region.x, region.y, region.width, region.height,
                 region.effectiveBlendX, region.effectiveBlendY,
                 region.effectiveBlendWidth, region.effectiveBlendHeight,
+                region.subdivisionGroup ?? 0,
             ]
             for value in values {
                 var littleEndian = UInt64(value).littleEndian

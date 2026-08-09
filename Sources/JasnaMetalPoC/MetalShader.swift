@@ -173,8 +173,8 @@ kernel void deform_conv2d_fp16(
     output[gid] = half(sum);
 }
 
-// Jasna's propagation body always uses batch 1, 64 output channels and one
-// convolution group. One threadgroup owns one output pixel. Its two SIMD
+// Jasna's propagation body uses 64 output channels and one convolution group.
+// One threadgroup owns one output pixel in one batch plane. Its two SIMD
 // groups calculate 32 output channels each while broadcasting the common
 // bilinear sample across the SIMD lanes. This removes the largest source of
 // redundant work in the general kernel.
@@ -494,9 +494,11 @@ kernel void jasna_bicubic_downsample_quarter_fp16(
     constexpr uint outputSize = 64u;
     constexpr uint inputPlane = inputSize * inputSize;
     constexpr uint outputPlane = outputSize * outputSize;
-    if (gid >= 3u * outputPlane) return;
-    uint channel = gid / outputPlane;
-    uint spatial = gid % outputPlane;
+    constexpr uint outputBatchElements = 3u * outputPlane;
+    uint n = gid / outputBatchElements;
+    uint local = gid % outputBatchElements;
+    uint channel = local / outputPlane;
+    uint spatial = local % outputPlane;
     uint outputY = spatial / outputSize;
     uint outputX = spatial % outputSize;
     float sourceY = (float(outputY) + 0.5f) * 4.0f - 0.5f;
@@ -508,7 +510,7 @@ kernel void jasna_bicubic_downsample_quarter_fp16(
         float wy = cubic_weight(sourceY - float(baseY + yy));
         for (int xx = -1; xx <= 2; ++xx) {
             float wx = cubic_weight(sourceX - float(baseX + xx));
-            uint source = channel * inputPlane
+            uint source = n * 3u * inputPlane + channel * inputPlane
                 + uint(baseY + yy) * inputSize + uint(baseX + xx);
             value += float(input[source]) * wy * wx;
         }
@@ -535,13 +537,14 @@ kernel void spynet_build_pyramid_pair_fp16(
     device half *support32 [[buffer(11)]],
     device half *reference64 [[buffer(12)]],
     device half *support64 [[buffer(13)]],
-    uint2 gid [[thread_position_in_grid]]
+    uint3 gid [[thread_position_in_grid]]
 ) {
     uint level = gid.y;
     if (level >= 6u) return;
     uint size = 2u << level;
     uint outputPlane = size * size;
     if (gid.x >= 3u * outputPlane) return;
+    uint n = gid.z;
     uint channel = gid.x / outputPlane;
     uint spatial = gid.x % outputPlane;
     uint y = spatial / size;
@@ -551,7 +554,8 @@ kernel void spynet_build_pyramid_pair_fp16(
     float supportSum = 0.0f;
     for (uint yy = 0; yy < factor; ++yy) {
         for (uint xx = 0; xx < factor; ++xx) {
-            uint source = channel * 4096u + (y * factor + yy) * 64u + x * factor + xx;
+            uint source = n * 3u * 4096u + channel * 4096u
+                + (y * factor + yy) * 64u + x * factor + xx;
             referenceSum += float(reference[source]);
             supportSum += float(support[source]);
         }
@@ -561,12 +565,13 @@ kernel void spynet_build_pyramid_pair_fp16(
     constexpr float stddev[3] = {0.229f, 0.224f, 0.225f};
     half referenceValue = half((referenceSum * inverseArea - mean[channel]) / stddev[channel]);
     half supportValue = half((supportSum * inverseArea - mean[channel]) / stddev[channel]);
-    if (level == 0u) { reference2[gid.x] = referenceValue; support2[gid.x] = supportValue; }
-    else if (level == 1u) { reference4[gid.x] = referenceValue; support4[gid.x] = supportValue; }
-    else if (level == 2u) { reference8[gid.x] = referenceValue; support8[gid.x] = supportValue; }
-    else if (level == 3u) { reference16[gid.x] = referenceValue; support16[gid.x] = supportValue; }
-    else if (level == 4u) { reference32[gid.x] = referenceValue; support32[gid.x] = supportValue; }
-    else { reference64[gid.x] = referenceValue; support64[gid.x] = supportValue; }
+    uint destination = n * 3u * outputPlane + gid.x;
+    if (level == 0u) { reference2[destination] = referenceValue; support2[destination] = supportValue; }
+    else if (level == 1u) { reference4[destination] = referenceValue; support4[destination] = supportValue; }
+    else if (level == 2u) { reference8[destination] = referenceValue; support8[destination] = supportValue; }
+    else if (level == 3u) { reference16[destination] = referenceValue; support16[destination] = supportValue; }
+    else if (level == 4u) { reference32[destination] = referenceValue; support32[destination] = supportValue; }
+    else { reference64[destination] = referenceValue; support64[destination] = supportValue; }
 }
 
 inline float sample_border_fp16(
@@ -656,6 +661,7 @@ struct SPyNetPaddedShape {
     uint sourceFlowHeight;
     uint sourceFlowRowStride;
     uint firstLevel;
+    uint batch;
 };
 
 kernel void spynet_prepare_padded_fp16(
@@ -668,9 +674,11 @@ kernel void spynet_prepare_padded_fp16(
     uint gid [[thread_position_in_grid]]
 ) {
     uint plane = s.width * s.height;
-    if (gid >= plane) return;
-    uint y = gid / s.width;
-    uint x = gid % s.width;
+    if (gid >= s.batch * plane) return;
+    uint n = gid / plane;
+    uint spatial = gid % plane;
+    uint y = spatial / s.width;
+    uint x = spatial % s.width;
     float flowX = 0.0f;
     float flowY = 0.0f;
     if (s.firstLevel == 0u) {
@@ -683,8 +691,9 @@ kernel void spynet_prepare_padded_fp16(
         float lx = sourceX - float(x0);
         float ly = sourceY - float(y0);
         uint sourceStoragePlane = s.sourceFlowRowStride * s.sourceFlowHeight;
+        uint sourceBatchBase = n * 2u * sourceStoragePlane;
         for (uint channel = 0u; channel < 2u; ++channel) {
-            uint base = channel * sourceStoragePlane;
+            uint base = sourceBatchBase + channel * sourceStoragePlane;
             float v00 = float(sourceFlow[base + uint(y0) * s.sourceFlowRowStride + uint(x0)]);
             float v01 = float(sourceFlow[base + uint(y0) * s.sourceFlowRowStride + uint(x1)]);
             float v10 = float(sourceFlow[base + uint(y1) * s.sourceFlowRowStride + uint(x0)]);
@@ -695,19 +704,24 @@ kernel void spynet_prepare_padded_fp16(
         }
     }
     uint storagePlane = s.rowStride * s.height;
+    uint featureBatchBase = n * 8u * storagePlane;
+    uint flowBatchBase = n * 2u * storagePlane;
+    uint sourceBatchBase = n * 3u * plane;
     uint destination = y * s.rowStride + x;
-    baseFlow[destination] = half(flowX);
-    baseFlow[storagePlane + destination] = half(flowY);
+    baseFlow[flowBatchBase + destination] = half(flowX);
+    baseFlow[flowBatchBase + storagePlane + destination] = half(flowY);
     for (uint channel = 0u; channel < 3u; ++channel) {
-        features[channel * storagePlane + destination] = reference[channel * plane + gid];
+        features[featureBatchBase + channel * storagePlane + destination]
+            = reference[sourceBatchBase + channel * plane + spatial];
         float warped = sample_border_fp16(
-            support, channel * plane, s.height, s.width,
+            support, sourceBatchBase + channel * plane, s.height, s.width,
             float(y) + flowY, float(x) + flowX
         );
-        features[(channel + 3u) * storagePlane + destination] = half(warped);
+        features[featureBatchBase + (channel + 3u) * storagePlane + destination]
+            = half(warped);
     }
-    features[6u * storagePlane + destination] = half(flowX);
-    features[7u * storagePlane + destination] = half(flowY);
+    features[featureBatchBase + 6u * storagePlane + destination] = half(flowX);
+    features[featureBatchBase + 7u * storagePlane + destination] = half(flowY);
 }
 
 kernel void spynet_add_flow_padded_fp16(
@@ -718,12 +732,17 @@ kernel void spynet_add_flow_padded_fp16(
     uint gid [[thread_position_in_grid]]
 ) {
     uint plane = s.width * s.height;
-    if (gid >= 2u * plane) return;
-    uint channel = gid / plane;
-    uint spatial = gid % plane;
+    uint batchElements = 2u * plane;
+    if (gid >= s.batch * batchElements) return;
+    uint n = gid / batchElements;
+    uint local = gid % batchElements;
+    uint channel = local / plane;
+    uint spatial = local % plane;
     uint y = spatial / s.width;
     uint x = spatial % s.width;
-    uint index = channel * s.rowStride * s.height + y * s.rowStride + x;
+    uint storagePlane = s.rowStride * s.height;
+    uint index = n * 2u * storagePlane + channel * storagePlane
+        + y * s.rowStride + x;
     output[index] = baseFlow[index] + residual[index];
 }
 
@@ -731,6 +750,7 @@ struct TemporalPrepareShape {
     uint width;
     uint height;
     uint hasSecondOrder;
+    uint batch;
 };
 
 // BasicVSR++ composes the previous link with the current first-order flow:
@@ -744,22 +764,26 @@ kernel void accumulate_second_order_flow_fp16(
     uint gid [[thread_position_in_grid]]
 ) {
     uint plane = s.width * s.height;
-    if (gid >= 2u * plane) return;
+    uint batchPlane = 2u * plane;
+    if (gid >= s.batch * batchPlane) return;
+    uint n = gid / batchPlane;
+    uint local = gid % batchPlane;
     if (s.hasSecondOrder == 0u) {
         flow2[gid] = half(0.0f);
         return;
     }
-    uint channel = gid / plane;
-    uint spatial = gid % plane;
+    uint channel = local / plane;
+    uint spatial = local % plane;
+    uint flowBase = n * batchPlane;
     uint y = spatial / s.width;
     uint x = spatial % s.width;
-    float flowX = float(flow1[spatial]);
-    float flowY = float(flow1[plane + spatial]);
+    float flowX = float(flow1[flowBase + spatial]);
+    float flowY = float(flow1[flowBase + plane + spatial]);
     float previous = sample_fp16(
-        previousFlow, channel * plane, s.height, s.width,
+        previousFlow, flowBase + channel * plane, s.height, s.width,
         float(y) + flowY, float(x) + flowX
     );
-    flow2[gid] = half(float(flow1[gid]) + previous);
+    flow2[gid] = half(float(flow1[flowBase + local]) + previous);
 }
 
 // Materializes the exact inputs consumed by Jasna's split offset/DCNv2 path:
@@ -778,37 +802,43 @@ kernel void assemble_temporal_alignment_fp16(
     uint gid [[thread_position_in_grid]]
 ) {
     uint plane = s.width * s.height;
-    uint channel = gid / plane;
-    uint spatial = gid % plane;
+    uint conditionPlane = 196u * plane;
+    if (gid >= s.batch * conditionPlane) return;
+    uint n = gid / conditionPlane;
+    uint local = gid % conditionPlane;
+    uint channel = local / plane;
+    uint spatial = local % plane;
+    uint featureBase = n * 64u * plane;
+    uint flowBase = n * 2u * plane;
+    uint deformBase = n * 128u * plane;
     uint y = spatial / s.width;
     uint x = spatial % s.width;
 
-    if (gid < 128u * plane) {
-        deformInput[gid] = channel < 64u
-            ? featProp[gid]
-            : featN2[(channel - 64u) * plane + spatial];
+    if (local < 128u * plane) {
+        deformInput[deformBase + local] = channel < 64u
+            ? featProp[featureBase + local]
+            : featN2[featureBase + (channel - 64u) * plane + spatial];
     }
-    if (gid >= 196u * plane) return;
     if (channel < 64u) {
-        float flowX = float(flow1[spatial]);
-        float flowY = float(flow1[plane + spatial]);
+        float flowX = float(flow1[flowBase + spatial]);
+        float flowY = float(flow1[flowBase + plane + spatial]);
         conditions[gid] = half(sample_fp16(
-            featProp, channel * plane, s.height, s.width,
+            featProp, featureBase + channel * plane, s.height, s.width,
             float(y) + flowY, float(x) + flowX
         ));
     } else if (channel < 128u) {
-        conditions[gid] = featCurrent[(channel - 64u) * plane + spatial];
+        conditions[gid] = featCurrent[featureBase + (channel - 64u) * plane + spatial];
     } else if (channel < 192u) {
-        float flowX = float(flow2[spatial]);
-        float flowY = float(flow2[plane + spatial]);
+        float flowX = float(flow2[flowBase + spatial]);
+        float flowY = float(flow2[flowBase + plane + spatial]);
         conditions[gid] = half(sample_fp16(
-            featN2, (channel - 128u) * plane, s.height, s.width,
+            featN2, featureBase + (channel - 128u) * plane, s.height, s.width,
             float(y) + flowY, float(x) + flowX
         ));
     } else if (channel < 194u) {
-        conditions[gid] = flow1[(channel - 192u) * plane + spatial];
+        conditions[gid] = flow1[flowBase + (channel - 192u) * plane + spatial];
     } else {
-        conditions[gid] = flow2[(channel - 194u) * plane + spatial];
+        conditions[gid] = flow2[flowBase + (channel - 194u) * plane + spatial];
     }
 }
 
@@ -823,18 +853,25 @@ kernel void prepare_dcn_offsets_fp16(
     constant uint &plane [[buffer(5)]],
     uint gid [[thread_position_in_grid]]
 ) {
-    uint channel = gid / plane;
+    uint flattenedChannel = gid / plane;
+    uint n = flattenedChannel / 432u;
+    uint channel = flattenedChannel % 432u;
     uint spatial = gid % plane;
+    uint flowBase = n * 2u * plane;
     if (channel < 288) {
         uint localChannel = channel % 144;
-        device const half *flow = channel < 144 ? flow1 : flow2;
+        device const half *flow = channel < 144 ? flow1 + flowBase : flow2 + flowBase;
         // flow is [x,y]; Jasna flip(1).repeat(...) produces [y,x,y,x,...].
         uint flowChannel = (localChannel & 1u) == 0u ? 1u : 0u;
         float residue = 10.0f * tanh(float(raw[gid]));
-        offset[gid] = half(residue + float(flow[flowChannel * plane + spatial]));
+        uint destination = n * 288u * plane + channel * plane + spatial;
+        offset[destination] = half(
+            residue + float(flow[flowChannel * plane + spatial])
+        );
     } else if (channel < 432) {
         float value = float(raw[gid]);
-        mask[(channel - 288) * plane + spatial] = half(1.0f / (1.0f + exp(-value)));
+        uint destination = n * 144u * plane + (channel - 288u) * plane + spatial;
+        mask[destination] = half(1.0f / (1.0f + exp(-value)));
     }
 }
 
@@ -849,9 +886,13 @@ kernel void assemble_propagation_backbone_fp16(
     uint gid [[thread_position_in_grid]]
 ) {
     uint prefixCount = prefixChannels * plane;
-    uint count = prefixCount + 64u * plane;
-    if (gid >= count) return;
-    output[gid] = gid < prefixCount ? prefix[gid] : aligned[gid - prefixCount];
+    uint channels = prefixChannels + 64u;
+    uint batchCount = channels * plane;
+    uint n = gid / batchCount;
+    uint local = gid % batchCount;
+    output[gid] = local < prefixCount
+        ? prefix[n * prefixCount + local]
+        : aligned[n * 64u * plane + local - prefixCount];
 }
 
 // BasicVSR++ keeps deformable alignment as a residual around each propagation
@@ -878,8 +919,11 @@ kernel void assemble_reconstruction_fp16(
     constant uint &plane [[buffer(6)]],
     uint gid [[thread_position_in_grid]]
 ) {
-    uint sourceIndex = gid / (64u * plane);
-    uint localIndex = gid % (64u * plane);
+    uint batchCount = 320u * plane;
+    uint n = gid / batchCount;
+    uint local = gid % batchCount;
+    uint sourceIndex = local / (64u * plane);
+    uint localIndex = n * 64u * plane + local % (64u * plane);
     if (sourceIndex == 0u) output[gid] = spatial[localIndex];
     else if (sourceIndex == 1u) output[gid] = backward1[localIndex];
     else if (sourceIndex == 2u) output[gid] = forward1[localIndex];
@@ -913,15 +957,17 @@ kernel void assemble_temporal_backbone_fp16(
 ) {
     uint prefixChannels = 64u * (branchIndex + 1u);
     uint totalChannels = prefixChannels + 64u;
-    if (gid >= totalChannels * plane) return;
-    uint channel = gid / plane;
-    uint spatialIndex = gid % plane;
+    uint batchCount = totalChannels * plane;
+    uint n = gid / batchCount;
+    uint local = gid % batchCount;
+    uint channel = local / plane;
+    uint spatialIndex = local % plane;
     if (channel >= prefixChannels) {
-        output[gid] = aligned[(channel - prefixChannels) * plane + spatialIndex];
+        output[gid] = aligned[n * 64u * plane + (channel - prefixChannels) * plane + spatialIndex];
         return;
     }
     uint source = channel / 64u;
-    uint localIndex = (channel % 64u) * plane + spatialIndex;
+    uint localIndex = n * 64u * plane + (channel % 64u) * plane + spatialIndex;
     if (source == 0u) output[gid] = spatial[localIndex];
     else if (source == 1u) output[gid] = backward1[localIndex];
     else if (source == 2u) output[gid] = forward1[localIndex];
@@ -947,15 +993,17 @@ kernel void assemble_temporal_backbone_fused_fp16(
 ) {
     uint prefixChannels = 64u * (branchIndex + 1u);
     uint totalChannels = prefixChannels + 64u;
-    if (gid >= totalChannels * plane) return;
-    uint channel = gid / plane;
-    uint spatialIndex = gid % plane;
+    uint batchCount = totalChannels * plane;
+    uint n = gid / batchCount;
+    uint local = gid % batchCount;
+    uint channel = local / plane;
+    uint spatialIndex = local % plane;
     if (channel >= prefixChannels) {
-        output[gid] = aligned[(channel - prefixChannels) * plane + spatialIndex];
+        output[gid] = aligned[n * 64u * plane + (channel - prefixChannels) * plane + spatialIndex];
         return;
     }
     uint source = channel / 64u;
-    uint localIndex = (channel % 64u) * plane + spatialIndex;
+    uint localIndex = n * 64u * plane + (channel % 64u) * plane + spatialIndex;
     if (source == branchIndex) {
         half value = previousAligned[localIndex] + previousBackbone[localIndex];
         previousOutput[localIndex] = value;
@@ -973,6 +1021,18 @@ struct MosaicCompositeParams {
     uint regionWidth;
     uint regionHeight;
     uint modelSize;
+    uint maskWidth;
+    uint maskHeight;
+    uint groupX;
+    uint groupY;
+    uint groupWidth;
+};
+
+struct MosaicGroupResolveParams {
+    uint groupX;
+    uint groupY;
+    uint groupWidth;
+    uint groupHeight;
 };
 
 inline float mosaic_sample_plane(
@@ -997,12 +1057,36 @@ inline float mosaic_sample_plane(
     return mix(top, bottom, fy);
 }
 
+inline float mosaic_sample_mask(
+    device const uchar *mask,
+    constant MosaicCompositeParams &params,
+    uint localX,
+    uint localY
+) {
+    float maskX = float(localX) * float(params.maskWidth - 1u)
+        / float(max(params.regionWidth - 1u, 1u));
+    float maskY = float(localY) * float(params.maskHeight - 1u)
+        / float(max(params.regionHeight - 1u, 1u));
+    uint x0 = uint(floor(maskX));
+    uint y0 = uint(floor(maskY));
+    uint x1 = min(x0 + 1u, params.maskWidth - 1u);
+    uint y1 = min(y0 + 1u, params.maskHeight - 1u);
+    float fx = maskX - float(x0);
+    float fy = maskY - float(y0);
+    float top = mix(float(mask[y0 * params.maskWidth + x0]),
+                    float(mask[y0 * params.maskWidth + x1]), fx);
+    float bottom = mix(float(mask[y1 * params.maskWidth + x0]),
+                       float(mask[y1 * params.maskWidth + x1]), fx);
+    return mix(top, bottom, fy) / 255.0f;
+}
+
 kernel void composite_fisheye_mosaic_delta(
     device uchar *bgra [[buffer(0)]],
     device const half *restored [[buffer(1)]],
     device const half *original [[buffer(2)]],
     device const float4 *compositeSamples [[buffer(3)]],
-    constant MosaicCompositeParams &params [[buffer(4)]],
+    device const uchar *mask [[buffer(4)]],
+    constant MosaicCompositeParams &params [[buffer(5)]],
     uint gid [[thread_position_in_grid]]
 ) {
     uint regionPixels = params.regionWidth * params.regionHeight;
@@ -1011,7 +1095,9 @@ kernel void composite_fisheye_mosaic_delta(
     uint pixelY = params.regionY + gid / params.regionWidth;
 
     float4 compositeSample = compositeSamples[gid];
-    float alpha = compositeSample.z;
+    float alpha = compositeSample.z * mosaic_sample_mask(
+        mask, params, gid % params.regionWidth, gid / params.regionWidth
+    );
     if (alpha <= 0.0f) return;
     float modelX = compositeSample.x;
     float modelY = compositeSample.y;
@@ -1037,7 +1123,8 @@ kernel void composite_fisheye_mosaic_delta_texture(
     device const half *restored [[buffer(0)]],
     device const half *original [[buffer(1)]],
     device const float4 *compositeSamples [[buffer(2)]],
-    constant MosaicCompositeParams &params [[buffer(3)]],
+    device const uchar *mask [[buffer(3)]],
+    constant MosaicCompositeParams &params [[buffer(4)]],
     uint gid [[thread_position_in_grid]]
 ) {
     uint regionPixels = params.regionWidth * params.regionHeight;
@@ -1047,7 +1134,9 @@ kernel void composite_fisheye_mosaic_delta_texture(
         params.regionY + gid / params.regionWidth
     );
     float4 compositeSample = compositeSamples[gid];
-    float alpha = compositeSample.z;
+    float alpha = compositeSample.z * mosaic_sample_mask(
+        mask, params, gid % params.regionWidth, gid / params.regionWidth
+    );
     if (alpha <= 0.0f) return;
 
     float4 color = frame.read(position);
@@ -1063,6 +1152,65 @@ kernel void composite_fisheye_mosaic_delta_texture(
             );
         color[rgbChannel] = mix(color[rgbChannel], clamp(value, 0.0f, 1.0f), alpha);
     }
+    frame.write(color, position);
+}
+
+kernel void accumulate_fisheye_mosaic_delta(
+    device float4 *accumulator [[buffer(0)]],
+    device const half *restored [[buffer(1)]],
+    device const half *original [[buffer(2)]],
+    device const float4 *compositeSamples [[buffer(3)]],
+    device const uchar *mask [[buffer(4)]],
+    constant MosaicCompositeParams &params [[buffer(5)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint regionPixels = params.regionWidth * params.regionHeight;
+    if (gid >= regionPixels) return;
+    uint localX = gid % params.regionWidth;
+    uint localY = gid / params.regionWidth;
+    uint pixelX = params.regionX + localX;
+    uint pixelY = params.regionY + localY;
+    float4 compositeSample = compositeSamples[gid];
+    float alpha = compositeSample.z * mosaic_sample_mask(
+        mask, params, localX, localY
+    );
+    if (alpha <= 0.0f) return;
+    uint plane = params.modelSize * params.modelSize;
+    float3 delta;
+    for (uint rgbChannel = 0u; rgbChannel < 3u; ++rgbChannel) {
+        uint offset = rgbChannel * plane;
+        delta[rgbChannel] = mosaic_sample_plane(
+            restored, offset, params.modelSize, compositeSample.x, compositeSample.y
+        ) - mosaic_sample_plane(
+            original, offset, params.modelSize, compositeSample.x, compositeSample.y
+        );
+    }
+    uint destination = (pixelY - params.groupY) * params.groupWidth
+        + pixelX - params.groupX;
+    accumulator[destination] += float4(delta * alpha, alpha);
+}
+
+kernel void resolve_fisheye_mosaic_delta_group_texture(
+    texture2d<float, access::read_write> frame [[texture(0)]],
+    device const float4 *accumulator [[buffer(0)]],
+    constant MosaicGroupResolveParams &params [[buffer(1)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint groupPixels = params.groupWidth * params.groupHeight;
+    if (gid >= groupPixels) return;
+    float4 accumulated = accumulator[gid];
+    if (accumulated.w <= 0.0f) return;
+    uint2 position = uint2(
+        params.groupX + gid % params.groupWidth,
+        params.groupY + gid / params.groupWidth
+    );
+    float4 color = frame.read(position);
+    float visibleAlpha = min(accumulated.w, 1.0f);
+    color.rgb = clamp(
+        color.rgb + accumulated.rgb / accumulated.w * visibleAlpha,
+        0.0f,
+        1.0f
+    );
     frame.write(color, position);
 }
 """#

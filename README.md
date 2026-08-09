@@ -164,13 +164,78 @@ processing window. This gives BasicVSR++ five times more temporal context than
 the former 0.2-second clips, which reduces residual blocks and flicker on moving
 mosaics without materially increasing the total number of restored frames. Set
 `JASNA_REGION_DURATION=0.2` only for an old-behaviour comparison. The detector
-writes a JSON manifest, and the
+writes a JSON manifest, suppresses fully contained crops, and applies temporal
+non-maximum suppression to strongly overlapping duplicate tracks before
+restoration. This prevents both inner rectangles and stacks of projected boxes
+when one moving mosaic produces several detections. Nearby independent subjects
+and tracks that continue outside the winning interval remain separate.
+The default overlap cutoff is 0.45 (`JASNA_REGION_NMS_IOU`), based on the
+remaining 0.487–0.497 overlaps in the v6 VR fixture. Large projected regions
+also scale feathering from 12 up to 64 pixels instead of exposing a narrow,
+fixed-width rectangular transition.
+Detection defaults to confidence 0.15 with one second of temporal
+padding so short or fast-moving mosaic appearances are less likely to be
+missed. `JASNA_DETECT_CONFIDENCE` and `JASNA_TEMPORAL_PADDING` can override
+those quality settings for controlled comparisons. The
 Metal restorer then runs only the detected 256×256 model crops. Clean
 one-second windows bypass the Jasna model. Following Jasna's VR180 path, the
 sparse wrapper defaults to fisheye projection: each region is flattened before
 restoration, only the restored delta is inverse-projected, and a feathered mask
 places that delta onto the untouched source frame. Set
 `JASNA_VR_PROJECTION=raw` only when comparing against the older flat-crop path.
+The v11 manifest also carries compact 128×128 soft-mask keyframes from the detector's
+segmentation output. Metal multiplies the precomputed fisheye composite alpha by
+an interpolated mask for every output frame, restricting restored deltas to the
+moving mosaic shape instead of using a one-second union or
+exposing a rectangular crop. The mask expands by 10% of its resolution before
+the soft edge is applied, covering large source mosaic blocks that extend
+beyond the semantic contour. The higher resolution reduces visible alpha steps
+when a large VR crop maps each former 64×64 mask pixel to roughly 25 source
+pixels. `JASNA_MASK_EXPANSION` can tune expansion from `0.01` through `0.25`,
+and `JASNA_MASK_SIZE` accepts powers of two from 32 through 256. Older manifests
+without mask data retain the rectangular feather fallback.
+The v12 restoration path selectively subdivides the largest oversized region in
+each eye/window before inference. A region wider or taller than 768 pixels becomes
+overlapping model crops with 96 pixels of context, capped at three crops per axis.
+Each child retains a remapped static and temporal segmentation mask. This raises
+the effective model resolution for the large moving VR regions that otherwise
+stretch one 256×256 restoration over roughly 1,300–2,000 source pixels. Only one
+region per window is expanded by default to contain the performance cost. Tune
+`JASNA_LARGE_REGION_MAX_BLEND`, `JASNA_LARGE_REGION_OVERLAP`,
+`JASNA_LARGE_REGION_SPLIT_LIMIT`, and `JASNA_LARGE_REGION_MAX_AXIS_CROPS`, or set
+`JASNA_LARGE_REGION_MAX_BLEND=0` to retain the v11 single-crop behaviour.
+The Metal compositor accumulates child restoration deltas and normalizes their
+overlap weights before touching the frame. A sequential overwrite experiment
+exposed a cross-shaped 2×2 grid and was rejected; normalized accumulation removes
+that internal seam and fails closed if a grouped texture composite is unavailable.
+The v13 path additionally expands only the selected oversized region's parent mask
+before subdivision. Its parent blend envelope grows by the same bounded amount so
+the existing rectangular feather cannot clip that new coverage. The default 5%
+growth and 2.5% soft transition cover residual large mosaic blocks outside the
+detector contour without broadening every small restoration. Tune
+`JASNA_LARGE_REGION_MASK_GROWTH` and
+`JASNA_LARGE_REGION_MASK_FEATHER`, or set growth to `0` for the v12 mask behaviour.
+Grid dimensions remain based on the original detected envelope, preventing mask
+growth near a threshold from unexpectedly changing a 2×2 restoration into 3×3.
+The v14 path adds a square-distance halo around that semantic mask to target the
+axis-aligned corners left by large mosaic blocks, while a half-strength adjacent
+keyframe union protects quickly moving mask edges. The defaults add 4% block
+coverage and one temporal keyframe on each side without adding model crops. Tune
+`JASNA_LARGE_REGION_BLOCK_GROWTH` and
+`JASNA_LARGE_REGION_MASK_TEMPORAL_RADIUS`; set either to `0` to disable that part.
+The v15 path adds one 576-pixel detail crop centred on the lower boundary of the
+selected semantic mask. It joins the same normalized compositor group as the 2x2
+base grid, increasing sampling density only where the large VR block ring remained.
+This adds one model crop per selected oversized region instead of the five extra
+crops required by a full 3x3 grid. Tune `JASNA_LARGE_REGION_DETAIL_CROPS` from
+`0` through `2` and `JASNA_LARGE_REGION_DETAIL_DIMENSION` from 256 pixels up to
+the configured large-region maximum.
+Metal 4/MPSGraph allocations on the macOS 27 beta are released reliably only when
+the restoration process exits. Direct SBS restoration therefore defaults to six
+temporal windows per subprocess, writes a validated HEVC part, exits to release
+`IOAccelerator` and `IOSurface` memory, and concatenates the parts without another
+video encode. Set `JASNA_METAL_WINDOWS_PER_PROCESS` from 1 through 30 to tune the
+peak-memory/startup tradeoff; six is the safe default for a 16 GB M4 Mac.
 The current sparse VR path decodes and encodes 8-bit BGRA/SDR. A Main 10 or HDR
 source therefore does not retain its original bit depth or HDR transfer
 characteristics; do not use this path when HDR preservation is required.
@@ -237,6 +302,14 @@ measured about 1.10 seconds for the initial graph build and execution, then
 about 0.45 seconds per reused 30-frame crop including roughly 0.38 seconds of
 GPU work. Decoded frame hashes matched the pre-cache output exactly.
 
+When `Models/MetalMLBatch2` is present, restoration automatically groups two
+mosaic crops with the same temporal length into one retained graph. Incompatible
+or odd final crops stay on batch 1, and any batch failure retries both crops on
+the established individual fallback path. Set `JASNA_MODEL_BATCH=1` to disable
+this experimental path. The batch-2 package initialization can take roughly
+three minutes in a fresh process under Xcode 27 beta, after which the graph is
+reused for the remaining crops and segments.
+
 The retained graph clears its unpadded main buffers only on first use because
 every later destination is fully overwritten. SPyNet's padded-row tensors are
 still cleared for every crop; skipping those clears changed output and was
@@ -279,6 +352,21 @@ Run an end-to-end 30-second test of both eyes and rebuild an SBS preview with:
 ./script/test_vr_sparse_30s.sh \
   /path/to/input-sbs.mp4 /path/to/restored-vr-test.mov 00:12:00
 ```
+
+After validating quality, restore the complete SBS source with the production
+wrapper:
+
+```sh
+./script/restore_vr_sparse_sbs.sh \
+  /path/to/input-sbs.mp4 /path/to/restored-full.mp4
+```
+
+It does not apply the test harness's 30-second cut. It uses persistent
+120-second source/restoration segments, fisheye sparse regions, direct SBS
+output, and batch 2 by default. All pending segments are submitted through one
+app process so the expensive batch-2 Metal ML graph is initialized once. A
+restart reuses completed source segments, region manifests, restored windows,
+and validated SBS segment files.
 
 The start time is optional and defaults to the beginning. The script prepares
 an exact 30 fps test clip, restores the left and right eyes sequentially, copies
@@ -334,6 +422,13 @@ Fisheye sampling coordinates and interpolation weights are calculated once per
 mosaic region and reused across its active frames.
 Inactive region/frame cache slots are sparse file holes and are skipped during
 compositing, reducing physical cache I/O without changing resumable offsets.
+A conservative contained-track merge was rejected on the 30-second production
+fixture: it preserved all original blend coverage but reduced 346 crops to only
+343 and saved just 65 of 10,047 model frames (0.65%). Reusing the extracted
+original crops during direct compositing was pixel-identical but increased the
+one-window runtime by 4–8% from retained-memory pressure. Moving compositor work
+ahead of HEVC backpressure was also neutral (1.33 versus 1.32 seconds for the
+one-second fixture), so neither experiment is in the production path.
 
 When the supporter-only Jasna SD1.5 checkpoint is unavailable, the public
 DeepMosaics BVDNet checkpoint can be tested on a persistent 30-second left-eye
@@ -720,6 +815,28 @@ into feature extraction, six SPyNet convolution levels, offset prediction,
 propagation backbone, and upsampling packages. Deformable convolution and
 SPyNet's dynamic border warp remain in custom Metal kernels.
 
+The converter accepts `--batch-size N` for fixed-batch feasibility packages.
+Batch 2 passed the M4 microbenchmark gate: compared with two batch-1 executions,
+feature extraction fell from 0.748 to 0.590 ms, the 64×64 SPyNet block from
+0.536 to 0.422 ms, offset prediction from 0.724 to 0.567 ms, representative
+propagation backbones from 1.454 to 1.273 ms and 1.522 to 1.322 ms, and
+reconstruction from 2.354 to 2.124 ms. The complete bidirectional six-level
+SPyNet graph is now batch-aware: batch 2 takes 2.608 ms versus 4.500 ms for two
+batch-1 executions, a 42% reduction, with finite deterministic flows and zero
+repeat error. The retained feature/propagation/reconstruction tensor arena is
+now batch-aware in the experimental full-graph probe: a three-frame
+batch-2 restoration takes 51.893 ms versus 65.050 ms for two batch-1 executions,
+a 20% reduction, and matches both independent batch-1 outputs exactly. Xcode 27
+beta takes roughly three minutes to initialize all batch-2 packages in a fresh
+process, but the retained graph pays that cost once. Video restoration remains
+batch 1 until the crop scheduler supplies two regions to this graph. The custom
+temporal preparation and DCNv2 offset stages now pass exact batch-2 isolation
+tests. Gather plus SIMD-group GEMM also matches the general FP16
+kernel within 0.000244: one batch-2 dispatch takes 1.047 ms versus 1.070 ms for
+two batch-1 dispatches. This removes correctness blockers even though DCNv2's
+own batching gain is only about 2%; the larger expected win remains in the
+Metal ML packages above.
+
 The converter intentionally emits the iOS 18 Core ML operation set, even though
 the runtime target is macOS 26+. Xcode 27 beta 4's Metal package builder crashes
 on the newer `ios19.add` representation; the equivalent `ios18.add` compiles.
@@ -727,6 +844,22 @@ on the newer `ios19.add` representation; the equivalent `ios18.add` compiles.
 After conversion, `tools/build_metal_packages.sh` turns each `.mlpackage` into
 an Xcode 27 `.mtlpackage`. The script contains a workspace-local workaround for
 the beta's incorrect `coremlcompiler` lookup and does not modify Xcode.
+
+Generate the fixed batch-2 packages once in persistent project storage with:
+
+```sh
+python3 tools/convert_basicvsrpp.py \
+  --jasna-source ../../work/jasna \
+  --weights Models/SourceWeights/lada_mosaic_restoration_model_generic_v1.2.pth \
+  --output Models/CoreMLBatch2 \
+  --batch-size 2
+
+./tools/build_metal_packages.sh Models/CoreMLBatch2 Models/MetalMLBatch2
+```
+
+Both directories are ignored by Git because generated packages and downloaded
+weights are not source artifacts. `build_and_run.sh` detects the Metal batch-2
+directory automatically.
 
 The old monolithic `spynet.mtlpackage` is retained only as evidence of the beta
 limitation: Metal ML rejects its dynamic `sample_grid` operation at runtime.

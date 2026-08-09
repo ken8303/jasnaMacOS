@@ -7,6 +7,22 @@ import Metal
 extension SideBySideRestoration {
     static let defaultEncoderWindowsPerSegment = 120
 
+    static func restorationWindowRange(
+        windowCount: Int,
+        environment: [String: String]
+    ) throws -> Range<Int> {
+        guard windowCount > 0 else { throw DeformConvError.invalidShape }
+        let start = Int(environment["JASNA_WINDOW_START"] ?? "") ?? 0
+        let requestedCount = Int(environment["JASNA_WINDOW_COUNT"] ?? "") ?? windowCount
+        guard start >= 0, start < windowCount, requestedCount > 0 else {
+            throw DeformConvError.commandFailed(
+                "invalid restoration window range: start \(start), count \(requestedCount), "
+                    + "available \(windowCount)"
+            )
+        }
+        return start..<min(windowCount, start + requestedCount)
+    }
+
     static func elapsedMilliseconds(since start: ContinuousClock.Instant) -> Double {
         let elapsed = start.duration(to: .now).components
         return Double(elapsed.seconds) * 1_000
@@ -111,6 +127,9 @@ extension SideBySideRestoration {
         )
         let manifest = try MosaicRegionManifest.load(from: manifestURL)
         try manifest.validate(for: plan)
+        let subdivisionConfiguration = MosaicRegionSubdivisionConfiguration.fromEnvironment(
+            ProcessInfo.processInfo.environment
+        )
         let windowFrameCounts = stride(
             from: 0,
             to: manifest.frameCount,
@@ -126,6 +145,7 @@ extension SideBySideRestoration {
                 + "\(manifest.frameCount) frames, \(manifest.regions.count) regions, "
                 + "VR projection \(projection.rawValue)"
         )
+        reportSubdivisionConfiguration(subdivisionConfiguration)
         let decoder = try await FrameDecoder(
             inputURL: inputURL,
             plan: plan,
@@ -208,12 +228,23 @@ extension SideBySideRestoration {
                 let outputCount = windowFrameCounts[currentWindowIndex]
                 let windowStart = currentWindowIndex * SideBySideVideoPlan.temporalWindowFrames
                 let frameRange = windowStart..<(windowStart + outputCount)
-                let activeRegions = manifest.regions(intersecting: frameRange)
+                let detectedRegions = manifest.regions(intersecting: frameRange)
+                let subdivision = MosaicRegionSubdivision.expand(
+                    detectedRegions, configuration: subdivisionConfiguration
+                )
+                let activeRegions = subdivision.regions
                 report(
                     "Window \(currentWindowIndex + 1)/\(windowFrameCounts.count): decoding "
-                        + "\(outputCount) frames; mosaic regions \(activeRegions.count), "
+                        + "\(outputCount) frames; mosaic regions \(detectedRegions.count), "
                         + "model crops \(activeRegions.count)"
                 )
+                if subdivision.splitRegionCount > 0 {
+                    report(
+                        "Window \(currentWindowIndex + 1)/\(windowFrameCounts.count): "
+                            + "split \(subdivision.splitRegionCount) oversized region(s), "
+                            + "added \(subdivision.addedModelCropCount) overlapping crop(s)"
+                    )
+                }
                 let baseFrames = try (0..<outputCount).map {
                     try decoder.copyFrame(outputIndex: windowStart + $0)
                 }
@@ -345,16 +376,13 @@ extension SideBySideRestoration {
             durationSeconds: leftInfo.durationSeconds,
             eyeLayout: .singleEye
         )
-        let stereoPlan = try SideBySideVideoPlan(
-            width: leftInfo.dimensions.width * 2,
-            height: leftInfo.dimensions.height,
-            sourceFramesPerSecond: leftInfo.nominalFramesPerSecond,
-            durationSeconds: leftInfo.durationSeconds
-        )
         let leftManifest = try MosaicRegionManifest.load(from: leftManifestURL)
         let rightManifest = try MosaicRegionManifest.load(from: rightManifestURL)
         try leftManifest.validate(for: eyePlan)
         try rightManifest.validate(for: eyePlan)
+        let subdivisionConfiguration = MosaicRegionSubdivisionConfiguration.fromEnvironment(
+            ProcessInfo.processInfo.environment
+        )
         guard leftManifest.frameCount == rightManifest.frameCount else {
             throw DeformConvError.commandFailed(
                 "direct SBS left/right manifests have different frame counts"
@@ -363,13 +391,30 @@ extension SideBySideRestoration {
         let windowCount = (leftManifest.frameCount
             + SideBySideVideoPlan.temporalWindowFrames - 1)
             / SideBySideVideoPlan.temporalWindowFrames
+        let windowRange = try restorationWindowRange(
+            windowCount: windowCount,
+            environment: ProcessInfo.processInfo.environment
+        )
+        let rangeStartFrame = windowRange.lowerBound * SideBySideVideoPlan.temporalWindowFrames
+        let rangeEndFrame = min(
+            leftManifest.frameCount,
+            windowRange.upperBound * SideBySideVideoPlan.temporalWindowFrames
+        )
+        let rangeFrameCount = rangeEndFrame - rangeStartFrame
+        let stereoPlan = try SideBySideVideoPlan(
+            width: leftInfo.dimensions.width * 2,
+            height: leftInfo.dimensions.height,
+            sourceFramesPerSecond: leftInfo.nominalFramesPerSecond,
+            durationSeconds: Double(rangeFrameCount)
+                / SideBySideVideoPlan.outputFramesPerSecond
+        )
         if await validWindowOutput(
             outputURL,
             dimensions: stereoPlan.dimensions,
-            frameCount: leftManifest.frameCount
+            frameCount: rangeFrameCount
         ) {
             report("Direct SBS segment already complete: \(outputURL.path)")
-            return windowCount
+            return windowRange.count
         }
         if FileManager.default.fileExists(atPath: outputURL.path) {
             let archived = try archiveInterruptedOutput(outputURL)
@@ -394,23 +439,43 @@ extension SideBySideRestoration {
         var completedCacheDirectories = [URL]()
         report(
             "Direct SBS segment: \(stereoPlan.dimensions.width)×"
-                + "\(stereoPlan.dimensions.height), \(leftManifest.frameCount) frames, "
-                + "\(windowCount) windows"
+                + "\(stereoPlan.dimensions.height), \(rangeFrameCount) frames, windows "
+                + "\(windowRange.lowerBound + 1)-\(windowRange.upperBound)/\(windowCount)"
         )
-        for windowIndex in 0..<windowCount {
+        reportSubdivisionConfiguration(subdivisionConfiguration)
+        for windowIndex in windowRange {
             let windowStart = windowIndex * SideBySideVideoPlan.temporalWindowFrames
             let outputCount = min(
                 SideBySideVideoPlan.temporalWindowFrames,
                 leftManifest.frameCount - windowStart
             )
             let frameRange = windowStart..<(windowStart + outputCount)
-            let leftRegions = leftManifest.regions(intersecting: frameRange)
-            let rightRegions = rightManifest.regions(intersecting: frameRange)
+            let leftDetectedRegions = leftManifest.regions(intersecting: frameRange)
+            let rightDetectedRegions = rightManifest.regions(intersecting: frameRange)
+            let leftSubdivision = MosaicRegionSubdivision.expand(
+                leftDetectedRegions, configuration: subdivisionConfiguration
+            )
+            let rightSubdivision = MosaicRegionSubdivision.expand(
+                rightDetectedRegions, configuration: subdivisionConfiguration
+            )
+            let leftRegions = leftSubdivision.regions
+            let rightRegions = rightSubdivision.regions
             report(
                 "Direct SBS window \(windowIndex + 1)/\(windowCount): "
-                    + "decoding \(outputCount) frames; left/right crops "
-                    + "\(leftRegions.count)/\(rightRegions.count)"
+                    + "decoding \(outputCount) frames; left/right regions "
+                    + "\(leftDetectedRegions.count)/\(rightDetectedRegions.count), "
+                    + "model crops \(leftRegions.count)/\(rightRegions.count)"
             )
+            if leftSubdivision.splitRegionCount + rightSubdivision.splitRegionCount > 0 {
+                report(
+                    "Direct SBS window \(windowIndex + 1)/\(windowCount): split "
+                        + "left/right oversized regions "
+                        + "\(leftSubdivision.splitRegionCount)/"
+                        + "\(rightSubdivision.splitRegionCount), added crops "
+                        + "\(leftSubdivision.addedModelCropCount)/"
+                        + "\(rightSubdivision.addedModelCropCount)"
+                )
+            }
             var leftFrames = try (0..<outputCount).map {
                 try leftDecoder.copyFrame(outputIndex: windowStart + $0)
             }
@@ -489,8 +554,9 @@ extension SideBySideRestoration {
                 rightRegions: rightRegions,
                 leftSamplingMaps: leftSamplingMaps,
                 rightSamplingMaps: rightSamplingMaps,
-                startFrame: windowStart,
-                progressStartFrame: windowStart,
+                presentationStartFrame: windowStart - rangeStartFrame,
+                absoluteStartFrame: windowStart,
+                progressFrameCount: leftManifest.frameCount,
                 plan: stereoPlan,
                 projection: projection
             )
@@ -499,7 +565,7 @@ extension SideBySideRestoration {
         guard await validWindowOutput(
             outputURL,
             dimensions: stereoPlan.dimensions,
-            frameCount: leftManifest.frameCount
+            frameCount: rangeFrameCount
         ) else {
             throw DeformConvError.commandFailed("direct SBS segment failed validation")
         }
@@ -509,7 +575,7 @@ extension SideBySideRestoration {
         report(
             "Direct SBS segment encoded and validated: \(outputURL.path)"
         )
-        return windowCount
+        return windowRange.count
     }
 
     private static func processRegionWindow(
@@ -582,19 +648,28 @@ extension SideBySideRestoration {
             let checkpointInterval = configuredWorkPath == nil
                 ? max(1, regions.count)
                 : max(1, configuredCheckpointInterval ?? 5)
-            // The retained 30-frame graph makes concurrent graph construction
-            // unnecessary after the first crop. Building two first-use Metal ML
-            // graphs concurrently is also unstable in the macOS 27 beta runtime.
-            let regionConcurrency = 1
+            let batchModelsURL = ProcessInfo.processInfo.environment[
+                "JASNA_BATCH2_MODELS_DIR"
+            ].map { URL(fileURLWithPath: $0, isDirectory: true) }.flatMap { candidate in
+                FileManager.default.fileExists(
+                    atPath: candidate.appendingPathComponent(
+                        "feature_extract.mtlpackage"
+                    ).path
+                ) ? candidate : nil
+            }
+            // Keep construction serial: two simultaneous first-use Metal ML
+            // graphs are unstable in the macOS 27 beta. A fixed-batch graph can
+            // still restore two compatible crops in one command buffer.
+            let regionBatchSize = batchModelsURL == nil ? 1 : 2
             report(
                 "Window \(windowIndex + 1)/\(windowCount): restoring "
                     + "\(regions.count) tight mosaic crops; cache "
                     + "\(String(format: "%.2f", Double(cacheBytes) / 1_073_741_824)) GiB; "
-                    + "concurrency \(regionConcurrency)"
+                    + "model batch \(regionBatchSize)"
             )
             var nextRegion = completedRegions
             while nextRegion < regions.count {
-                let batchEnd = min(regions.count, nextRegion + regionConcurrency)
+                let batchEnd = min(regions.count, nextRegion + regionBatchSize)
                 let extractionStarted = ContinuousClock.now
                 let work = try (nextRegion..<batchEnd).map { regionIndex in
                     let windowStartFrame = windowIndex * SideBySideVideoPlan.temporalWindowFrames
@@ -631,20 +706,39 @@ extension SideBySideRestoration {
                     )
                 }
                 extractionMilliseconds += elapsedMilliseconds(since: extractionStarted)
-                let batch = RegionRestorationBatch(
-                    device: device,
-                    modelsURL: modelsURL,
-                    weightsURL: weightsURL,
-                    work: work
-                )
-                if work.count == 1 {
-                    batch.execute(0)
-                } else {
-                    DispatchQueue.concurrentPerform(iterations: work.count) { index in
-                        batch.execute(index)
+                let completedWork: [CompletedRegionRestoration]
+                if let batchModelsURL,
+                   work.count == 2,
+                   work[0].inputFrames.count == work[1].inputFrames.count
+                {
+                    do {
+                        completedWork = try restorePreparedRegionBatch(
+                            device: device,
+                            modelsURL: batchModelsURL,
+                            weightsURL: weightsURL,
+                            work: work
+                        )
+                    } catch {
+                        report(
+                            "Window \(windowIndex + 1)/\(windowCount): batch-2 graph failed "
+                                + "(\(error)); retrying both crops independently"
+                        )
+                        completedWork = try restorePreparedRegionsIndividually(
+                            device: device,
+                            modelsURL: modelsURL,
+                            weightsURL: weightsURL,
+                            work: work
+                        )
                     }
+                } else {
+                    completedWork = try restorePreparedRegionsIndividually(
+                        device: device,
+                        modelsURL: modelsURL,
+                        weightsURL: weightsURL,
+                        work: work
+                    )
                 }
-                for restored in try batch.results() {
+                for restored in completedWork {
                     let prepared = restored.prepared
                     let cacheWriteStarted = ContinuousClock.now
                     for frame in 0..<outputCount {
@@ -716,6 +810,85 @@ extension SideBySideRestoration {
                 report("Preserving failed crop cache at \(directory.path)")
             }
             throw error
+        }
+    }
+
+    private static func reportSubdivisionConfiguration(
+        _ configuration: MosaicRegionSubdivisionConfiguration
+    ) {
+        guard configuration.maximumBlendDimension > 0,
+              configuration.splitLimit > 0
+        else {
+            report("Large-region subdivision: disabled")
+            return
+        }
+        report(
+            "Large-region subdivision: max blend "
+                + "\(configuration.maximumBlendDimension)px, overlap "
+                + "\(configuration.overlap)px, up to "
+                + "\(configuration.splitLimit) region(s)/window and "
+                + "\(configuration.maximumAxisCrops) crops/axis; "
+                + "normalized Metal overlap; adaptive parent mask growth "
+                + "\(String(format: "%.3f", configuration.maskGrowthFraction)), feather "
+                + "\(String(format: "%.3f", configuration.maskFeatherFraction)), block halo "
+                + "\(String(format: "%.3f", configuration.blockResidualGrowthFraction)), "
+                + "temporal radius \(configuration.maskTemporalRadius); lower detail "
+                + "\(configuration.detailCropCount)x"
+                + "\(configuration.detailCropDimension)px"
+        )
+    }
+
+    private static func restorePreparedRegionsIndividually(
+        device: MTLDevice,
+        modelsURL: URL,
+        weightsURL: URL,
+        work: [PreparedRegionRestoration]
+    ) throws -> [CompletedRegionRestoration] {
+        let batch = RegionRestorationBatch(
+            device: device, modelsURL: modelsURL, weightsURL: weightsURL, work: work
+        )
+        for index in work.indices { batch.execute(index) }
+        return try batch.results()
+    }
+
+    private static func restorePreparedRegionBatch(
+        device: MTLDevice,
+        modelsURL: URL,
+        weightsURL: URL,
+        work: [PreparedRegionRestoration]
+    ) throws -> [CompletedRegionRestoration] {
+        guard work.count == 2,
+              work[0].inputFrames.count == work[1].inputFrames.count,
+              work.allSatisfy({ item in
+                  item.inputFrames.allSatisfy({ $0.count == tileElements })
+              })
+        else { throw DeformConvError.invalidShape }
+        let started = ContinuousClock.now
+        let batchedFrames = try work[0].inputFrames.indices.map { frame in
+            let values = work.flatMap { $0.inputFrames[frame] }
+            guard values.count == 2 * tileElements else {
+                throw DeformConvError.invalidShape
+            }
+            return values
+        }
+        let restored = try restoreTileFrames(
+            device: device,
+            modelsURL: modelsURL,
+            weightsURL: weightsURL,
+            inputFrames: batchedFrames,
+            maximumFramesPerChunk: batchedFrames.count,
+            batch: 2
+        )
+        let wallMilliseconds = elapsedMilliseconds(since: started)
+        return work.indices.map { sample in
+            let start = sample * tileElements
+            let end = start + tileElements
+            return CompletedRegionRestoration(
+                prepared: work[sample],
+                frames: restored.frames.map { Array($0[start..<end]) },
+                gpuMilliseconds: restored.gpuMilliseconds / Double(work.count),
+                wallMilliseconds: wallMilliseconds / Double(work.count)
+            )
         }
     }
 
@@ -833,7 +1006,8 @@ extension SideBySideRestoration {
         modelsURL: URL,
         weightsURL: URL,
         inputFrames: [[Float16]],
-        maximumFramesPerChunk: Int
+        maximumFramesPerChunk: Int,
+        batch: Int = 1
     ) throws -> (frames: [[Float16]], gpuMilliseconds: Double) {
         let ranges = try temporalChunkRanges(
             frameCount: inputFrames.count,
@@ -855,7 +1029,8 @@ extension SideBySideRestoration {
                     stagedRestoredFrames: [],
                     warmupCount: 0,
                     measurementCount: 1,
-                    collectDiagnostics: false
+                    collectDiagnostics: false,
+                    batch: batch
                 )
             }
             guard result.restoredFrames.count == range.count else {

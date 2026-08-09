@@ -9,6 +9,19 @@ struct MetalMosaicCompositeInput {
     let samples: [MosaicCompositeSample]
 }
 
+private func mosaicCompositeInputsByVisiblePriority(
+    _ inputs: [MetalMosaicCompositeInput]
+) -> [MetalMosaicCompositeInput] {
+    // Composite small regions first. If an unusual or older manifest contains
+    // nested crops, the broader restoration wins instead of leaving a sharp
+    // inner rectangle where the smaller crop overwrote it.
+    inputs.sorted {
+        let leftArea = $0.region.effectiveBlendWidth * $0.region.effectiveBlendHeight
+        let rightArea = $1.region.effectiveBlendWidth * $1.region.effectiveBlendHeight
+        return leftArea < rightArea
+    }
+}
+
 private struct MetalMosaicCompositeParams {
     var frameWidth: UInt32
     var regionX: UInt32
@@ -16,6 +29,18 @@ private struct MetalMosaicCompositeParams {
     var regionWidth: UInt32
     var regionHeight: UInt32
     var modelSize: UInt32
+    var maskWidth: UInt32
+    var maskHeight: UInt32
+    var groupX: UInt32
+    var groupY: UInt32
+    var groupWidth: UInt32
+}
+
+private struct MetalMosaicGroupResolveParams {
+    var groupX: UInt32
+    var groupY: UInt32
+    var groupWidth: UInt32
+    var groupHeight: UInt32
 }
 
 @available(macOS 27.0, *)
@@ -37,6 +62,8 @@ final class MetalMosaicCompositor: @unchecked Sendable {
     private let queue: MTLCommandQueue
     private let pipeline: MTLComputePipelineState
     private let texturePipeline: MTLComputePipelineState
+    private let groupAccumulatePipeline: MTLComputePipelineState
+    private let groupResolvePipeline: MTLComputePipelineState
     private let textureCache: CVMetalTextureCache
     let prefersTextureSurfaces: Bool
     private let textureCacheLock = NSLock()
@@ -55,6 +82,12 @@ final class MetalMosaicCompositor: @unchecked Sendable {
               let textureFunction = library.makeFunction(
                   name: "composite_fisheye_mosaic_delta_texture"
               ),
+              let groupAccumulateFunction = library.makeFunction(
+                  name: "accumulate_fisheye_mosaic_delta"
+              ),
+              let groupResolveFunction = library.makeFunction(
+                  name: "resolve_fisheye_mosaic_delta_group_texture"
+              ),
               let queue = device.makeCommandQueue()
         else { throw DeformConvError.metalUnavailable }
         pipeline = try MetalResourceCache.shared.computePipeline(
@@ -62,6 +95,12 @@ final class MetalMosaicCompositor: @unchecked Sendable {
         )
         texturePipeline = try MetalResourceCache.shared.computePipeline(
             device: device, function: textureFunction
+        )
+        groupAccumulatePipeline = try MetalResourceCache.shared.computePipeline(
+            device: device, function: groupAccumulateFunction
+        )
+        groupResolvePipeline = try MetalResourceCache.shared.computePipeline(
+            device: device, function: groupResolveFunction
         )
         var optionalTextureCache: CVMetalTextureCache?
         guard CVMetalTextureCacheCreate(
@@ -86,13 +125,23 @@ final class MetalMosaicCompositor: @unchecked Sendable {
               CVPixelBufferGetWidth(outputPixelBuffer) == dimensions.width,
               CVPixelBufferGetHeight(outputPixelBuffer) == dimensions.height
         else { throw DeformConvError.invalidShape }
-        if prefersTextureSurfaces, try compositeUsingTextures(
-            basePixelBuffer: basePixelBuffer,
-            outputPixelBuffer: outputPixelBuffer,
-            dimensions: dimensions,
-            inputs: inputs
-        ) {
-            return
+        let requiresGroupedComposite = inputs.contains {
+            $0.region.subdivisionGroup != nil
+        }
+        if prefersTextureSurfaces {
+            if try compositeUsingTextures(
+                basePixelBuffer: basePixelBuffer,
+                outputPixelBuffer: outputPixelBuffer,
+                dimensions: dimensions,
+                inputs: inputs
+            ) {
+                return
+            }
+        }
+        if requiresGroupedComposite {
+            throw DeformConvError.commandFailed(
+                "subdivided mosaic regions require normalized Metal texture compositing"
+            )
         }
         try compositeUsingBufferCopies(
             basePixelBuffer: basePixelBuffer,
@@ -154,7 +203,7 @@ final class MetalMosaicCompositor: @unchecked Sendable {
         let modelSize = SideBySideVideoPlan.modelTileSize
         let modelElements = 3 * modelSize * modelSize
         var heldBuffers = [MTLBuffer]()
-        for input in inputs {
+        for input in mosaicCompositeInputsByVisiblePriority(inputs) {
             guard input.restored.count == modelElements,
                   input.original.count == modelElements,
                   input.samples.count == input.region.width * input.region.height
@@ -168,24 +217,36 @@ final class MetalMosaicCompositor: @unchecked Sendable {
             let sampleBuffer = try cachedSampleBuffer(
                 input: input, dimensions: dimensions
             )
-            guard let restoredBuffer, let originalBuffer else {
+            let mask = input.region.maskData ?? Data([255])
+            let maskBuffer = mask.withUnsafeBytes {
+                device.makeBuffer(
+                    bytes: $0.baseAddress!, length: $0.count, options: .storageModeShared
+                )
+            }
+            guard let restoredBuffer, let originalBuffer, let maskBuffer else {
                 throw DeformConvError.metalUnavailable
             }
-            heldBuffers += [restoredBuffer, originalBuffer]
+            heldBuffers += [restoredBuffer, originalBuffer, maskBuffer]
             var params = MetalMosaicCompositeParams(
                 frameWidth: UInt32(dimensions.width),
                 regionX: UInt32(input.region.x),
                 regionY: UInt32(input.region.y),
                 regionWidth: UInt32(input.region.width),
                 regionHeight: UInt32(input.region.height),
-                modelSize: UInt32(modelSize)
+                modelSize: UInt32(modelSize),
+                maskWidth: UInt32(input.region.maskWidth ?? 1),
+                maskHeight: UInt32(input.region.maskHeight ?? 1),
+                groupX: 0,
+                groupY: 0,
+                groupWidth: 0
             )
             encoder.setBuffer(frameBuffer, offset: 0, index: 0)
             encoder.setBuffer(restoredBuffer, offset: 0, index: 1)
             encoder.setBuffer(originalBuffer, offset: 0, index: 2)
             encoder.setBuffer(sampleBuffer, offset: 0, index: 3)
+            encoder.setBuffer(maskBuffer, offset: 0, index: 4)
             encoder.setBytes(
-                &params, length: MemoryLayout<MetalMosaicCompositeParams>.stride, index: 4
+                &params, length: MemoryLayout<MetalMosaicCompositeParams>.stride, index: 5
             )
             let count = input.region.width * input.region.height
             let threads = min(pipeline.maxTotalThreadsPerThreadgroup, 256)
@@ -246,12 +307,13 @@ final class MetalMosaicCompositor: @unchecked Sendable {
             blitEncoder.endEncoding()
         }
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return false }
-        encoder.setComputePipelineState(texturePipeline)
         encoder.setTexture(destination.texture, index: 0)
         let modelSize = SideBySideVideoPlan.modelTileSize
         let modelElements = 3 * modelSize * modelSize
         var heldBuffers = [MTLBuffer]()
-        for input in inputs {
+        let orderedInputs = mosaicCompositeInputsByVisiblePriority(inputs)
+        encoder.setComputePipelineState(texturePipeline)
+        for input in orderedInputs where input.region.subdivisionGroup == nil {
             guard input.restored.count == modelElements,
                   input.original.count == modelElements,
                   input.samples.count == input.region.width * input.region.height
@@ -265,28 +327,136 @@ final class MetalMosaicCompositor: @unchecked Sendable {
             let sampleBuffer = try cachedSampleBuffer(
                 input: input, dimensions: dimensions
             )
-            guard let restoredBuffer, let originalBuffer else {
+            let mask = input.region.maskData ?? Data([255])
+            let maskBuffer = mask.withUnsafeBytes {
+                device.makeBuffer(
+                    bytes: $0.baseAddress!, length: $0.count, options: .storageModeShared
+                )
+            }
+            guard let restoredBuffer, let originalBuffer, let maskBuffer else {
                 throw DeformConvError.metalUnavailable
             }
-            heldBuffers += [restoredBuffer, originalBuffer]
+            heldBuffers += [restoredBuffer, originalBuffer, maskBuffer]
             var params = MetalMosaicCompositeParams(
                 frameWidth: UInt32(dimensions.width),
                 regionX: UInt32(input.region.x),
                 regionY: UInt32(input.region.y),
                 regionWidth: UInt32(input.region.width),
                 regionHeight: UInt32(input.region.height),
-                modelSize: UInt32(modelSize)
+                modelSize: UInt32(modelSize),
+                maskWidth: UInt32(input.region.maskWidth ?? 1),
+                maskHeight: UInt32(input.region.maskHeight ?? 1),
+                groupX: 0,
+                groupY: 0,
+                groupWidth: 0
             )
             encoder.setBuffer(restoredBuffer, offset: 0, index: 0)
             encoder.setBuffer(originalBuffer, offset: 0, index: 1)
             encoder.setBuffer(sampleBuffer, offset: 0, index: 2)
+            encoder.setBuffer(maskBuffer, offset: 0, index: 3)
             encoder.setBytes(
-                &params, length: MemoryLayout<MetalMosaicCompositeParams>.stride, index: 3
+                &params, length: MemoryLayout<MetalMosaicCompositeParams>.stride, index: 4
             )
             let count = input.region.width * input.region.height
             let threads = min(texturePipeline.maxTotalThreadsPerThreadgroup, 256)
             encoder.dispatchThreads(
                 MTLSize(width: count, height: 1, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: threads, height: 1, depth: 1)
+            )
+            encoder.memoryBarrier(scope: .textures)
+        }
+        let groupedInputs = Dictionary(grouping: orderedInputs.compactMap { input in
+            input.region.subdivisionGroup == nil ? nil : input
+        }) { $0.region.subdivisionGroup! }
+        for groupID in groupedInputs.keys.sorted() {
+            guard let group = groupedInputs[groupID], !group.isEmpty else { continue }
+            let groupX = group.map(\.region.x).min()!
+            let groupY = group.map(\.region.y).min()!
+            let groupRight = group.map { $0.region.x + $0.region.width }.max()!
+            let groupBottom = group.map { $0.region.y + $0.region.height }.max()!
+            let groupWidth = groupRight - groupX
+            let groupHeight = groupBottom - groupY
+            let accumulatorLength = groupWidth * groupHeight * MemoryLayout<SIMD4<Float>>.stride
+            guard let accumulator = device.makeBuffer(
+                length: accumulatorLength, options: .storageModeShared
+            ) else { throw DeformConvError.metalUnavailable }
+            accumulator.contents().initializeMemory(
+                as: UInt8.self, repeating: 0, count: accumulatorLength
+            )
+            heldBuffers.append(accumulator)
+            encoder.setComputePipelineState(groupAccumulatePipeline)
+            for input in group {
+                guard input.restored.count == modelElements,
+                      input.original.count == modelElements,
+                      input.samples.count == input.region.width * input.region.height
+                else { throw DeformConvError.invalidShape }
+                let restoredBuffer = input.restored.withUnsafeBytes {
+                    device.makeBuffer(
+                        bytes: $0.baseAddress!, length: $0.count, options: .storageModeShared
+                    )
+                }
+                let originalBuffer = input.original.withUnsafeBytes {
+                    device.makeBuffer(
+                        bytes: $0.baseAddress!, length: $0.count, options: .storageModeShared
+                    )
+                }
+                let sampleBuffer = try cachedSampleBuffer(input: input, dimensions: dimensions)
+                let mask = input.region.maskData ?? Data([255])
+                let maskBuffer = mask.withUnsafeBytes {
+                    device.makeBuffer(
+                        bytes: $0.baseAddress!, length: $0.count, options: .storageModeShared
+                    )
+                }
+                guard let restoredBuffer, let originalBuffer, let maskBuffer else {
+                    throw DeformConvError.metalUnavailable
+                }
+                heldBuffers += [restoredBuffer, originalBuffer, maskBuffer]
+                var params = MetalMosaicCompositeParams(
+                    frameWidth: UInt32(dimensions.width),
+                    regionX: UInt32(input.region.x),
+                    regionY: UInt32(input.region.y),
+                    regionWidth: UInt32(input.region.width),
+                    regionHeight: UInt32(input.region.height),
+                    modelSize: UInt32(modelSize),
+                    maskWidth: UInt32(input.region.maskWidth ?? 1),
+                    maskHeight: UInt32(input.region.maskHeight ?? 1),
+                    groupX: UInt32(groupX),
+                    groupY: UInt32(groupY),
+                    groupWidth: UInt32(groupWidth)
+                )
+                encoder.setBuffer(accumulator, offset: 0, index: 0)
+                encoder.setBuffer(restoredBuffer, offset: 0, index: 1)
+                encoder.setBuffer(originalBuffer, offset: 0, index: 2)
+                encoder.setBuffer(sampleBuffer, offset: 0, index: 3)
+                encoder.setBuffer(maskBuffer, offset: 0, index: 4)
+                encoder.setBytes(
+                    &params, length: MemoryLayout<MetalMosaicCompositeParams>.stride, index: 5
+                )
+                let count = input.region.width * input.region.height
+                let threads = min(groupAccumulatePipeline.maxTotalThreadsPerThreadgroup, 256)
+                encoder.dispatchThreads(
+                    MTLSize(width: count, height: 1, depth: 1),
+                    threadsPerThreadgroup: MTLSize(width: threads, height: 1, depth: 1)
+                )
+                encoder.memoryBarrier(scope: .buffers)
+            }
+            var resolveParams = MetalMosaicGroupResolveParams(
+                groupX: UInt32(groupX),
+                groupY: UInt32(groupY),
+                groupWidth: UInt32(groupWidth),
+                groupHeight: UInt32(groupHeight)
+            )
+            encoder.setComputePipelineState(groupResolvePipeline)
+            encoder.setTexture(destination.texture, index: 0)
+            encoder.setBuffer(accumulator, offset: 0, index: 0)
+            encoder.setBytes(
+                &resolveParams,
+                length: MemoryLayout<MetalMosaicGroupResolveParams>.stride,
+                index: 1
+            )
+            let threads = min(groupResolvePipeline.maxTotalThreadsPerThreadgroup, 256)
+            encoder.dispatchThreads(
+                MTLSize(width: groupWidth * groupHeight, height: 1, depth: 1),
                 threadsPerThreadgroup: MTLSize(width: threads, height: 1, depth: 1)
             )
             encoder.memoryBarrier(scope: .textures)
@@ -338,7 +508,7 @@ final class MetalMosaicCompositor: @unchecked Sendable {
             blendX: input.region.effectiveBlendX,
             blendY: input.region.effectiveBlendY,
             blendWidth: input.region.effectiveBlendWidth,
-            blendHeight: input.region.effectiveBlendHeight
+            blendHeight: input.region.effectiveBlendHeight,
         )
         sampleBufferLock.lock()
         defer { sampleBufferLock.unlock() }

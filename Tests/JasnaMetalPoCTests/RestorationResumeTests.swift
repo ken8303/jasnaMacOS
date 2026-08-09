@@ -115,3 +115,37 @@ import Testing
         ) == 120
     )
 }
+
+@available(macOS 27.0, *)
+@Test func restorationWindowRangeBoundsEachMetalProcess() throws {
+    #expect(
+        try SideBySideRestoration.restorationWindowRange(
+            windowCount: 30,
+            environment: [:]
+        ) == 0..<30
+    )
+    #expect(
+        try SideBySideRestoration.restorationWindowRange(
+            windowCount: 30,
+            environment: ["JASNA_WINDOW_START": "6", "JASNA_WINDOW_COUNT": "6"]
+        ) == 6..<12
+    )
+    #expect(
+        try SideBySideRestoration.restorationWindowRange(
+            windowCount: 30,
+            environment: ["JASNA_WINDOW_START": "24", "JASNA_WINDOW_COUNT": "20"]
+        ) == 24..<30
+    )
+    #expect(throws: (any Error).self) {
+        try SideBySideRestoration.restorationWindowRange(
+            windowCount: 30,
+            environment: ["JASNA_WINDOW_START": "30", "JASNA_WINDOW_COUNT": "6"]
+        )
+    }
+    #expect(throws: (any Error).self) {
+        try SideBySideRestoration.restorationWindowRange(
+            windowCount: 30,
+            environment: ["JASNA_WINDOW_START": "0", "JASNA_WINDOW_COUNT": "0"]
+        )
+    }
+}

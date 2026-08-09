@@ -8,6 +8,7 @@ private struct FusedSPyNetShape {
     var sourceFlowHeight: UInt32
     var sourceFlowRowStride: UInt32
     var firstLevel: UInt32
+    var batch: UInt32
 }
 
 @available(macOS 27.0, *)
@@ -39,6 +40,7 @@ final class FusedSPyNetClipGraph {
     private let downsampleArguments: [any MTL4ArgumentTable]
     private let pyramidArguments: [any MTL4ArgumentTable]
     private let pairs: [[[FusedSPyNetLevel]]]
+    private let batch: Int
     private let residentBuffers: [MTLBuffer]
     private let transientBuffers: [MTLBuffer]
     private let heaps: [MTLHeap]
@@ -48,10 +50,14 @@ final class FusedSPyNetClipGraph {
         device: MTLDevice,
         modelsURL: URL,
         library: MTLLibrary,
-        sourceFrames: [MTLBuffer]
+        sourceFrames: [MTLBuffer],
+        batch: Int = 1
     ) throws {
         let sizes = [2, 4, 8, 16, 32, 64]
-        guard sourceFrames.count >= 2 else { throw DeformConvError.invalidShape }
+        guard sourceFrames.count >= 2, batch > 0 else {
+            throw DeformConvError.invalidShape
+        }
+        self.batch = batch
         let frameCount = sourceFrames.count
         guard let downsampleFunction = library.makeFunction(
                   name: "jasna_bicubic_downsample_quarter_fp16"
@@ -89,7 +95,7 @@ final class FusedSPyNetClipGraph {
         }
 
         let downsampledFrames = try (0..<frameCount).map { _ in
-            try Support.makeSharedFP16Buffer(device: device, elements: 3 * 64 * 64)
+            try Support.makeSharedFP16Buffer(device: device, elements: batch * 3 * 64 * 64)
         }
         downsampleArguments = try (0..<frameCount).map { frame in
             try Support.makeComputeArguments(
@@ -118,10 +124,10 @@ final class FusedSPyNetClipGraph {
         var tensors = [any MTLTensor]()
         for pairIndex in 0..<(frameCount - 1) {
             let referencePyramid = try sizes.map {
-                try Support.makeSharedFP16Buffer(device: device, elements: 3 * $0 * $0)
+                try Support.makeSharedFP16Buffer(device: device, elements: batch * 3 * $0 * $0)
             }
             let supportPyramid = try sizes.map {
-                try Support.makeSharedFP16Buffer(device: device, elements: 3 * $0 * $0)
+                try Support.makeSharedFP16Buffer(device: device, elements: batch * 3 * $0 * $0)
             }
             var pyramidBindings = [downsampledFrames[pairIndex], downsampledFrames[pairIndex + 1]]
             for level in sizes.indices {
@@ -139,16 +145,16 @@ final class FusedSPyNetClipGraph {
                     let rowStride = max(size, 32)
                     let storagePlane = rowStride * size
                     let (featureTensor, featureBuffer) = try makePaddedTensor(
-                        dimensions: [size, size, 8, 1], rowStride: rowStride
+                        dimensions: [size, size, 8, batch], rowStride: rowStride
                     )
                     let (residualTensor, residualBuffer) = try makePaddedTensor(
-                        dimensions: [size, size, 2, 1], rowStride: rowStride
+                        dimensions: [size, size, 2, batch], rowStride: rowStride
                     )
                     let baseFlow = try Support.makeSharedFP16Buffer(
-                        device: device, elements: 2 * storagePlane
+                        device: device, elements: batch * 2 * storagePlane
                     )
                     let outputFlow = try Support.makeSharedFP16Buffer(
-                        device: device, elements: 2 * storagePlane
+                        device: device, elements: batch * 2 * storagePlane
                     )
                     let previousFlow = level == 0
                         ? zeroFlow : directions[direction][level - 1].outputFlowBuffer
@@ -161,7 +167,8 @@ final class FusedSPyNetClipGraph {
                         sourceFlowWidth: UInt32(level == 0 ? 2 : sizes[level - 1]),
                         sourceFlowHeight: UInt32(level == 0 ? 2 : sizes[level - 1]),
                         sourceFlowRowStride: UInt32(level == 0 ? 32 : max(sizes[level - 1], 32)),
-                        firstLevel: level == 0 ? 1 : 0
+                        firstLevel: level == 0 ? 1 : 0,
+                        batch: UInt32(batch)
                     )
                     let shapeBuffer = try Support.makeConstant(device: device, value: &shape)
                     let pipeline = levelPipelines[level]
@@ -223,7 +230,7 @@ final class FusedSPyNetClipGraph {
         for arguments in downsampleArguments {
             Support.dispatch1D(
                 downsample, pipeline: downsamplePipeline, arguments: arguments,
-                count: 3 * 64 * 64
+                count: batch * 3 * 64 * 64
             )
         }
         downsample.barrier(
@@ -241,7 +248,7 @@ final class FusedSPyNetClipGraph {
             pyramid.setComputePipelineState(pyramidPipeline)
             pyramid.setArgumentTable(arguments)
             pyramid.dispatchThreads(
-                threadsPerGrid: MTLSize(width: 3 * 64 * 64, height: 6, depth: 1),
+                threadsPerGrid: MTLSize(width: 3 * 64 * 64, height: 6, depth: batch),
                 threadsPerThreadgroup: MTLSize(
                     width: min(pyramidPipeline.threadExecutionWidth * 4, 256), height: 1, depth: 1
                 )
@@ -265,7 +272,7 @@ final class FusedSPyNetClipGraph {
                     Support.dispatch1D(
                         prepare, pipeline: preparePipeline,
                         arguments: runtime.prepareArguments,
-                        count: runtime.size * runtime.size
+                        count: batch * runtime.size * runtime.size
                     )
                 }
             }
@@ -300,7 +307,7 @@ final class FusedSPyNetClipGraph {
                     let runtime = direction[level]
                     Support.dispatch1D(
                         add, pipeline: addPipeline, arguments: runtime.addArguments,
-                        count: 2 * runtime.size * runtime.size
+                        count: batch * 2 * runtime.size * runtime.size
                     )
                 }
             }

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import math
 import os
@@ -32,6 +33,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rect-expand", type=float, default=1.5)
     parser.add_argument("--minimum-rect", type=int, default=512)
     parser.add_argument("--temporal-padding", type=float, default=0.75)
+    parser.add_argument("--region-nms-iou", type=float, default=0.45)
+    parser.add_argument(
+        "--mask-expansion",
+        type=float,
+        default=0.10,
+        help="soft segmentation-mask expansion as a fraction of mask resolution",
+    )
+    parser.add_argument(
+        "--mask-size",
+        type=int,
+        default=128,
+        help="square segmentation-mask resolution; power of two from 32 through 256",
+    )
     parser.add_argument("--device", default="auto")
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument(
@@ -148,6 +162,100 @@ def rectangles_overlap(left, right):
     )
 
 
+def intersection_fraction_of_smaller(small, large):
+    """Return how much of small's blend rectangle is covered by large's."""
+    sx, sy = small.get("blendX", small["x"]), small.get("blendY", small["y"])
+    sw = small.get("blendWidth", small["width"])
+    sh = small.get("blendHeight", small["height"])
+    lx, ly = large.get("blendX", large["x"]), large.get("blendY", large["y"])
+    lw = large.get("blendWidth", large["width"])
+    lh = large.get("blendHeight", large["height"])
+    intersection_width = max(0, min(sx + sw, lx + lw) - max(sx, lx))
+    intersection_height = max(0, min(sy + sh, ly + lh) - max(sy, ly))
+    small_area = sw * sh
+    return intersection_width * intersection_height / small_area if small_area > 0 else 0.0
+
+
+def blend_iou(left, right):
+    """Return intersection-over-union for two visible blend rectangles."""
+    lx, ly = left.get("blendX", left["x"]), left.get("blendY", left["y"])
+    lw = left.get("blendWidth", left["width"])
+    lh = left.get("blendHeight", left["height"])
+    rx, ry = right.get("blendX", right["x"]), right.get("blendY", right["y"])
+    rw = right.get("blendWidth", right["width"])
+    rh = right.get("blendHeight", right["height"])
+    intersection = max(0, min(lx + lw, rx + rw) - max(lx, rx)) * max(
+        0, min(ly + lh, ry + rh) - max(ly, ry)
+    )
+    union = lw * lh + rw * rh - intersection
+    return intersection / union if union > 0 else 0.0
+
+
+def suppress_nested_regions(regions, coverage=0.8, area_ratio=1.5):
+    """Drop duplicate inner crops that would overwrite a larger restoration.
+
+    Distinct nearby subjects are preserved. A crop is removed only when one
+    larger region covers its complete active time and nearly all of its blend
+    rectangle.
+    """
+    kept = []
+    for index, small in enumerate(regions):
+        small_area = small.get("blendWidth", small["width"]) * small.get(
+            "blendHeight", small["height"]
+        )
+        nested = False
+        for other_index, large in enumerate(regions):
+            if index == other_index:
+                continue
+            large_area = large.get("blendWidth", large["width"]) * large.get(
+                "blendHeight", large["height"]
+            )
+            if (
+                large["startFrame"] <= small["startFrame"]
+                and large["endFrame"] >= small["endFrame"]
+                and large_area >= area_ratio * small_area
+                and intersection_fraction_of_smaller(small, large) >= coverage
+            ):
+                nested = True
+                break
+        if not nested:
+            kept.append(small)
+    return kept
+
+
+def suppress_duplicate_regions(regions, overlap=0.45):
+    """Apply contained-crop removal, then temporal region NMS.
+
+    The detector can create several tracks for one large moving mosaic. When
+    those tracks are restored independently, their projected deltas form a
+    stack of translucent rectangles. Prefer the most confident track only when
+    it covers the candidate's complete active interval and their visible areas
+    have strong IoU. Distinct subjects and temporal continuations remain.
+    """
+    unnested = suppress_nested_regions(regions)
+    ranked = sorted(
+        enumerate(unnested),
+        key=lambda item: (
+            -(item[1]["endFrame"] - item[1]["startFrame"]),
+            -item[1].get("confidence", 0.0),
+            -item[1].get("blendWidth", item[1]["width"])
+            * item[1].get("blendHeight", item[1]["height"]),
+            item[0],
+        ),
+    )
+    kept = []
+    for original_index, candidate in ranked:
+        duplicate = any(
+            winner["startFrame"] <= candidate["startFrame"]
+            and winner["endFrame"] >= candidate["endFrame"]
+            and blend_iou(candidate, winner) >= overlap
+            for _, winner in kept
+        )
+        if not duplicate:
+            kept.append((original_index, candidate))
+    return [region for _, region in sorted(kept)]
+
+
 def tight_rect(boxes, frame_width, frame_height):
     left = max(0, int(math.floor(min(box[0] for box in boxes))))
     top = max(0, int(math.floor(min(box[1] for box in boxes))))
@@ -183,6 +291,102 @@ def vr_model_crop(boxes, frame_width, frame_height, target_size=256):
     return left, top, right - left, bottom - top
 
 
+def mask_expansion_radius(size, expansion_fraction):
+    return max(1, int(math.ceil(size * expansion_fraction)))
+
+
+def segmentation_alpha_mask(
+    boxes, rectangle, cv2, np, size=64, expansion_fraction=0.10
+):
+    """Rasterize tracked YOLO polygons into a compact soft region mask."""
+    polygons = [box[6] for box in boxes if len(box) > 6 and len(box[6]) >= 3]
+    if not polygons:
+        return None
+    x, y, width, height = rectangle
+    mask = np.zeros((size, size), dtype=np.uint8)
+    for polygon in polygons:
+        points = np.asarray(polygon, dtype=np.float32).copy()
+        points[:, 0] = (points[:, 0] - x) * (size - 1) / max(width - 1, 1)
+        points[:, 1] = (points[:, 1] - y) * (size - 1) / max(height - 1, 1)
+        points = np.rint(np.clip(points, 0, size - 1)).astype(np.int32)
+        cv2.fillPoly(mask, [points], 255)
+    if not np.any(mask):
+        return None
+    # Mosaic encoders operate in large blocks that extend beyond the detector's
+    # semantic contour. Expand proportionally so large VR crops do not retain a
+    # staircase of original blocks, while keeping a rounded boundary.
+    radius = mask_expansion_radius(size, expansion_fraction)
+    kernel_size = radius * 2 + 1
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (kernel_size, kernel_size)
+    )
+    mask = cv2.dilate(mask, kernel, iterations=1)
+    blur_radius = max(2, int(math.ceil(radius / 2)))
+    blur_size = blur_radius * 2 + 1
+    mask = cv2.GaussianBlur(mask, (blur_size, blur_size), radius / 3)
+    return {
+        "maskWidth": size,
+        "maskHeight": size,
+        "maskData": base64.b64encode(mask.tobytes()).decode("ascii"),
+    }
+
+
+def mask_source_boxes(cluster, nearby, start_frame, end_frame):
+    """Ensure padded/interpolated segments inherit the nearest real polygon."""
+    if any(len(box) > 6 and len(box[6]) >= 3 for box in nearby):
+        return nearby
+    polygon_boxes = [box for box in cluster if len(box) > 6 and len(box[6]) >= 3]
+    if not polygon_boxes:
+        return nearby
+    midpoint = (start_frame + end_frame - 1) / 2
+    return [min(polygon_boxes, key=lambda box: abs(float(box[5]) - midpoint))]
+
+
+def mask_keyframe_box_groups(cluster, start_frame, end_frame, stride_frames):
+    """Group real detector polygons into ordered, clamped mask keyframes."""
+    polygon_boxes = [box for box in cluster if len(box) > 6 and len(box[6]) >= 3]
+    selected = [
+        box for box in polygon_boxes
+        if start_frame - stride_frames <= int(box[5]) < end_frame + stride_frames
+    ]
+    if not selected and polygon_boxes:
+        midpoint = (start_frame + end_frame - 1) / 2
+        selected = [min(polygon_boxes, key=lambda box: abs(float(box[5]) - midpoint))]
+    groups = {}
+    for box in selected:
+        frame = min(max(int(box[5]), start_frame), end_frame - 1)
+        groups.setdefault(frame, []).append(box)
+    return sorted(groups.items())
+
+
+def segmentation_mask_keyframes(
+    cluster,
+    rectangle,
+    start_frame,
+    end_frame,
+    stride_frames,
+    cv2,
+    np,
+    size,
+    expansion_fraction,
+):
+    keyframes = []
+    for frame, boxes in mask_keyframe_box_groups(
+        cluster, start_frame, end_frame, stride_frames
+    ):
+        mask = segmentation_alpha_mask(
+            boxes,
+            rectangle,
+            cv2,
+            np,
+            size=size,
+            expansion_fraction=expansion_fraction,
+        )
+        if mask is not None:
+            keyframes.append({"frame": frame, "maskData": mask["maskData"]})
+    return keyframes
+
+
 def choose_device(torch, requested: str) -> str:
     if requested != "auto":
         return requested
@@ -204,16 +408,26 @@ def main() -> int:
         or args.region_duration <= 0
         or args.region_duration > 1.0
         or args.temporal_padding < 0
+        or args.region_nms_iou <= 0
+        or args.region_nms_iou > 1
+        or args.mask_expansion <= 0
+        or args.mask_expansion > 0.25
+        or args.mask_size < 32
+        or args.mask_size > 256
+        or args.mask_size & (args.mask_size - 1) != 0
     ):
         raise SystemExit(
             "sample stride must be positive, region duration must be in (0, 1], "
-            "and temporal padding cannot be negative"
+            "temporal padding cannot be negative, region NMS IoU must be in (0, 1], "
+            "mask expansion must be in (0, 0.25], and mask size must be a power "
+            "of two from 32 through 256"
         )
     if args.batch_size <= 0:
         raise SystemExit("batch size must be positive")
 
     try:
         import cv2
+        import numpy as np
         import torch
         from ultralytics import YOLO
     except ImportError as error:
@@ -292,9 +506,15 @@ def main() -> int:
             if result.boxes is not None:
                 coordinates = result.boxes.xyxy.detach().cpu().tolist()
                 confidences = result.boxes.conf.detach().cpu().tolist()
+                polygons = result.masks.xy if result.masks is not None else []
                 boxes = [
-                    tuple(coords) + (float(conf), frame_index)
-                    for coords, conf in zip(coordinates, confidences)
+                    tuple(coords)
+                    + (
+                        float(conf),
+                        frame_index,
+                        polygons[index].tolist() if index < len(polygons) else [],
+                    )
+                    for index, (coords, conf) in enumerate(zip(coordinates, confidences))
                 ]
             if boxes:
                 first_window = max(0, frame_index - padding_frames) // window_frames
@@ -386,8 +606,7 @@ def main() -> int:
                 confidence = max(box[4] for box in nearby)
                 x, y, region_width, region_height = rectangle
                 blend_x, blend_y, blend_width, blend_height = blend_rectangle
-                regions.append(
-                    {
+                region = {
                         "startFrame": clipped_start,
                         "endFrame": segment_end,
                         "x": x,
@@ -400,7 +619,40 @@ def main() -> int:
                         "blendWidth": blend_width,
                         "blendHeight": blend_height,
                     }
+                mask_boxes = mask_source_boxes(cluster, nearby, clipped_start, segment_end)
+                mask = segmentation_alpha_mask(
+                    mask_boxes,
+                    rectangle,
+                    cv2,
+                    np,
+                    size=args.mask_size,
+                    expansion_fraction=args.mask_expansion,
                 )
+                if mask is not None:
+                    region.update(mask)
+                    keyframes = segmentation_mask_keyframes(
+                        cluster,
+                        rectangle,
+                        clipped_start,
+                        segment_end,
+                        stride_frames,
+                        cv2,
+                        np,
+                        size=args.mask_size,
+                        expansion_fraction=args.mask_expansion,
+                    )
+                    if keyframes:
+                        region["maskKeyframes"] = keyframes
+                regions.append(region)
+
+    unsuppressed_region_count = len(regions)
+    regions = suppress_duplicate_regions(regions, overlap=args.region_nms_iou)
+    suppressed_region_count = unsuppressed_region_count - len(regions)
+    masked_region_count = sum("maskData" in region for region in regions)
+    temporal_mask_region_count = sum("maskKeyframes" in region for region in regions)
+    temporal_mask_count = sum(
+        len(region.get("maskKeyframes", [])) for region in regions
+    )
 
     manifest = {
         "version": 1,
@@ -420,6 +672,19 @@ def main() -> int:
         f"Saved {len(regions)} regions across {affected_windows} affected windows "
         f"out of {total_windows} to "
         f"{args.output_manifest}",
+        flush=True,
+    )
+    print(
+        f"Suppressed {suppressed_region_count} nested/overlapping duplicate regions",
+        flush=True,
+    )
+    print(
+        f"Segmentation masks: {masked_region_count}/{len(regions)} regions",
+        flush=True,
+    )
+    print(
+        f"Temporal masks: {temporal_mask_count} keyframes across "
+        f"{temporal_mask_region_count}/{len(regions)} regions",
         flush=True,
     )
     print(

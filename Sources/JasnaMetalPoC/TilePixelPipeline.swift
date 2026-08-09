@@ -134,6 +134,7 @@ struct MosaicCropSamplingMap: Sendable {
             let right = left + region.effectiveBlendWidth - 1
             let top = region.effectiveBlendY
             let bottom = top + region.effectiveBlendHeight - 1
+            let feather = Float(region.recommendedFeather)
             for pixelY in region.y..<(region.y + region.height) {
                 for pixelX in region.x..<(region.x + region.width) {
                     let model = fisheyeTransform.modelCoordinate(
@@ -145,13 +146,13 @@ struct MosaicCropSamplingMap: Sendable {
                     )
                     let alpha: Float
                     if outside > 0 {
-                        alpha = max(0, 0.5 * (1 - Float(outside) / 12))
+                        alpha = max(0, 0.5 * (1 - Float(outside) / feather))
                     } else {
                         let inside = min(
                             min(pixelX - left, right - pixelX),
                             min(pixelY - top, bottom - pixelY)
                         )
-                        alpha = min(1, 0.5 + 0.5 * Float(inside + 1) / 12)
+                        alpha = min(1, 0.5 + 0.5 * Float(inside + 1) / feather)
                     }
                     generatedComposite.append(
                         MosaicCompositeSample(
@@ -428,10 +429,16 @@ struct MosaicRegionFrameAccumulator {
             for pixelX in startX..<endX {
                 let alpha = projection == .fisheye
                     ? Self.expandedFeatherAlpha(
-                        region: region, x: pixelX, y: pixelY, feather: 12
+                        region: region,
+                        x: pixelX,
+                        y: pixelY,
+                        feather: region.recommendedFeather
                     )
                     : region.featherAlpha(x: pixelX, y: pixelY, feather: 12)
-                guard alpha > 0 else { continue }
+                let maskedAlpha = alpha * region.segmentationMaskAlpha(
+                    x: pixelX, y: pixelY
+                )
+                guard maskedAlpha > 0 else { continue }
                 let model = fisheyeTransform?.modelCoordinate(
                     pixelX: pixelX, pixelY: pixelY
                 ) ?? rawTransform.modelCoordinate(pixelX: pixelX, pixelY: pixelY)
@@ -452,12 +459,14 @@ struct MosaicRegionFrameAccumulator {
                 let red = restored(0, base: baseRed)
                 let green = restored(plane, base: baseGreen)
                 let blue = restored(2 * plane, base: baseBlue)
-                bytes[destination] = Self.blend(base: bytes[destination], restored: blue, alpha: alpha)
+                bytes[destination] = Self.blend(
+                    base: bytes[destination], restored: blue, alpha: maskedAlpha
+                )
                 bytes[destination + 1] = Self.blend(
-                    base: bytes[destination + 1], restored: green, alpha: alpha
+                    base: bytes[destination + 1], restored: green, alpha: maskedAlpha
                 )
                 bytes[destination + 2] = Self.blend(
-                    base: bytes[destination + 2], restored: red, alpha: alpha
+                    base: bytes[destination + 2], restored: red, alpha: maskedAlpha
                 )
             }
         }

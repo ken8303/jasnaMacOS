@@ -1,3 +1,4 @@
+import Foundation
 import Testing
 @testable import JasnaMetalPoC
 
@@ -54,6 +55,83 @@ import Testing
     #expect(region.featherAlpha(x: 99, y: 250, feather: 12) == 0)
     #expect(region.featherAlpha(x: 100, y: 250, feather: 12) > 0)
     #expect(region.featherAlpha(x: 150, y: 250, feather: 12) == 1)
+}
+
+@Test func largeMosaicRegionsUseAProportionallyWiderFeather() {
+    let small = MosaicRegion(
+        startFrame: 0, endFrame: 30, x: 0, y: 0,
+        width: 256, height: 256, confidence: 1
+    )
+    let large = MosaicRegion(
+        startFrame: 0, endFrame: 30, x: 0, y: 0,
+        width: 1_600, height: 1_300, confidence: 1
+    )
+    let huge = MosaicRegion(
+        startFrame: 0, endFrame: 30, x: 0, y: 0,
+        width: 4_096, height: 4_096, confidence: 1
+    )
+
+    #expect(small.recommendedFeather == 12)
+    #expect(large.recommendedFeather == 50)
+    #expect(huge.recommendedFeather == 64)
+}
+
+@Test func mosaicRegionBilinearlySamplesItsSegmentationMask() {
+    let region = MosaicRegion(
+        startFrame: 0,
+        endFrame: 30,
+        x: 100,
+        y: 200,
+        width: 3,
+        height: 3,
+        confidence: 1,
+        maskWidth: 2,
+        maskHeight: 2,
+        maskData: Data([0, 255, 255, 0])
+    )
+
+    #expect(region.hasSegmentationMask)
+    #expect(region.segmentationMaskAlpha(x: 100, y: 200) == 0)
+    #expect(region.segmentationMaskAlpha(x: 102, y: 200) == 1)
+    #expect(abs(region.segmentationMaskAlpha(x: 101, y: 201) - 0.5) < 0.001)
+}
+
+@Test func mosaicRegionWithoutMaskUsesLegacyOpaqueFallback() {
+    let region = MosaicRegion(
+        startFrame: 0, endFrame: 30, x: 0, y: 0,
+        width: 256, height: 256, confidence: 1
+    )
+
+    #expect(!region.hasSegmentationMask)
+    #expect(region.segmentationMaskAlpha(x: 128, y: 128) == 1)
+}
+
+@Test func mosaicRegionInterpolatesTemporalMasksForEachFrame() {
+    let region = MosaicRegion(
+        startFrame: 0,
+        endFrame: 30,
+        x: 0,
+        y: 0,
+        width: 2,
+        height: 2,
+        confidence: 1,
+        maskWidth: 2,
+        maskHeight: 2,
+        maskData: Data(repeating: 255, count: 4),
+        maskKeyframes: [
+            MosaicMaskKeyframe(frame: 3, maskData: Data(repeating: 0, count: 4)),
+            MosaicMaskKeyframe(frame: 9, maskData: Data(repeating: 240, count: 4)),
+        ]
+    )
+
+    let before = region.resolvingSegmentationMask(at: 0)
+    let middle = region.resolvingSegmentationMask(at: 6)
+    let after = region.resolvingSegmentationMask(at: 20)
+
+    #expect(before.maskData == Data(repeating: 0, count: 4))
+    #expect(middle.maskData == Data(repeating: 120, count: 4))
+    #expect(after.maskData == Data(repeating: 240, count: 4))
+    #expect(middle.maskKeyframes == nil)
 }
 
 @available(macOS 27.0, *)

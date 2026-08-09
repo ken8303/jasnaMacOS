@@ -12,6 +12,11 @@ MODEL_PATH="$ROOT_DIR/Models/MosaicDetection/lada_vr_mosaic_detection_model_v2_f
 DETECT_BATCH_SIZE="${JASNA_DETECT_BATCH_SIZE:-2}"
 DETECT_DECODE_MODE="${JASNA_DETECT_DECODE_MODE:-sequential}"
 REGION_DURATION="${JASNA_REGION_DURATION:-1.0}"
+DETECT_CONFIDENCE="${JASNA_DETECT_CONFIDENCE:-0.15}"
+TEMPORAL_PADDING="${JASNA_TEMPORAL_PADDING:-1.0}"
+REGION_NMS_IOU="${JASNA_REGION_NMS_IOU:-0.45}"
+MASK_EXPANSION="${JASNA_MASK_EXPANSION:-0.10}"
+MASK_SIZE="${JASNA_MASK_SIZE:-128}"
 
 [[ "$DETECT_BATCH_SIZE" =~ ^[1-9][0-9]*$ ]] || {
   echo "error: JASNA_DETECT_BATCH_SIZE must be a positive integer" >&2
@@ -19,6 +24,32 @@ REGION_DURATION="${JASNA_REGION_DURATION:-1.0}"
 }
 [[ "$DETECT_DECODE_MODE" == "sequential" || "$DETECT_DECODE_MODE" == "seek" ]] || {
   echo "error: JASNA_DETECT_DECODE_MODE must be sequential or seek" >&2
+  exit 1
+}
+/usr/bin/awk -v value="$DETECT_CONFIDENCE" \
+  'BEGIN { exit !(value ~ /^[0-9]+([.][0-9]+)?$/ && value > 0 && value <= 1) }' || {
+  echo "error: JASNA_DETECT_CONFIDENCE must be greater than 0 and at most 1" >&2
+  exit 1
+}
+/usr/bin/awk -v value="$TEMPORAL_PADDING" \
+  'BEGIN { exit !(value ~ /^[0-9]+([.][0-9]+)?$/ && value >= 0) }' || {
+  echo "error: JASNA_TEMPORAL_PADDING must be zero or greater" >&2
+  exit 1
+}
+/usr/bin/awk -v value="$REGION_NMS_IOU" \
+  'BEGIN { exit !(value ~ /^[0-9]+([.][0-9]+)?$/ && value > 0 && value <= 1) }' || {
+  echo "error: JASNA_REGION_NMS_IOU must be greater than 0 and at most 1" >&2
+  exit 1
+}
+/usr/bin/awk -v value="$MASK_EXPANSION" \
+  'BEGIN { exit !(value ~ /^[0-9]+([.][0-9]+)?$/ && value > 0 && value <= 0.25) }' || {
+  echo "error: JASNA_MASK_EXPANSION must be greater than 0 and at most 0.25" >&2
+  exit 1
+}
+[[ "$MASK_SIZE" =~ ^[0-9]+$ ]] \
+  && (( MASK_SIZE >= 32 && MASK_SIZE <= 256 )) \
+  && (( (MASK_SIZE & (MASK_SIZE - 1)) == 0 )) || {
+  echo "error: JASNA_MASK_SIZE must be a power of two from 32 through 256" >&2
   exit 1
 }
 
@@ -32,4 +63,9 @@ REGION_DURATION="${JASNA_REGION_DURATION:-1.0}"
   "$1" "$2" --model "$MODEL_PATH" \
   --batch-size "$DETECT_BATCH_SIZE" \
   --decode-mode "$DETECT_DECODE_MODE" \
-  --region-duration "$REGION_DURATION"
+  --region-duration "$REGION_DURATION" \
+  --confidence "$DETECT_CONFIDENCE" \
+  --temporal-padding "$TEMPORAL_PADDING" \
+  --region-nms-iou "$REGION_NMS_IOU" \
+  --mask-expansion "$MASK_EXPANSION" \
+  --mask-size "$MASK_SIZE"

@@ -83,7 +83,7 @@ extension SideBySideRestoration {
                             : nil
                         compositeInputs.append(
                             MetalMosaicCompositeInput(
-                                region: region,
+                                region: region.resolvingSegmentationMask(at: absoluteFrame),
                                 restored: values,
                                 original: original ?? [],
                                 samples: samplingMaps[regionIndex].compositeSamples
@@ -505,8 +505,9 @@ extension SideBySideRestoration {
             rightRegions: [MosaicRegion],
             leftSamplingMaps: [MosaicCropSamplingMap],
             rightSamplingMaps: [MosaicCropSamplingMap],
-            startFrame: Int,
-            progressStartFrame: Int,
+            presentationStartFrame: Int,
+            absoluteStartFrame: Int,
+            progressFrameCount: Int,
             plan: SideBySideVideoPlan,
             projection: VRMosaicProjection
         ) async throws {
@@ -538,7 +539,7 @@ extension SideBySideRestoration {
                 guard status == kCVReturnSuccess, let outputBuffer = optionalOutput else {
                     throw DeformConvError.commandFailed("failed allocating direct SBS frame")
                 }
-                let absoluteFrame = progressStartFrame + localFrame
+                let absoluteFrame = absoluteStartFrame + localFrame
                 let leftInputs = try Self.readCompositeInputs(
                     cacheURL: leftCacheURLs[localFrame],
                     baseFrame: leftBaseFrames[localFrame],
@@ -593,7 +594,7 @@ extension SideBySideRestoration {
                     CVBufferSetAttachments(outputBuffer, attachments, .shouldPropagate)
                 }
                 let presentationTime = CMTime(
-                    value: CMTimeValue(startFrame + localFrame), timescale: 30
+                    value: CMTimeValue(presentationStartFrame + localFrame), timescale: 30
                 )
                 guard adaptor.append(outputBuffer, withPresentationTime: presentationTime) else {
                     throw writer.error
@@ -601,7 +602,7 @@ extension SideBySideRestoration {
                 }
                 report(
                     "Queued direct SBS frame \(absoluteFrame + 1)/"
-                        + "\(plan.frameRate.outputFrameCount); composite "
+                        + "\(progressFrameCount); composite "
                         + "\(String(format: "%.3f", SideBySideRestoration.elapsedMilliseconds(since: frameStarted))) ms"
                 )
             }
@@ -633,7 +634,10 @@ extension SideBySideRestoration {
                 _ = restored.withUnsafeMutableBytes { data.copyBytes(to: $0) }
                 let original = try samplingMaps[index].extractPlanarRGB(from: baseFrame)
                 result.append(MetalMosaicCompositeInput(
-                    region: translated(region, xOffset: xOffset),
+                    region: translated(
+                        region.resolvingSegmentationMask(at: absoluteFrame),
+                        xOffset: xOffset
+                    ),
                     restored: restored,
                     original: original,
                     samples: samplingMaps[index].compositeSamples
@@ -655,7 +659,14 @@ extension SideBySideRestoration {
                 blendX: region.blendX.map { $0 + xOffset },
                 blendY: region.blendY,
                 blendWidth: region.blendWidth,
-                blendHeight: region.blendHeight
+                blendHeight: region.blendHeight,
+                maskWidth: region.maskWidth,
+                maskHeight: region.maskHeight,
+                maskData: region.maskData,
+                maskKeyframes: region.maskKeyframes,
+                subdivisionGroup: region.subdivisionGroup.map {
+                    xOffset == 0 ? $0 : $0 + 1_000_000
+                }
             )
         }
 

@@ -22,6 +22,7 @@ struct ThreeFramePrepareShape {
     var width: UInt32 = 64
     var height: UInt32 = 64
     var hasSecondOrder: UInt32
+    var batch: UInt32 = 1
 }
 
 @available(macOS 27.0, *)

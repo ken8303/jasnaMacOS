@@ -4,10 +4,15 @@ set -euo pipefail
 usage() {
   echo "usage: $0 INPUT_SBS_VIDEO OUTPUT_SBS_VIDEO [START_TIME]" >&2
   echo "example: $0 input.mp4 restored-test.mov 00:12:00" >&2
-  echo "optional: JASNA_TEST_SECONDS=30 (maximum 300)" >&2
+  echo "optional: JASNA_TEST_SECONDS=30 (1-300, or full)" >&2
   echo "          JASNA_ENCODER_WINDOWS_PER_SEGMENT=120" >&2
+  echo "          JASNA_METAL_WINDOWS_PER_PROCESS=6 (releases Metal memory between parts)" >&2
   echo "          JASNA_EYE_BITRATE=20000000 JASNA_VR_BITRATE=40000000" >&2
   echo "          JASNA_DIRECT_SBS_OUTPUT=1 (set 0 for the legacy three-encode path)" >&2
+  echo "          JASNA_LARGE_REGION_MAX_BLEND=768 JASNA_LARGE_REGION_OVERLAP=96" >&2
+  echo "          JASNA_LARGE_REGION_MASK_GROWTH=0.05 JASNA_LARGE_REGION_MASK_FEATHER=0.025" >&2
+  echo "          JASNA_LARGE_REGION_BLOCK_GROWTH=0.04 JASNA_LARGE_REGION_MASK_TEMPORAL_RADIUS=1" >&2
+  echo "          JASNA_LARGE_REGION_DETAIL_CROPS=1 JASNA_LARGE_REGION_DETAIL_DIMENSION=576" >&2
   exit 2
 }
 
@@ -23,6 +28,7 @@ VR_BITRATE="${JASNA_VR_BITRATE:-40000000}"
 FAST_ENCODE="${JASNA_FAST_ENCODE:-1}"
 FAST_SOURCE_COPY="${JASNA_FAST_SOURCE_COPY:-auto}"
 DIRECT_SBS_OUTPUT="${JASNA_DIRECT_SBS_OUTPUT:-1}"
+METAL_WINDOWS_PER_PROCESS="${JASNA_METAL_WINDOWS_PER_PROCESS:-6}"
 
 [[ -f "$INPUT_PATH" ]] || {
   echo "error: input video not found: $INPUT_PATH" >&2
@@ -36,13 +42,24 @@ DIRECT_SBS_OUTPUT="${JASNA_DIRECT_SBS_OUTPUT:-1}"
   echo "error: output path ends with whitespace: '$OUTPUT_PATH'" >&2
   exit 1
 }
-[[ "$TEST_SECONDS" =~ ^[0-9]+$ ]] && (( TEST_SECONDS >= 1 && TEST_SECONDS <= 300 )) || {
-  echo "error: JASNA_TEST_SECONDS must be an integer from 1 to 300" >&2
-  exit 1
-}
-TEST_SEGMENT_SECONDS="$TEST_SECONDS"
-(( TEST_SEGMENT_SECONDS < 30 )) && TEST_SEGMENT_SECONDS=30
-(( TEST_SEGMENT_SECONDS > 120 )) && TEST_SEGMENT_SECONDS=120
+if [[ "$TEST_SECONDS" == "full" ]]; then
+  TEST_SEGMENT_SECONDS=120
+  DURATION_ARGS=()
+  RUN_DESCRIPTION="full source"
+  ARTIFACT_TAG="jasna-vr-full-v15"
+else
+  [[ "$TEST_SECONDS" =~ ^[0-9]+$ ]] \
+    && (( TEST_SECONDS >= 1 && TEST_SECONDS <= 300 )) || {
+      echo "error: JASNA_TEST_SECONDS must be an integer from 1 to 300, or full" >&2
+      exit 1
+    }
+  TEST_SEGMENT_SECONDS="$TEST_SECONDS"
+  (( TEST_SEGMENT_SECONDS < 30 )) && TEST_SEGMENT_SECONDS=30
+  (( TEST_SEGMENT_SECONDS > 120 )) && TEST_SEGMENT_SECONDS=120
+  DURATION_ARGS=(-t "$TEST_SECONDS")
+  RUN_DESCRIPTION="$TEST_SECONDS seconds"
+  ARTIFACT_TAG="jasna-vr30-v15"
+fi
 [[ "$EYE_BITRATE" =~ ^[0-9]+$ && "$VR_BITRATE" =~ ^[0-9]+$ ]] || {
   echo "error: JASNA_EYE_BITRATE and JASNA_VR_BITRATE must be integer bit rates" >&2
   exit 1
@@ -59,6 +76,11 @@ TEST_SEGMENT_SECONDS="$TEST_SECONDS"
   echo "error: JASNA_DIRECT_SBS_OUTPUT must be 0 or 1" >&2
   exit 1
 }
+[[ "$METAL_WINDOWS_PER_PROCESS" =~ ^[0-9]+$ ]] \
+  && (( METAL_WINDOWS_PER_PROCESS >= 1 && METAL_WINDOWS_PER_PROCESS <= 30 )) || {
+    echo "error: JASNA_METAL_WINDOWS_PER_PROCESS must be an integer from 1 to 30" >&2
+    exit 1
+  }
 
 ENCODER_SPEED_ARGS=()
 if [[ "$FAST_ENCODE" == "1" ]]; then
@@ -89,7 +111,7 @@ OUTPUT_PATH="$(cd "$(dirname "$OUTPUT_PATH")" && pwd)/$(basename "$OUTPUT_PATH")
 OUTPUT_DIR="$(dirname "$OUTPUT_PATH")"
 OUTPUT_NAME="$(basename "$OUTPUT_PATH")"
 OUTPUT_STEM="${OUTPUT_NAME%.*}"
-WORK_DIR="$OUTPUT_DIR/${OUTPUT_STEM}.jasna-vr30-work"
+WORK_DIR="$OUTPUT_DIR/${OUTPUT_STEM}.${ARTIFACT_TAG}-work"
 SOURCE_DIR="$WORK_DIR/source"
 RUN_CONFIG_PATH="$WORK_DIR/run-config.txt"
 TEST_INPUT="$SOURCE_DIR/test-sbs-30fps.mov"
@@ -98,7 +120,7 @@ TEST_INPUT_DONE="$SOURCE_DIR/test-sbs-30fps.done"
 LEFT_OUTPUT="$WORK_DIR/left-restored.mov"
 RIGHT_OUTPUT="$WORK_DIR/right-restored.mov"
 FINAL_TEMP="$WORK_DIR/.joined-sbs-writing.${OUTPUT_NAME##*.}"
-LOG_PATH="$OUTPUT_DIR/${OUTPUT_STEM}.jasna-vr30.log"
+LOG_PATH="$OUTPUT_DIR/${OUTPUT_STEM}.${ARTIFACT_TAG}.log"
 SHARED_BATCH_PATH="$WORK_DIR/pending-eye-restorations.tsv"
 DIRECT_SEGMENT_DIR="$WORK_DIR/direct-sbs-segments"
 DIRECT_CONCAT_PATH="$WORK_DIR/direct-sbs-concat.txt"
@@ -112,6 +134,23 @@ vr_bitrate=$VR_BITRATE
 fast_encode=$FAST_ENCODE
 fast_source_copy=$FAST_SOURCE_COPY
 direct_sbs_output=$DIRECT_SBS_OUTPUT
+quality_profile=lower-detail-crop-v15
+detect_confidence=${JASNA_DETECT_CONFIDENCE:-0.15}
+temporal_padding=${JASNA_TEMPORAL_PADDING:-1.0}
+region_nms_iou=${JASNA_REGION_NMS_IOU:-0.45}
+mask_expansion=${JASNA_MASK_EXPANSION:-0.10}
+mask_size=${JASNA_MASK_SIZE:-128}
+region_duration=${JASNA_REGION_DURATION:-1.0}
+large_region_max_blend=${JASNA_LARGE_REGION_MAX_BLEND:-768}
+large_region_overlap=${JASNA_LARGE_REGION_OVERLAP:-96}
+large_region_split_limit=${JASNA_LARGE_REGION_SPLIT_LIMIT:-1}
+large_region_max_axis_crops=${JASNA_LARGE_REGION_MAX_AXIS_CROPS:-3}
+large_region_mask_growth=${JASNA_LARGE_REGION_MASK_GROWTH:-0.05}
+large_region_mask_feather=${JASNA_LARGE_REGION_MASK_FEATHER:-0.025}
+large_region_block_growth=${JASNA_LARGE_REGION_BLOCK_GROWTH:-0.04}
+large_region_mask_temporal_radius=${JASNA_LARGE_REGION_MASK_TEMPORAL_RADIUS:-1}
+large_region_detail_crops=${JASNA_LARGE_REGION_DETAIL_CROPS:-1}
+large_region_detail_dimension=${JASNA_LARGE_REGION_DETAIL_DIMENSION:-576}
 projection=fisheye"
 if [[ -s "$RUN_CONFIG_PATH" && "$(<"$RUN_CONFIG_PATH")" != "$RUN_CONFIG" ]]; then
   echo "error: this output path belongs to a different test configuration" >&2
@@ -127,7 +166,7 @@ echo
 echo "===== Jasna sparse VR test $(date -u '+%Y-%m-%dT%H:%M:%SZ') ====="
 echo "Input:       $INPUT_PATH"
 echo "Start:       $START_TIME"
-echo "Test length: $TEST_SECONDS seconds"
+echo "Selected range: $RUN_DESCRIPTION"
 echo "Output:      $OUTPUT_PATH"
 echo "Work dir:    $WORK_DIR"
 echo "Log:         $LOG_PATH"
@@ -199,7 +238,7 @@ if [[ ! -f "$TEST_INPUT_DONE" ]]; then
       -hide_banner \
       -ss "$START_TIME" \
       -i "$INPUT_PATH" \
-      -t "$TEST_SECONDS" \
+      ${DURATION_ARGS[@]+"${DURATION_ARGS[@]}"} \
       -map '0:v:0' \
       -map '0:a?' \
       -c copy \
@@ -212,7 +251,7 @@ if [[ ! -f "$TEST_INPUT_DONE" ]]; then
       -hide_banner \
       -ss "$START_TIME" \
       -i "$INPUT_PATH" \
-      -t "$TEST_SECONDS" \
+      ${DURATION_ARGS[@]+"${DURATION_ARGS[@]}"} \
       -map '0:v:0' \
       -map '0:a?' \
       -vf fps=30 \
@@ -360,26 +399,49 @@ if [[ "$DIRECT_SBS_OUTPUT" == "1" ]]; then
     exit 1
   }
   mkdir -p "$DIRECT_SEGMENT_DIR"
-  DIRECT_BATCH_ARGS=()
   DIRECT_SEGMENTS=()
+  echo "Metal process isolation: at most $METAL_WINDOWS_PER_PROCESS temporal windows/process"
   for ((JOB_INDEX = 0; JOB_INDEX < ${#LEFT_JOB_INPUTS[@]}; JOB_INDEX++)); do
-    DIRECT_SEGMENT="$DIRECT_SEGMENT_DIR/$(printf 'segment-%05d.mov' "$JOB_INDEX")"
-    DIRECT_SEGMENTS+=("$DIRECT_SEGMENT")
-    DIRECT_BATCH_ARGS+=(
-      "${LEFT_JOB_INPUTS[$JOB_INDEX]}"
-      "${RIGHT_JOB_INPUTS[$JOB_INDEX]}"
-      "$DIRECT_SEGMENT"
-      "${LEFT_JOB_MANIFESTS[$JOB_INDEX]}"
-      "${RIGHT_JOB_MANIFESTS[$JOB_INDEX]}"
-      "${LEFT_JOB_CACHES[$JOB_INDEX]}"
-      "${RIGHT_JOB_CACHES[$JOB_INDEX]}"
-    )
+    JOB_FRAME_COUNT="$(
+      "$FFPROBE_PATH" -v error -select_streams v:0 \
+        -show_entries stream=nb_frames -of default=noprint_wrappers=1:nokey=1 \
+        "${LEFT_JOB_INPUTS[$JOB_INDEX]}"
+    )"
+    if [[ ! "$JOB_FRAME_COUNT" =~ ^[0-9]+$ ]]; then
+      JOB_DURATION="$(video_duration "${LEFT_JOB_INPUTS[$JOB_INDEX]}")"
+      JOB_FRAME_COUNT="$(
+        /usr/bin/awk -v duration="$JOB_DURATION" \
+          'BEGIN { printf "%d\n", int(duration * 30 + 0.5) }'
+      )"
+    fi
+    JOB_WINDOW_COUNT=$(( (JOB_FRAME_COUNT + 29) / 30 ))
+    for ((WINDOW_START = 0; WINDOW_START < JOB_WINDOW_COUNT; \
+      WINDOW_START += METAL_WINDOWS_PER_PROCESS)); do
+      WINDOW_COUNT=$((JOB_WINDOW_COUNT - WINDOW_START))
+      (( WINDOW_COUNT > METAL_WINDOWS_PER_PROCESS )) \
+        && WINDOW_COUNT="$METAL_WINDOWS_PER_PROCESS"
+      WINDOW_END=$((WINDOW_START + WINDOW_COUNT))
+      DIRECT_SEGMENT="$DIRECT_SEGMENT_DIR/$(
+        printf 'segment-%05d-windows-%05d-%05d.mov' \
+          "$JOB_INDEX" "$WINDOW_START" "$WINDOW_END"
+      )"
+      DIRECT_SEGMENTS+=("$DIRECT_SEGMENT")
+      echo "Restoring source segment $((JOB_INDEX + 1))/${#LEFT_JOB_INPUTS[@]}, windows $((WINDOW_START + 1))-$WINDOW_END/$JOB_WINDOW_COUNT"
+      JASNA_WINDOW_START="$WINDOW_START" \
+      JASNA_WINDOW_COUNT="$WINDOW_COUNT" \
+      JASNA_VIDEO_BITRATE="$VR_BITRATE" \
+      JASNA_VR_PROJECTION=fisheye \
+        "$ROOT_DIR/script/build_and_run.sh" --restore-stereo-sparse-batch \
+          "${LEFT_JOB_INPUTS[$JOB_INDEX]}" \
+          "${RIGHT_JOB_INPUTS[$JOB_INDEX]}" \
+          "$DIRECT_SEGMENT" \
+          "${LEFT_JOB_MANIFESTS[$JOB_INDEX]}" \
+          "${RIGHT_JOB_MANIFESTS[$JOB_INDEX]}" \
+          "${LEFT_JOB_CACHES[$JOB_INDEX]}" \
+          "${RIGHT_JOB_CACHES[$JOB_INDEX]}"
+    done
   done
-  echo "Restoring ${#DIRECT_SEGMENTS[@]} paired segment(s) directly to 8K SBS"
-  JASNA_VIDEO_BITRATE="$VR_BITRATE" \
-  JASNA_VR_PROJECTION=fisheye \
-    "$ROOT_DIR/script/build_and_run.sh" --restore-stereo-sparse-batch \
-      "${DIRECT_BATCH_ARGS[@]}"
+  echo "Restored ${#DIRECT_SEGMENTS[@]} isolated 8K SBS part(s)"
 
   : > "$DIRECT_CONCAT_PATH"
   for DIRECT_SEGMENT in "${DIRECT_SEGMENTS[@]}"; do
@@ -423,7 +485,7 @@ if [[ "$DIRECT_SBS_OUTPUT" == "1" ]]; then
   FINAL_INFO="$("$FFPROBE_PATH" -v error -select_streams v:0 \
     -show_entries stream=codec_name,width,height,avg_frame_rate,nb_frames \
     -show_entries format=duration,size -of default=noprint_wrappers=1 "$OUTPUT_PATH")"
-  echo "Sparse ${TEST_SECONDS}-second direct SBS VR test: PASS"
+  echo "Sparse SBS VR restoration ($RUN_DESCRIPTION): PASS"
   echo "$FINAL_INFO"
   echo "Output: $OUTPUT_PATH"
   echo "Log:    $LOG_PATH"
@@ -507,7 +569,7 @@ FINAL_INFO="$("$FFPROBE_PATH" \
   -of default=noprint_wrappers=1 \
   "$OUTPUT_PATH")"
 
-echo "Sparse ${TEST_SECONDS}-second VR test: PASS"
+echo "Sparse VR restoration ($RUN_DESCRIPTION): PASS"
 echo "$FINAL_INFO"
 echo "Output:   $OUTPUT_PATH"
 echo "Left eye: $LEFT_OUTPUT"

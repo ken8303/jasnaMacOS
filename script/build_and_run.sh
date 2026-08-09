@@ -59,6 +59,10 @@ case "$MODE" in
     RESTORE_OUTPUT_NAME="$(basename "$RESTORE_OUTPUT_PATH")"
     RESTORE_OUTPUT_STEM="${RESTORE_OUTPUT_NAME%.*}"
     export JASNA_WORK_DIR="${JASNA_WORK_DIR:-$RESTORE_OUTPUT_DIR/${RESTORE_OUTPUT_STEM}.jasna-work}"
+    if [[ "${JASNA_MODEL_BATCH:-auto}" != "1" \
+          && -d "$ROOT_DIR/Models/MetalMLBatch2/feature_extract.mtlpackage" ]]; then
+      export JASNA_BATCH2_MODELS_DIR="${JASNA_BATCH2_MODELS_DIR:-$ROOT_DIR/Models/MetalMLBatch2}"
+    fi
     JASNA_LOG_PATH="$RESTORE_OUTPUT_DIR/${RESTORE_OUTPUT_STEM}.jasna.log"
     mkdir -p "$JASNA_WORK_DIR"
     exec > >(/usr/bin/tee -a "$JASNA_LOG_PATH") 2>&1
@@ -67,6 +71,11 @@ case "$MODE" in
     echo "Log:      $JASNA_LOG_PATH"
     echo "Work dir: $JASNA_WORK_DIR"
     echo "Output:   $RESTORE_OUTPUT_PATH"
+    if [[ -n "${JASNA_BATCH2_MODELS_DIR:-}" ]]; then
+      echo "Model batch: 2 ($JASNA_BATCH2_MODELS_DIR)"
+    else
+      echo "Model batch: 1"
+    fi
     ;;
 esac
 
