@@ -6,7 +6,7 @@ usage() {
   echo "example: $0 input.mp4 restored-test.mov 00:12:00" >&2
   echo "optional: JASNA_TEST_SECONDS=30 (1-300, or full)" >&2
   echo "          JASNA_ENCODER_WINDOWS_PER_SEGMENT=120" >&2
-  echo "          JASNA_METAL_WINDOWS_PER_PROCESS=6 (releases Metal memory between parts)" >&2
+  echo "          JASNA_METAL_WINDOWS_PER_PROCESS=12 (releases Metal memory between parts)" >&2
   echo "          JASNA_EYE_BITRATE=20000000 JASNA_VR_BITRATE=40000000" >&2
   echo "          JASNA_DIRECT_SBS_OUTPUT=1 (set 0 for the legacy three-encode path)" >&2
   echo "          JASNA_LARGE_REGION_MAX_BLEND=768 JASNA_LARGE_REGION_OVERLAP=96" >&2
@@ -28,7 +28,8 @@ VR_BITRATE="${JASNA_VR_BITRATE:-40000000}"
 FAST_ENCODE="${JASNA_FAST_ENCODE:-1}"
 FAST_SOURCE_COPY="${JASNA_FAST_SOURCE_COPY:-auto}"
 DIRECT_SBS_OUTPUT="${JASNA_DIRECT_SBS_OUTPUT:-1}"
-METAL_WINDOWS_PER_PROCESS="${JASNA_METAL_WINDOWS_PER_PROCESS:-6}"
+METAL_WINDOWS_PER_PROCESS="${JASNA_METAL_WINDOWS_PER_PROCESS:-12}"
+MODEL_BATCH="${JASNA_MODEL_BATCH:-1}"
 
 [[ -f "$INPUT_PATH" ]] || {
   echo "error: input video not found: $INPUT_PATH" >&2
@@ -81,6 +82,11 @@ fi
     echo "error: JASNA_METAL_WINDOWS_PER_PROCESS must be an integer from 1 to 30" >&2
     exit 1
   }
+[[ "$MODEL_BATCH" == "1" || "$MODEL_BATCH" == "2" ]] || {
+  echo "error: JASNA_MODEL_BATCH must be 1 or 2" >&2
+  exit 1
+}
+export JASNA_MODEL_BATCH="$MODEL_BATCH"
 
 ENCODER_SPEED_ARGS=()
 if [[ "$FAST_ENCODE" == "1" ]]; then
@@ -134,6 +140,8 @@ vr_bitrate=$VR_BITRATE
 fast_encode=$FAST_ENCODE
 fast_source_copy=$FAST_SOURCE_COPY
 direct_sbs_output=$DIRECT_SBS_OUTPUT
+model_batch=$MODEL_BATCH
+metal_windows_per_process=$METAL_WINDOWS_PER_PROCESS
 quality_profile=lower-detail-crop-v15
 detect_confidence=${JASNA_DETECT_CONFIDENCE:-0.15}
 temporal_padding=${JASNA_TEMPORAL_PADDING:-1.0}
@@ -173,6 +181,7 @@ echo "Log:         $LOG_PATH"
 echo "Projection:  fisheye"
 echo "Fast encode: $FAST_ENCODE"
 echo "Direct SBS:  $DIRECT_SBS_OUTPUT"
+echo "Model batch: $MODEL_BATCH"
 
 video_duration() {
   "$FFPROBE_PATH" -v error -show_entries format=duration \
@@ -291,6 +300,35 @@ else
 fi
 
 TEST_DURATION="$(video_duration "$TEST_INPUT")"
+EXPECTED_FRAME_COUNT="$(
+  /usr/bin/awk -v duration="$TEST_DURATION" 'BEGIN { printf "%d\n", int(duration * 30 + 0.5) }'
+)"
+
+completed_sbs_output() {
+  local candidate="$1"
+  duration_matches "$candidate" "$TEST_DURATION" || return 1
+  local codec width height frame_rate frame_count extra
+  IFS=, read -r codec width height frame_rate frame_count extra < <(
+    "$FFPROBE_PATH" -v error -select_streams v:0 \
+      -show_entries stream=codec_name,width,height,avg_frame_rate,nb_frames \
+      -of csv=p=0 "$candidate" 2>/dev/null
+  )
+  [[ -z "$extra" \
+    && "$codec" == "hevc" \
+    && "$width" == "$SOURCE_WIDTH" \
+    && "$height" == "$SOURCE_HEIGHT" \
+    && "$frame_count" =~ ^[0-9]+$ ]] || return 1
+  /usr/bin/awk -F/ '
+    NF == 2 && $2 != 0 { rate = $1 / $2 }
+    NF == 1 { rate = $1 }
+    END { exit !(rate >= 29.99 && rate <= 30.01) }
+  ' <<< "$frame_rate" || return 1
+  /usr/bin/awk -v actual="$frame_count" -v expected="$EXPECTED_FRAME_COUNT" '
+    BEGIN { delta = actual - expected; if (delta < 0) delta = -delta; exit !(delta <= 1) }
+  ' || return 1
+  "$FFMPEG_PATH" -v error -i "$candidate" -map '0:v:0' \
+    -frames:v 1 -f null - </dev/null >/dev/null 2>&1
+}
 
 if [[ -z "${JASNA_APP_BINARY:-}" ]]; then
   for CANDIDATE in \
@@ -452,7 +490,7 @@ if [[ "$DIRECT_SBS_OUTPUT" == "1" ]]; then
     ESCAPED_SEGMENT="${DIRECT_SEGMENT//\'/\'\\\'\'}"
     printf "file '%s'\n" "$ESCAPED_SEGMENT" >> "$DIRECT_CONCAT_PATH"
   done
-  if duration_matches "$OUTPUT_PATH" "$TEST_DURATION"; then
+  if completed_sbs_output "$OUTPUT_PATH"; then
     echo "Final direct SBS output already complete"
   else
     if [[ -e "$FINAL_TEMP" ]]; then
@@ -476,8 +514,8 @@ if [[ "$DIRECT_SBS_OUTPUT" == "1" ]]; then
       -shortest \
       -n \
       "$FINAL_TEMP"
-    duration_matches "$FINAL_TEMP" "$TEST_DURATION" || {
-      echo "error: direct SBS output duration does not match the test source" >&2
+    completed_sbs_output "$FINAL_TEMP" || {
+      echo "error: direct SBS output failed codec, dimensions, frame-count, or decode validation" >&2
       exit 1
     }
     mv "$FINAL_TEMP" "$OUTPUT_PATH"
@@ -517,7 +555,7 @@ JASNA_VR_PROJECTION=fisheye \
   "$ROOT_DIR/script/restore_vr_eye_sparse.sh" \
     "$TEST_INPUT" right "$RIGHT_OUTPUT"
 
-if duration_matches "$OUTPUT_PATH" "$TEST_DURATION" \
+if completed_sbs_output "$OUTPUT_PATH" \
     && [[ "$OUTPUT_PATH" -nt "$LEFT_OUTPUT" && "$OUTPUT_PATH" -nt "$RIGHT_OUTPUT" ]]; then
   echo "Stage 4/4: combined SBS output already complete"
 else
@@ -554,8 +592,8 @@ else
     -n \
     "$FINAL_TEMP"
 
-  duration_matches "$FINAL_TEMP" "$TEST_DURATION" || {
-    echo "error: combined output duration does not match the test source" >&2
+  completed_sbs_output "$FINAL_TEMP" || {
+    echo "error: combined output failed codec, dimensions, frame-count, or decode validation" >&2
     exit 1
   }
   mv "$FINAL_TEMP" "$OUTPUT_PATH"

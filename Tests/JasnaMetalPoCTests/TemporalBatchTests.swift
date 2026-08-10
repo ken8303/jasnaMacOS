@@ -2,6 +2,85 @@ import Metal
 import Testing
 @testable import JasnaMetalPoC
 
+@available(macOS 27.0, *)
+@Test func batchTwoFailureRetriesBothCropsIndividuallyInOrder() throws {
+    struct InjectedBatchFailure: Error {}
+
+    let work = [0, 1].map { index in
+        SideBySideRestoration.PreparedRegionRestoration(
+            regionIndex: index,
+            localStart: index,
+            activeFrameCount: 3,
+            inputFrames: [[Float16(index)], [Float16(index + 1)], [Float16(index + 2)]],
+            context: "test crop \(index)"
+        )
+    }
+    var batchAttempts = 0
+    var individualAttempts = 0
+    var reportedFailures = 0
+
+    let restored = try SideBySideRestoration.restorePreparedRegionsWithBatchFallback(
+        work: work,
+        batchRestore: { _ in
+            batchAttempts += 1
+            throw InjectedBatchFailure()
+        },
+        individualRestore: { individualWork in
+            individualAttempts += 1
+            return individualWork.map { item in
+                SideBySideRestoration.CompletedRegionRestoration(
+                    prepared: item,
+                    frames: item.inputFrames,
+                    gpuMilliseconds: Double(item.regionIndex + 1),
+                    wallMilliseconds: Double(item.regionIndex + 2)
+                )
+            }
+        },
+        onBatchFailure: { error in
+            #expect(error is InjectedBatchFailure)
+            reportedFailures += 1
+        }
+    )
+
+    #expect(batchAttempts == 1)
+    #expect(individualAttempts == 1)
+    #expect(reportedFailures == 1)
+    #expect(restored.map(\.prepared.regionIndex) == [0, 1])
+    #expect(restored.map(\.frames) == work.map(\.inputFrames))
+}
+
+@available(macOS 27.0, *)
+@Test func batchTwoCircuitBreakerDisablesOnlyOnce() {
+    let breaker = RestorationBatchCircuitBreaker()
+
+    #expect(!breaker.isDisabled)
+    #expect(breaker.disable())
+    #expect(breaker.isDisabled)
+    #expect(!breaker.disable())
+}
+
+@available(macOS 27.0, *)
+@Test func malformedBatchOutputThrowsBeforeTensorSlicing() throws {
+    let work = [0, 1].map { index in
+        SideBySideRestoration.PreparedRegionRestoration(
+            regionIndex: index,
+            localStart: 0,
+            activeFrameCount: 1,
+            inputFrames: [[Float16(index)]],
+            context: "malformed crop \(index)"
+        )
+    }
+
+    #expect(throws: (any Error).self) {
+        try SideBySideRestoration.splitBatchedRegionFrames(
+            [[Float16(1)]],
+            work: work,
+            gpuMilliseconds: 1,
+            wallMilliseconds: 1
+        )
+    }
+}
+
 @Test func temporalPreparationBatchMatchesIndependentRuns() throws {
     guard #available(macOS 27.0, *), MTLCreateSystemDefaultDevice() != nil else { return }
     let runner = try MetalDeformConv()

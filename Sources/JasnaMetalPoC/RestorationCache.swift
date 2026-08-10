@@ -112,10 +112,11 @@ extension SideBySideRestoration {
 
     static func sparseRegionCacheVariant(
         regions: [MosaicRegion],
-        projection: VRMosaicProjection = .raw
+        projection: VRMosaicProjection = .raw,
+        restorationIdentity: String = ""
     ) -> String {
         var hash: UInt64 = 14_695_981_039_346_656_037
-        for byte in projection.rawValue.utf8 {
+        for byte in "\(projection.rawValue):\(restorationIdentity)".utf8 {
             hash ^= UInt64(byte)
             hash &*= 1_099_511_628_211
         }
@@ -137,7 +138,44 @@ extension SideBySideRestoration {
                 }
             }
         }
-        return String(format: "crop-v3-%@-%016llx", projection.rawValue, hash)
+        return String(format: "crop-v4-%@-%016llx", projection.rawValue, hash)
+    }
+
+    static func restorationCacheIdentity(
+        sourceURLs: [URL],
+        modelsURL: URL,
+        weightsURL: URL
+    ) -> String {
+        var hash: UInt64 = 14_695_981_039_346_656_037
+        let fileManager = FileManager.default
+        let roots = sourceURLs + [modelsURL, weightsURL]
+        var entries = [URL]()
+        for root in roots {
+            entries.append(root.standardizedFileURL)
+            if let enumerator = fileManager.enumerator(
+                at: root,
+                includingPropertiesForKeys: [
+                    .isRegularFileKey, .fileSizeKey, .contentModificationDateKey,
+                ],
+                options: [.skipsHiddenFiles]
+            ) {
+                entries.append(contentsOf: enumerator.compactMap { $0 as? URL })
+            }
+        }
+        for url in entries.sorted(by: { $0.path < $1.path }) {
+            let values = try? url.resourceValues(
+                forKeys: [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey]
+            )
+            guard values?.isRegularFile == true || roots.contains(url) else { continue }
+            let metadata = "\(url.standardizedFileURL.path)\u{0}"
+                + "\(values?.fileSize ?? -1)\u{0}"
+                + "\(values?.contentModificationDate?.timeIntervalSince1970 ?? -1)\u{0}"
+            for byte in metadata.utf8 {
+                hash ^= UInt64(byte)
+                hash &*= 1_099_511_628_211
+            }
+        }
+        return String(format: "%016llx", hash)
     }
 
     static func recoverableTileCount(

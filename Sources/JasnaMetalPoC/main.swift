@@ -1,6 +1,7 @@
 import Foundation
 
 do {
+    defer { RuntimeMemoryTelemetry.reportIfEnabled() }
     try await runJasnaCLI()
 } catch {
     FileHandle.standardError.write(Data("Error: \(error)\n".utf8))

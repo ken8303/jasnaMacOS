@@ -59,12 +59,37 @@ case "$MODE" in
     RESTORE_OUTPUT_NAME="$(basename "$RESTORE_OUTPUT_PATH")"
     RESTORE_OUTPUT_STEM="${RESTORE_OUTPUT_NAME%.*}"
     export JASNA_WORK_DIR="${JASNA_WORK_DIR:-$RESTORE_OUTPUT_DIR/${RESTORE_OUTPUT_STEM}.jasna-work}"
-    if [[ "${JASNA_MODEL_BATCH:-auto}" != "1" \
+    export JASNA_LOG_PEAK_MEMORY="${JASNA_LOG_PEAK_MEMORY:-1}"
+    if [[ "${JASNA_MODEL_BATCH:-1}" == "2" \
           && -d "$ROOT_DIR/Models/MetalMLBatch2/feature_extract.mtlpackage" ]]; then
       export JASNA_BATCH2_MODELS_DIR="${JASNA_BATCH2_MODELS_DIR:-$ROOT_DIR/Models/MetalMLBatch2}"
     fi
     JASNA_LOG_PATH="$RESTORE_OUTPUT_DIR/${RESTORE_OUTPUT_STEM}.jasna.log"
     mkdir -p "$JASNA_WORK_DIR"
+    JASNA_PROCESS_LOCK="$JASNA_WORK_DIR/.jasna-process-lock"
+    if ! mkdir "$JASNA_PROCESS_LOCK" 2>/dev/null; then
+      EXISTING_PID="$(/bin/cat "$JASNA_PROCESS_LOCK/pid" 2>/dev/null || true)"
+      if [[ "$EXISTING_PID" =~ ^[0-9]+$ ]] && kill -0 "$EXISTING_PID" 2>/dev/null; then
+        echo "error: this restoration work directory is already active (PID $EXISTING_PID)" >&2
+        echo "work dir: $JASNA_WORK_DIR" >&2
+        exit 1
+      fi
+      STALE_LOCK="$JASNA_WORK_DIR/.jasna-process-lock.stale-$(date '+%Y%m%d-%H%M%S')-$$"
+      mv "$JASNA_PROCESS_LOCK" "$STALE_LOCK"
+      mkdir "$JASNA_PROCESS_LOCK"
+    fi
+    printf '%s\n' "$$" > "$JASNA_PROCESS_LOCK/pid"
+    cleanup_jasna_process_lock() {
+      [[ -d "$JASNA_PROCESS_LOCK" ]] || return 0
+      local owner_pid
+      owner_pid="$(/bin/cat "$JASNA_PROCESS_LOCK/pid" 2>/dev/null || true)"
+      [[ "$owner_pid" == "$$" ]] || return 0
+      rm -f "$JASNA_PROCESS_LOCK/pid"
+      rmdir "$JASNA_PROCESS_LOCK" 2>/dev/null || true
+    }
+    trap cleanup_jasna_process_lock EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' HUP TERM
     exec > >(/usr/bin/tee -a "$JASNA_LOG_PATH") 2>&1
     echo
     echo "===== Jasna restoration session $(date -u '+%Y-%m-%dT%H:%M:%SZ') ====="
@@ -80,7 +105,6 @@ case "$MODE" in
 esac
 
 cd "$ROOT_DIR"
-pkill -x "$APP_NAME" >/dev/null 2>&1 || true
 mkdir -p "$ROOT_DIR/.build/ModuleCache"
 export CLANG_MODULE_CACHE_PATH="$ROOT_DIR/.build/ModuleCache"
 export SWIFTPM_MODULECACHE_OVERRIDE="$ROOT_DIR/.build/ModuleCache"

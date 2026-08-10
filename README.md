@@ -235,7 +235,18 @@ the restoration process exits. Direct SBS restoration therefore defaults to six
 temporal windows per subprocess, writes a validated HEVC part, exits to release
 `IOAccelerator` and `IOSurface` memory, and concatenates the parts without another
 video encode. Set `JASNA_METAL_WINDOWS_PER_PROCESS` from 1 through 30 to tune the
-peak-memory/startup tradeoff; six is the safe default for a 16 GB M4 Mac.
+peak-memory/startup tradeoff; twelve is the measured default for a 16 GB M4 Mac.
+Set it to `6` for the earlier conservative limit.
+Each work directory also has its own process lock. A second command targeting the
+same resume data fails clearly, while unrelated restorations are left running.
+Every isolated restoration subprocess logs `Runtime memory: peak resident` at
+exit. This uses Darwin's per-process high-water mark and makes six- versus
+twelve-window memory comparisons visible in the persistent restoration log.
+Set `JASNA_LOG_PEAK_MEMORY=0` only when this telemetry is not wanted. A real
+30-second 8K SBS batch-1 comparison completed in three 12-window processes at
+5.74, 5.82, and 5.57 GiB peak resident memory, without progressive growth. Its
+restoration span was 182 seconds versus 201 seconds for five six-window
+processes, a 9.5% reduction.
 The current sparse VR path decodes and encodes 8-bit BGRA/SDR. A Main 10 or HDR
 source therefore does not retain its original bit depth or HDR transfer
 characteristics; do not use this path when HDR preservation is required.
@@ -262,6 +273,8 @@ model used 1.31 seconds of GPU time for all three crops; compositing and hardwar
 HEVC encoding brought the post-build work to roughly six seconds. Its output was
 validated as exactly 30 frames at 30 fps. Projection mode is included in the
 resume-cache key, so an older raw crop can never be reused for a fisheye run.
+The key also fingerprints source-segment and model-file paths, sizes, and
+modification times, preventing stale crops after an input or model replacement.
 
 Persistent crop caches are flushed every five completed regions and at the end
 of every window. After an unexpected restart, at most four small regions are
@@ -302,13 +315,13 @@ measured about 1.10 seconds for the initial graph build and execution, then
 about 0.45 seconds per reused 30-frame crop including roughly 0.38 seconds of
 GPU work. Decoded frame hashes matched the pre-cache output exactly.
 
-When `Models/MetalMLBatch2` is present, restoration automatically groups two
-mosaic crops with the same temporal length into one retained graph. Incompatible
-or odd final crops stay on batch 1, and any batch failure retries both crops on
-the established individual fallback path. Set `JASNA_MODEL_BATCH=1` to disable
-this experimental path. The batch-2 package initialization can take roughly
-three minutes in a fresh process under Xcode 27 beta, after which the graph is
-reused for the remaining crops and segments.
+Restoration uses batch 1 by default. Set `JASNA_MODEL_BATCH=2` to experiment with
+grouping two mosaic crops of the same temporal length in one retained graph when
+`Models/MetalMLBatch2` is present. Incompatible or odd final crops stay on batch
+1. The first batch failure retries both crops individually and disables batch 2
+for the remainder of that process, preventing a bad graph from imposing another
+minute-long timeout on every later crop. Batch-2 package initialization can take
+roughly three minutes in a fresh process under Xcode 27 beta.
 
 The retained graph clears its unpadded main buffers only on first use because
 every later destination is fully overwritten. SPyNet's padded-row tensors are
@@ -363,10 +376,13 @@ wrapper:
 
 It does not apply the test harness's 30-second cut. It uses persistent
 120-second source/restoration segments, fisheye sparse regions, direct SBS
-output, and batch 2 by default. All pending segments are submitted through one
-app process so the expensive batch-2 Metal ML graph is initialized once. A
+output, and the stable batch-1 model path by default. The launcher limits each
+Metal process to twelve temporal windows so beta-runtime allocations are released
+regularly. Set `JASNA_MODEL_BATCH=2` only for an explicit batch-2 experiment. A
 restart reuses completed source segments, region manifests, restored windows,
-and validated SBS segment files.
+and validated SBS segment files. Existing and newly written final SBS outputs
+must also match the source dimensions, HEVC codec, 30 fps frame count, expected
+duration, and a real first-frame decode before they are accepted.
 
 The start time is optional and defaults to the beginning. The script prepares
 an exact 30 fps test clip, restores the left and right eyes sequentially, copies
@@ -533,10 +549,11 @@ the expensive tiles in the preserved interrupted window are reused.
 If a real-content tile overflows FP16 in the 30-frame recurrence, restoration
 logs the exact eye, coordinates, branch, frame, and element, then retries that
 tile with balanced 10-, 5-, and 3-frame chunks. A tile that remains unstable is
-restored as independent zero-motion frame triplets. As a final safety measure,
-only if every Metal recovery mode fails, that tile uses an explicitly logged
-input-pixel passthrough instead of aborting the complete video. Diagnose one
-tile without creating an output movie with:
+restored as independent zero-motion frame triplets. If every Metal recovery mode
+fails, production restoration now stops rather than silently retaining the
+original mosaic. Set `JASNA_ALLOW_PASSTHROUGH=1` only to create an explicitly
+logged, known-degraded diagnostic output. Diagnose one tile without creating an
+output movie with:
 
 ```sh
 ./script/build_and_run.sh --diagnose-sbs-tile input_30fps.mp4 90
