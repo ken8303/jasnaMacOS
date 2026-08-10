@@ -43,33 +43,74 @@ case "$MODE" in
     mkdir -p "$3"
     RESTORE_OUTPUT_PATH="$3/batched-windowed-output.mov"
     ;;
+  --restore-stereo-sparse-batch|restore-stereo-sparse-batch)
+    [[ $# -ge 8 ]] || {
+      echo "error: direct SBS batch mode requires at least one paired restoration job" >&2
+      exit 2
+    }
+    mkdir -p "$(dirname "$4")"
+    RESTORE_OUTPUT_PATH="$4"
+    ;;
 esac
 
 case "$MODE" in
-  --restore-sbs-video|restore-sbs-video|--restore-sbs-window|restore-sbs-window|--restore-sbs-eye|restore-sbs-eye|--restore-eye-video|restore-eye-video|--restore-eye-windows|restore-eye-windows|--restore-eye-windows-sparse|restore-eye-windows-sparse|--restore-eye-windows-sparse-batch|restore-eye-windows-sparse-batch)
+  --restore-sbs-video|restore-sbs-video|--restore-sbs-window|restore-sbs-window|--restore-sbs-eye|restore-sbs-eye|--restore-eye-video|restore-eye-video|--restore-eye-windows|restore-eye-windows|--restore-eye-windows-sparse|restore-eye-windows-sparse|--restore-eye-windows-sparse-batch|restore-eye-windows-sparse-batch|--restore-stereo-sparse-batch|restore-stereo-sparse-batch)
     RESTORE_OUTPUT_DIR="$(cd "$(dirname "$RESTORE_OUTPUT_PATH")" && pwd)"
     RESTORE_OUTPUT_NAME="$(basename "$RESTORE_OUTPUT_PATH")"
     RESTORE_OUTPUT_STEM="${RESTORE_OUTPUT_NAME%.*}"
     export JASNA_WORK_DIR="${JASNA_WORK_DIR:-$RESTORE_OUTPUT_DIR/${RESTORE_OUTPUT_STEM}.jasna-work}"
+    export JASNA_LOG_PEAK_MEMORY="${JASNA_LOG_PEAK_MEMORY:-1}"
+    if [[ "${JASNA_MODEL_BATCH:-1}" == "2" \
+          && -d "$ROOT_DIR/Models/MetalMLBatch2/feature_extract.mtlpackage" ]]; then
+      export JASNA_BATCH2_MODELS_DIR="${JASNA_BATCH2_MODELS_DIR:-$ROOT_DIR/Models/MetalMLBatch2}"
+    fi
     JASNA_LOG_PATH="$RESTORE_OUTPUT_DIR/${RESTORE_OUTPUT_STEM}.jasna.log"
     mkdir -p "$JASNA_WORK_DIR"
+    JASNA_PROCESS_LOCK="$JASNA_WORK_DIR/.jasna-process-lock"
+    if ! mkdir "$JASNA_PROCESS_LOCK" 2>/dev/null; then
+      EXISTING_PID="$(/bin/cat "$JASNA_PROCESS_LOCK/pid" 2>/dev/null || true)"
+      if [[ "$EXISTING_PID" =~ ^[0-9]+$ ]] && kill -0 "$EXISTING_PID" 2>/dev/null; then
+        echo "error: this restoration work directory is already active (PID $EXISTING_PID)" >&2
+        echo "work dir: $JASNA_WORK_DIR" >&2
+        exit 1
+      fi
+      STALE_LOCK="$JASNA_WORK_DIR/.jasna-process-lock.stale-$(date '+%Y%m%d-%H%M%S')-$$"
+      mv "$JASNA_PROCESS_LOCK" "$STALE_LOCK"
+      mkdir "$JASNA_PROCESS_LOCK"
+    fi
+    printf '%s\n' "$$" > "$JASNA_PROCESS_LOCK/pid"
+    cleanup_jasna_process_lock() {
+      [[ -d "$JASNA_PROCESS_LOCK" ]] || return 0
+      local owner_pid
+      owner_pid="$(/bin/cat "$JASNA_PROCESS_LOCK/pid" 2>/dev/null || true)"
+      [[ "$owner_pid" == "$$" ]] || return 0
+      rm -f "$JASNA_PROCESS_LOCK/pid"
+      rmdir "$JASNA_PROCESS_LOCK" 2>/dev/null || true
+    }
+    trap cleanup_jasna_process_lock EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' HUP TERM
     exec > >(/usr/bin/tee -a "$JASNA_LOG_PATH") 2>&1
     echo
     echo "===== Jasna restoration session $(date -u '+%Y-%m-%dT%H:%M:%SZ') ====="
     echo "Log:      $JASNA_LOG_PATH"
     echo "Work dir: $JASNA_WORK_DIR"
     echo "Output:   $RESTORE_OUTPUT_PATH"
+    if [[ -n "${JASNA_BATCH2_MODELS_DIR:-}" ]]; then
+      echo "Model batch: 2 ($JASNA_BATCH2_MODELS_DIR)"
+    else
+      echo "Model batch: 1"
+    fi
     ;;
 esac
 
 cd "$ROOT_DIR"
-pkill -x "$APP_NAME" >/dev/null 2>&1 || true
 mkdir -p "$ROOT_DIR/.build/ModuleCache"
 export CLANG_MODULE_CACHE_PATH="$ROOT_DIR/.build/ModuleCache"
 export SWIFTPM_MODULECACHE_OVERRIDE="$ROOT_DIR/.build/ModuleCache"
 BUILD_ARGUMENTS=(--disable-sandbox)
 case "$MODE" in
-  --restore-sbs-video|restore-sbs-video|--restore-sbs-window|restore-sbs-window|--restore-sbs-eye|restore-sbs-eye|--restore-eye-video|restore-eye-video|--restore-eye-windows|restore-eye-windows|--restore-eye-windows-sparse|restore-eye-windows-sparse|--restore-eye-windows-sparse-batch|restore-eye-windows-sparse-batch)
+  --restore-sbs-video|restore-sbs-video|--restore-sbs-window|restore-sbs-window|--restore-sbs-eye|restore-sbs-eye|--restore-eye-video|restore-eye-video|--restore-eye-windows|restore-eye-windows|--restore-eye-windows-sparse|restore-eye-windows-sparse|--restore-eye-windows-sparse-batch|restore-eye-windows-sparse-batch|--restore-stereo-sparse-batch|restore-stereo-sparse-batch)
     BUILD_ARGUMENTS+=(-c release)
     echo "Building optimized restoration binary..."
     ;;
@@ -186,6 +227,9 @@ case "$MODE" in
   --restore-eye-windows-sparse-batch|restore-eye-windows-sparse-batch)
     "$APP_BINARY" --restore-eye-windows-sparse-batch "${@:2}" "$ROOT_DIR/Models/MetalML" "$ROOT_DIR/Models/DeformConv" "${JASNA_VR_PROJECTION:-raw}"
     ;;
+  --restore-stereo-sparse-batch|restore-stereo-sparse-batch)
+    "$APP_BINARY" --restore-stereo-sparse-batch "${@:2}" "$ROOT_DIR/Models/MetalML" "$ROOT_DIR/Models/DeformConv" "${JASNA_VR_PROJECTION:-raw}"
+    ;;
   --diagnose-sbs-tile|diagnose-sbs-tile)
     "$APP_BINARY" --diagnose-sbs-tile "${2:?input video path required}" "${3:?one-based tile number required}" "$ROOT_DIR/Models/MetalML" "$ROOT_DIR/Models/DeformConv"
     ;;
@@ -216,7 +260,7 @@ case "$MODE" in
     done
     ;;
   *)
-    echo "usage: $0 [run|--debug|--logs|--telemetry|--verify|--metal-ml-probe|--metal-ml-benchmark|--metal-ml-interop|--propagation-smoke|--propagation-suite|--reconstruct-frame|--zero-copy-frame|--zero-copy-frame-grouped|--zero-copy-frame-staged|--zero-copy-frame-fused|--spynet-pair|--frame-with-spynet|--temporal-inputs|--three-frame-recurrence|--three-frame-first-pass|--three-frame-four-pass|--variable-clip [frames]|--single-run-clip [frames]|--plan-sbs-video [width height source-fps duration]|--inspect-sbs-video input|--transcode-sbs-30 input output.mov|--transcode-sbs-30-tiled input output.mov|--restore-sbs-video input output.mov|--restore-sbs-eye input left|right output.mov|--restore-eye-video input output.mov|--restore-eye-windows input output-directory|--diagnose-sbs-tile input tile-number|--metal-ml-suite|--schedule [frames]|--validate-package-graph|--allocate-frame-graph [frames]|--validate-deform-weights|--benchmark-real-weights]" >&2
+    echo "usage: $0 [run|--debug|--logs|--telemetry|--verify|--metal-ml-probe|--metal-ml-benchmark|--metal-ml-interop|--propagation-smoke|--propagation-suite|--reconstruct-frame|--zero-copy-frame|--zero-copy-frame-grouped|--zero-copy-frame-staged|--zero-copy-frame-fused|--spynet-pair|--frame-with-spynet|--temporal-inputs|--three-frame-recurrence|--three-frame-first-pass|--three-frame-four-pass|--variable-clip [frames]|--single-run-clip [frames]|--plan-sbs-video [width height source-fps duration]|--inspect-sbs-video input|--transcode-sbs-30 input output.mov|--transcode-sbs-30-tiled input output.mov|--restore-sbs-video input output.mov|--restore-sbs-eye input left|right output.mov|--restore-eye-video input output.mov|--restore-eye-windows input output-directory|--restore-stereo-sparse-batch paired-job...|--diagnose-sbs-tile input tile-number|--metal-ml-suite|--schedule [frames]|--validate-package-graph|--allocate-frame-graph [frames]|--validate-deform-weights|--benchmark-real-weights]" >&2
     exit 2
     ;;
 esac

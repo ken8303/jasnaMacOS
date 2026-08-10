@@ -12,6 +12,7 @@ enum JasnaCommand: String, CaseIterable, Sendable {
     case restoreEyeWindows = "--restore-eye-windows"
     case restoreEyeWindowsSparseBatch = "--restore-eye-windows-sparse-batch"
     case restoreEyeWindowsSparse = "--restore-eye-windows-sparse"
+    case restoreStereoSparseBatch = "--restore-stereo-sparse-batch"
     case diagnoseSBSTile = "--diagnose-sbs-tile"
     case benchmarkRealWeights = "--benchmark-real-weights"
     case metalMLProbe = "--metal-ml-probe"

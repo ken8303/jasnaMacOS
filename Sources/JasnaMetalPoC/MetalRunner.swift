@@ -55,6 +55,7 @@ private struct TemporalPrepareShape {
     var width: UInt32
     var height: UInt32
     var hasSecondOrder: UInt32
+    var batch: UInt32
 }
 
 struct TemporalPreparationResult {
@@ -186,10 +187,11 @@ final class MetalDeformConv {
 
     func benchmarkJasnaShape(
         iterations: Int = 20,
-        weightSet: DeformConvWeightSet? = nil
+        weightSet: DeformConvWeightSet? = nil,
+        batch: Int = 1
     ) throws -> BenchmarkResult {
         let shape = DeformConvShape(
-            batch: 1,
+            batch: batch,
             inputChannels: 128,
             inputHeight: 64,
             inputWidth: 64,
@@ -470,16 +472,17 @@ final class MetalDeformConv {
         plane: Int,
         raw: [Float16],
         flow1: [Float16],
-        flow2: [Float16]
+        flow2: [Float16],
+        batch: Int = 1
     ) throws -> (offset: [Float16], mask: [Float16]) {
-        guard plane > 0, raw.count == 432 * plane,
-              flow1.count == 2 * plane, flow2.count == 2 * plane
+        guard plane > 0, batch > 0, raw.count == batch * 432 * plane,
+              flow1.count == batch * 2 * plane, flow2.count == batch * 2 * plane
         else { throw DeformConvError.invalidShape }
         let rawBuffer = try makeBuffer(raw)
         let flow1Buffer = try makeBuffer(flow1)
         let flow2Buffer = try makeBuffer(flow2)
-        guard let offsetBuffer = device.makeBuffer(length: 288 * plane * 2, options: .storageModeShared),
-              let maskBuffer = device.makeBuffer(length: 144 * plane * 2, options: .storageModeShared),
+        guard let offsetBuffer = device.makeBuffer(length: batch * 288 * plane * 2, options: .storageModeShared),
+              let maskBuffer = device.makeBuffer(length: batch * 144 * plane * 2, options: .storageModeShared),
               let commandBuffer = queue.makeCommandBuffer(),
               let encoder = commandBuffer.makeComputeCommandEncoder()
         else { throw DeformConvError.metalUnavailable }
@@ -492,18 +495,18 @@ final class MetalDeformConv {
         var planeValue = UInt32(plane)
         encoder.setBytes(&planeValue, length: 4, index: 5)
         encoder.dispatchThreads(
-            MTLSize(width: 432 * plane, height: 1, depth: 1),
+            MTLSize(width: batch * 432 * plane, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: dcnOffsetPipeline.threadExecutionWidth, height: 1, depth: 1)
         )
         encoder.endEncoding()
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
         if let error = commandBuffer.error { throw error }
-        let offsets = offsetBuffer.contents().bindMemory(to: Float16.self, capacity: 288 * plane)
-        let masks = maskBuffer.contents().bindMemory(to: Float16.self, capacity: 144 * plane)
+        let offsets = offsetBuffer.contents().bindMemory(to: Float16.self, capacity: batch * 288 * plane)
+        let masks = maskBuffer.contents().bindMemory(to: Float16.self, capacity: batch * 144 * plane)
         return (
-            Array(UnsafeBufferPointer(start: offsets, count: 288 * plane)),
-            Array(UnsafeBufferPointer(start: masks, count: 144 * plane))
+            Array(UnsafeBufferPointer(start: offsets, count: batch * 288 * plane)),
+            Array(UnsafeBufferPointer(start: masks, count: batch * 144 * plane))
         )
     }
 
@@ -515,30 +518,31 @@ final class MetalDeformConv {
         featN2: [Float16],
         flow1: [Float16],
         previousFlow: [Float16],
-        hasSecondOrder: Bool
+        hasSecondOrder: Bool,
+        batch: Int = 1
     ) throws -> TemporalPreparationResult {
         let plane = width * height
-        guard width > 0, height > 0,
-              featProp.count == 64 * plane,
-              featCurrent.count == 64 * plane,
-              featN2.count == 64 * plane,
-              flow1.count == 2 * plane,
-              previousFlow.count == 2 * plane
+        guard width > 0, height > 0, batch > 0,
+              featProp.count == batch * 64 * plane,
+              featCurrent.count == batch * 64 * plane,
+              featN2.count == batch * 64 * plane,
+              flow1.count == batch * 2 * plane,
+              previousFlow.count == batch * 2 * plane
         else { throw DeformConvError.invalidShape }
         let featPropBuffer = try makeBuffer(featProp)
         let featCurrentBuffer = try makeBuffer(featCurrent)
         let featN2Buffer = try makeBuffer(featN2)
         let flow1Buffer = try makeBuffer(flow1)
         let previousFlowBuffer = try makeBuffer(previousFlow)
-        guard let flow2Buffer = device.makeBuffer(length: 2 * plane * 2, options: .storageModeShared),
-              let conditionBuffer = device.makeBuffer(length: 196 * plane * 2, options: .storageModeShared),
-              let deformInputBuffer = device.makeBuffer(length: 128 * plane * 2, options: .storageModeShared),
+        guard let flow2Buffer = device.makeBuffer(length: batch * 2 * plane * 2, options: .storageModeShared),
+              let conditionBuffer = device.makeBuffer(length: batch * 196 * plane * 2, options: .storageModeShared),
+              let deformInputBuffer = device.makeBuffer(length: batch * 128 * plane * 2, options: .storageModeShared),
               let commandBuffer = queue.makeCommandBuffer(),
               let flowEncoder = commandBuffer.makeComputeCommandEncoder()
         else { throw DeformConvError.metalUnavailable }
         var shape = TemporalPrepareShape(
             width: UInt32(width), height: UInt32(height),
-            hasSecondOrder: hasSecondOrder ? 1 : 0
+            hasSecondOrder: hasSecondOrder ? 1 : 0, batch: UInt32(batch)
         )
         flowEncoder.setComputePipelineState(secondOrderFlowPipeline)
         flowEncoder.setBuffer(flow1Buffer, offset: 0, index: 0)
@@ -546,7 +550,7 @@ final class MetalDeformConv {
         flowEncoder.setBuffer(flow2Buffer, offset: 0, index: 2)
         flowEncoder.setBytes(&shape, length: MemoryLayout<TemporalPrepareShape>.stride, index: 3)
         flowEncoder.dispatchThreads(
-            MTLSize(width: 2 * plane, height: 1, depth: 1),
+            MTLSize(width: batch * 2 * plane, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: secondOrderFlowPipeline.threadExecutionWidth, height: 1, depth: 1)
         )
         flowEncoder.endEncoding()
@@ -562,7 +566,7 @@ final class MetalDeformConv {
         }
         assemblyEncoder.setBytes(&shape, length: MemoryLayout<TemporalPrepareShape>.stride, index: 7)
         assemblyEncoder.dispatchThreads(
-            MTLSize(width: 196 * plane, height: 1, depth: 1),
+            MTLSize(width: batch * 196 * plane, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: temporalAlignmentPipeline.threadExecutionWidth, height: 1, depth: 1)
         )
         assemblyEncoder.endEncoding()
@@ -570,14 +574,14 @@ final class MetalDeformConv {
         commandBuffer.waitUntilCompleted()
         if let error = commandBuffer.error { throw error }
         let gpuMilliseconds = max(0, commandBuffer.gpuEndTime - commandBuffer.gpuStartTime) * 1_000
-        let conditions = conditionBuffer.contents().bindMemory(to: Float16.self, capacity: 196 * plane)
-        let deformInput = deformInputBuffer.contents().bindMemory(to: Float16.self, capacity: 128 * plane)
-        let flow2 = flow2Buffer.contents().bindMemory(to: Float16.self, capacity: 2 * plane)
+        let conditions = conditionBuffer.contents().bindMemory(to: Float16.self, capacity: batch * 196 * plane)
+        let deformInput = deformInputBuffer.contents().bindMemory(to: Float16.self, capacity: batch * 128 * plane)
+        let flow2 = flow2Buffer.contents().bindMemory(to: Float16.self, capacity: batch * 2 * plane)
         return TemporalPreparationResult(
             gpuMilliseconds: gpuMilliseconds,
-            conditions: Array(UnsafeBufferPointer(start: conditions, count: 196 * plane)),
-            deformInput: Array(UnsafeBufferPointer(start: deformInput, count: 128 * plane)),
-            secondOrderFlow: Array(UnsafeBufferPointer(start: flow2, count: 2 * plane))
+            conditions: Array(UnsafeBufferPointer(start: conditions, count: batch * 196 * plane)),
+            deformInput: Array(UnsafeBufferPointer(start: deformInput, count: batch * 128 * plane)),
+            secondOrderFlow: Array(UnsafeBufferPointer(start: flow2, count: batch * 2 * plane))
         )
     }
 
@@ -697,14 +701,13 @@ final class MetalDeformConv {
         shape: DeformConvShape,
         buffers: [MTLBuffer]
     ) throws -> Double {
-        guard shape.batch == 1,
-              shape.inputChannels == 128,
+        guard shape.inputChannels == 128,
               shape.outputChannels == 64,
               shape.kernelHeight == 3,
               shape.kernelWidth == 3,
               shape.groups == 1,
               shape.offsetGroups > 0,
-              (shape.outputHeight * shape.outputWidth).isMultiple(
+              (shape.batch * shape.outputHeight * shape.outputWidth).isMultiple(
                   of: MetalShader.fusedGEMMRowsPerTile
               ),
               buffers.count == 7,
@@ -712,7 +715,7 @@ final class MetalDeformConv {
               let gatherEncoder = commandBuffer.makeComputeCommandEncoder()
         else { throw DeformConvError.invalidShape }
 
-        let rows = shape.outputHeight * shape.outputWidth
+        let rows = shape.batch * shape.outputHeight * shape.outputWidth
         gatherEncoder.setComputePipelineState(fp16JasnaGatherPipeline)
         gatherEncoder.setBuffer(buffers[0], offset: 0, index: 0)
         gatherEncoder.setBuffer(buffers[1], offset: 0, index: 1)
@@ -791,9 +794,8 @@ final class MetalDeformConv {
         shape: DeformConvShape,
         buffers: [MTLBuffer]
     ) throws -> Double {
-        guard shape.batch == 1,
-              shape.outputChannels == 64,
-              (shape.outputHeight * shape.outputWidth).isMultiple(
+        guard shape.outputChannels == 64,
+              (shape.batch * shape.outputHeight * shape.outputWidth).isMultiple(
                   of: MetalShader.fusedGEMMRowsPerTile
               ),
               buffers.count == 7,

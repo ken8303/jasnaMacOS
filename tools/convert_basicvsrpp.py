@@ -107,6 +107,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weights", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--only", action="append", default=[])
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help="fixed batch dimension compiled into every converted package",
+    )
     parser.add_argument("--validate", action="store_true")
     return parser.parse_args()
 
@@ -152,6 +158,8 @@ def convert(
 
 def main() -> None:
     args = parse_args()
+    if args.batch_size <= 0:
+        raise SystemExit("batch size must be positive")
     sys.path.insert(0, str(args.jasna_source.resolve()))
     from jasna.models.basicvsrpp.inference import load_model
 
@@ -162,8 +170,18 @@ def main() -> None:
     selected = set(args.only)
 
     jobs: list[tuple[str, nn.Module, tuple[torch.Tensor, ...], tuple[str, ...]]] = [
-        ("feature_extract", generator.feat_extract, (torch.randn(1, 3, 256, 256),), ("frames",)),
-        ("upsample", Upsample(generator), (torch.randn(1, 320, 64, 64),), ("features",)),
+        (
+            "feature_extract",
+            generator.feat_extract,
+            (torch.randn(args.batch_size, 3, 256, 256),),
+            ("frames",),
+        ),
+        (
+            "upsample",
+            Upsample(generator),
+            (torch.randn(args.batch_size, 320, 64, 64),),
+            ("features",),
+        ),
     ]
     # Metal ML in Xcode 27 beta 4 rejects SPyNet's dynamic sample_grid op at
     # runtime. Emit its six convolutional residual blocks independently; the
@@ -174,7 +192,7 @@ def main() -> None:
             (
                 f"spynet_level_{level}",
                 generator.spynet.basic_module[level],
-                (torch.randn(1, 8, size, size),),
+                (torch.randn(args.batch_size, 8, size, size),),
                 ("features",),
             )
         )
@@ -183,7 +201,7 @@ def main() -> None:
             (
                 f"offset_{direction}",
                 generator.deform_align[direction].conv_offset,
-                (torch.randn(1, 196, 64, 64),),
+                (torch.randn(args.batch_size, 196, 64, 64),),
                 ("conditions",),
             )
         )
@@ -191,7 +209,7 @@ def main() -> None:
             (
                 f"backbone_{direction}",
                 generator.backbone[direction],
-                (torch.randn(1, (2 + index) * 64, 64, 64),),
+                (torch.randn(args.batch_size, (2 + index) * 64, 64, 64),),
                 ("features",),
             )
         )

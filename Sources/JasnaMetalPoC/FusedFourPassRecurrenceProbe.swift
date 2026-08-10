@@ -93,12 +93,17 @@ func verifyFusedFourPassRecurrence(
     stagedRestoredFrames: [[Float16]],
     warmupCount: Int = 3,
     measurementCount: Int = 20,
-    collectDiagnostics: Bool = true
+    collectDiagnostics: Bool = true,
+    batch: Int = 1
 ) throws -> FusedFourPassRecurrenceResult {
     typealias Support = Metal4GraphSupport
+    let traceGraph = ProcessInfo.processInfo.environment["JASNA_GRAPH_TRACE"] == "1"
+    func trace(_ message: String) {
+        if traceGraph { print("Fused graph: \(message)") }
+    }
     let plane = 64 * 64
-    let featureCount = 64 * plane
-    let frameElements = 3 * 256 * 256
+    let featureCount = batch * 64 * plane
+    let frameElements = batch * 3 * 256 * 256
     let frameCount = inputFrames.count
     let flowCount = frameCount - 1
     let hasFlowOracle = !backwardFlows.isEmpty || !forwardFlows.isEmpty
@@ -112,14 +117,17 @@ func verifyFusedFourPassRecurrence(
         && !hasStagedPropagation
         && !hasStagedRestoration
     let productionGraphKey = "\(device.registryID):\(modelsURL.standardizedFileURL.path):"
-        + "\(weightsURL.standardizedFileURL.path):\(frameCount)"
+        + "\(weightsURL.standardizedFileURL.path):\(frameCount):batch\(batch)"
     let branchSpecs: [(String, PropagationDirection)] = [
         ("backward_1", .backward), ("forward_1", .forward),
         ("backward_2", .backward), ("forward_2", .forward),
     ]
-    guard frameCount >= 3,
+    guard batch > 0,
+          frameCount >= 3,
           warmupCount >= 0,
           measurementCount > 0,
+          batch == 1 || (!collectDiagnostics && !hasFlowOracle
+              && !hasStagedPropagation && !hasStagedRestoration),
           (!hasFlowOracle || (
               backwardFlows.count == flowCount
                   && forwardFlows.count == flowCount
@@ -146,16 +154,19 @@ func verifyFusedFourPassRecurrence(
         return try runner.restore(inputFrames)
     }
 
+    trace("loading batch-\(batch) Metal ML pipelines")
     var activeInputFrames = inputFrames
 
     let featurePipeline = try makeMetalMLPipeline(
         device: device,
         packageURL: modelsURL.appendingPathComponent("feature_extract.mtlpackage")
     )
+    trace("feature pipeline ready")
     let upsamplePipeline = try makeMetalMLPipeline(
         device: device,
         packageURL: modelsURL.appendingPathComponent("upsample.mtlpackage")
     )
+    trace("reconstruction pipeline ready")
     // Metal ML's intermediates heap is scratch storage for one dispatch. These
     // networks execute serially in one command buffer, so a pipeline can reuse
     // the same heap for every frame instead of allocating 2 * frameCount heaps
@@ -166,18 +177,20 @@ func verifyFusedFourPassRecurrence(
     let upsampleHeap = try Support.makeHeap(
         device: device, size: upsamplePipeline.intermediatesHeapSize
     )
+    trace("feature and reconstruction heaps ready")
     let featureHeaps = [MTLHeap](repeating: featureHeap, count: frameCount)
     let upsampleHeaps = [MTLHeap](repeating: upsampleHeap, count: frameCount)
+    trace("feature and reconstruction pipelines ready")
     var heldTensors = [any MTLTensor]()
     var frameBuffers = [MTLBuffer]()
     var spatialBuffers = [MTLBuffer]()
     var featureArguments = [any MTL4ArgumentTable]()
     for _ in 0..<frameCount {
         let (frameTensor, frameBuffer) = try Support.makeTensor(
-            device: device, dimensions: [256, 256, 3, 1]
+            device: device, dimensions: [256, 256, 3, batch]
         )
         let (spatialTensor, spatialBuffer) = try Support.makeTensor(
-            device: device, dimensions: [64, 64, 64, 1]
+            device: device, dimensions: [64, 64, 64, batch]
         )
         heldTensors += [frameTensor, spatialTensor]
         frameBuffers.append(frameBuffer)
@@ -190,35 +203,45 @@ func verifyFusedFourPassRecurrence(
     }
 
     let (conditionTensor, conditionBuffer) = try Support.makeTensor(
-        device: device, dimensions: [64, 64, 196, 1]
+        device: device, dimensions: [64, 64, 196, batch]
     )
     let (rawTensor, rawBuffer) = try Support.makeTensor(
-        device: device, dimensions: [64, 64, 432, 1]
+        device: device, dimensions: [64, 64, 432, batch]
     )
     let (backboneOutputTensor, backboneOutputBuffer) = try Support.makeTensor(
-        device: device, dimensions: [64, 64, 64, 1]
+        device: device, dimensions: [64, 64, 64, batch]
     )
     heldTensors += [conditionTensor, rawTensor, backboneOutputTensor]
 
     let zeroFeatureBuffer = try Support.makeSharedFP16Buffer(device: device, elements: featureCount)
-    let flow2Buffer = try Support.makeSharedFP16Buffer(device: device, elements: 2 * plane)
-    let deformInputBuffer = try Support.makeSharedFP16Buffer(device: device, elements: 128 * plane)
-    let offsetBuffer = try Support.makeSharedFP16Buffer(device: device, elements: 288 * plane)
-    let maskBuffer = try Support.makeSharedFP16Buffer(device: device, elements: 144 * plane)
+    let flow2Buffer = try Support.makeSharedFP16Buffer(
+        device: device, elements: batch * 2 * plane
+    )
+    let deformInputBuffer = try Support.makeSharedFP16Buffer(
+        device: device, elements: batch * 128 * plane
+    )
+    let offsetBuffer = try Support.makeSharedFP16Buffer(
+        device: device, elements: batch * 288 * plane
+    )
+    let maskBuffer = try Support.makeSharedFP16Buffer(
+        device: device, elements: batch * 144 * plane
+    )
     let alignedBuffer = try Support.makeSharedFP16Buffer(device: device, elements: featureCount)
-    let gatheredBuffer = try Support.makePrivateBuffer(device: device, bytes: plane * 128 * 9 * 2)
+    let gatheredBuffer = try Support.makePrivateBuffer(
+        device: device, bytes: batch * plane * 128 * 9 * 2
+    )
     let propagationBuffers = try (0..<4).map { _ in
         try (0..<frameCount).map { _ in
             try Support.makeSharedFP16Buffer(device: device, elements: featureCount)
         }
     }
-    var firstShape = ThreeFramePrepareShape(hasSecondOrder: 0)
-    var secondShape = ThreeFramePrepareShape(hasSecondOrder: 1)
+    var firstShape = ThreeFramePrepareShape(hasSecondOrder: 0, batch: UInt32(batch))
+    var secondShape = ThreeFramePrepareShape(hasSecondOrder: 1, batch: UInt32(batch))
     var planeValue = UInt32(plane)
     var prefixChannelsValue = UInt32(64)
     var featureCountValue = UInt32(featureCount)
     var frameElementsValue = UInt32(frameElements)
-    var deformShape = PropagationDeformConvShape()
+    var deformShape = PropagationDeformConvShape(batch: UInt32(batch))
     let firstShapeBuffer = try Support.makeConstant(device: device, value: &firstShape)
     let secondShapeBuffer = try Support.makeConstant(device: device, value: &secondShape)
     let planeBuffer = try Support.makeConstant(device: device, value: &planeValue)
@@ -265,8 +288,10 @@ func verifyFusedFourPassRecurrence(
     )
     let nonFinitePipeline = try cache.computePipeline(device: device, function: nonFiniteFunction)
     let spynetGraph = try FusedSPyNetClipGraph(
-        device: device, modelsURL: modelsURL, library: library, sourceFrames: frameBuffers
+        device: device, modelsURL: modelsURL, library: library,
+        sourceFrames: frameBuffers, batch: batch
     )
+    trace("SPyNet graph ready")
     let backwardFlowBuffers = spynetGraph.backwardFlowBuffers
     let forwardFlowBuffers = spynetGraph.forwardFlowBuffers
     let gatherArguments = try Support.makeComputeArguments(
@@ -288,7 +313,7 @@ func verifyFusedFourPassRecurrence(
             packageURL: modelsURL.appendingPathComponent("backbone_\(name).mtlpackage")
         )
         let (backboneInputTensor, backboneInputBuffer) = try Support.makeTensor(
-            device: device, dimensions: [64, 64, backboneInputChannels, 1]
+            device: device, dimensions: [64, 64, backboneInputChannels, batch]
         )
         heldTensors.append(backboneInputTensor)
         let checkpoint = try MetalResourceCache.shared.deformConvWeightBuffers(
@@ -402,6 +427,7 @@ func verifyFusedFourPassRecurrence(
             backboneInputBuffer: backboneInputBuffer,
             weightBuffer: checkpoint.weight, biasBuffer: checkpoint.bias
         ))
+        trace("branch \(name) ready")
     }
 
     var reconstructionBuffers = [MTLBuffer]()
@@ -415,10 +441,10 @@ func verifyFusedFourPassRecurrence(
     else { throw DeformConvError.metalUnavailable }
     for frame in 0..<frameCount {
         let (reconstructionTensor, reconstructionBuffer) = try Support.makeTensor(
-            device: device, dimensions: [64, 64, 320, 1]
+            device: device, dimensions: [64, 64, 320, batch]
         )
         let (predictedTensor, predictedBuffer) = try Support.makeTensor(
-            device: device, dimensions: [256, 256, 3, 1]
+            device: device, dimensions: [256, 256, 3, batch]
         )
         let restoredBuffer = try Support.makeSharedFP16Buffer(
             device: device, elements: frameElements
@@ -474,6 +500,7 @@ func verifyFusedFourPassRecurrence(
         residencySet.addAllocation(branch.biasBuffer)
     }
     residencySet.commit()
+    trace("residency set committed")
     guard let queue = device.makeMTL4CommandQueue(),
           let commandAllocator = device.makeCommandAllocator(),
           let commandBuffer = device.makeCommandBuffer()
@@ -512,6 +539,7 @@ func verifyFusedFourPassRecurrence(
     }
 
     func execute() throws -> (Double, [[[Float16]]], [[Float16]], [[Float16]]) {
+        trace("execution starting")
         MetalResourceCache.shared.beginMachineLearningExecution()
         defer { MetalResourceCache.shared.endMachineLearningExecution() }
         initializeBuffers()
@@ -540,7 +568,7 @@ func verifyFusedFourPassRecurrence(
             Support.dispatch1D(
                 initialAssembly, pipeline: assemblyPipeline,
                 arguments: branch.initialAssemblyArguments,
-                count: branch.backboneInputChannels * plane
+                count: batch * branch.backboneInputChannels * plane
             )
             initialAssembly.barrier(
                 afterStages: .dispatch, beforeQueueStages: .machineLearning,
@@ -577,7 +605,7 @@ func verifyFusedFourPassRecurrence(
                 )
                 Support.dispatch1D(
                     preparation, pipeline: accumulatePipeline,
-                    arguments: branch.accumulateArguments[step], count: 2 * plane
+                    arguments: branch.accumulateArguments[step], count: batch * 2 * plane
                 )
                 preparation.barrier(
                     afterEncoderStages: .dispatch, beforeEncoderStages: .dispatch,
@@ -585,7 +613,7 @@ func verifyFusedFourPassRecurrence(
                 )
                 Support.dispatch1D(
                     preparation, pipeline: preparePipeline,
-                    arguments: branch.prepareArguments[step], count: 196 * plane
+                    arguments: branch.prepareArguments[step], count: batch * 196 * plane
                 )
                 preparation.barrier(
                     afterStages: .dispatch, beforeQueueStages: .machineLearning,
@@ -608,7 +636,7 @@ func verifyFusedFourPassRecurrence(
                 }
                 Support.dispatch1D(
                     alignment, pipeline: transformPipeline,
-                    arguments: branch.transformArguments[step], count: 432 * plane
+                    arguments: branch.transformArguments[step], count: batch * 432 * plane
                 )
                 alignment.barrier(
                     afterEncoderStages: .dispatch, beforeEncoderStages: .dispatch,
@@ -616,7 +644,7 @@ func verifyFusedFourPassRecurrence(
                 )
                 Support.dispatch1D(
                     alignment, pipeline: gatherPipeline, arguments: gatherArguments,
-                    count: plane, threads: 128, threadgroups: true
+                    count: batch * plane, threads: 128, threadgroups: true
                 )
                 alignment.barrier(
                     afterEncoderStages: .dispatch, beforeEncoderStages: .dispatch,
@@ -625,7 +653,7 @@ func verifyFusedFourPassRecurrence(
                 Support.dispatch1D(
                     alignment, pipeline: gemmPipeline,
                     arguments: branch.gemmArguments,
-                    count: plane / MetalShader.fusedGEMMRowsPerTile,
+                    count: batch * plane / MetalShader.fusedGEMMRowsPerTile,
                     threads: 8 * gemmPipeline.threadExecutionWidth, threadgroups: true
                 )
                 alignment.barrier(
@@ -635,7 +663,7 @@ func verifyFusedFourPassRecurrence(
                 Support.dispatch1D(
                     alignment, pipeline: assemblyPipeline,
                     arguments: branch.assemblyArguments[step],
-                    count: branch.backboneInputChannels * plane
+                    count: batch * branch.backboneInputChannels * plane
                 )
                 alignment.barrier(
                     afterStages: .dispatch, beforeQueueStages: .machineLearning,
@@ -675,7 +703,7 @@ func verifyFusedFourPassRecurrence(
                 reconstructionAssembly,
                 pipeline: reconstructionAssemblyPipeline,
                 arguments: arguments,
-                count: 320 * plane
+                count: batch * 320 * plane
             )
         }
         reconstructionAssembly.barrier(
@@ -732,7 +760,9 @@ func verifyFusedFourPassRecurrence(
             semaphore.signal()
         }
         queue.commit([commandBuffer], options: commitOptions)
+        trace("command buffer committed")
         semaphore.wait()
+        trace("command buffer completed")
         commandAllocatorHasCompletedSubmission = true
         let (milliseconds, error) = commitResult.load()
         if let error { throw error }

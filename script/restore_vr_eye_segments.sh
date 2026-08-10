@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
   echo "usage: $0 INPUT_SBS_VIDEO left|right OUTPUT_EYE_VIDEO" >&2
-  echo "optional: JASNA_SEGMENT_SECONDS=60 JASNA_EYE_BITRATE=20000000" >&2
+  echo "optional: JASNA_SEGMENT_SECONDS=120 JASNA_EYE_BITRATE=20000000" >&2
   exit 2
 }
 
@@ -13,7 +13,7 @@ INPUT_PATH="$1"
 EYE="$2"
 OUTPUT_PATH="$3"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SEGMENT_SECONDS="${JASNA_SEGMENT_SECONDS:-60}"
+SEGMENT_SECONDS="${JASNA_SEGMENT_SECONDS:-120}"
 EYE_BITRATE="${JASNA_EYE_BITRATE:-20000000}"
 SPARSE_MOSAIC="${JASNA_SPARSE_MOSAIC:-0}"
 VR_PROJECTION="${JASNA_VR_PROJECTION:-raw}"
@@ -97,10 +97,9 @@ SOURCE_DIR="$WORK_DIR/source"
 RESTORED_DIR="$WORK_DIR/restored"
 CACHE_DIR="$WORK_DIR/cache"
 if [[ "$SPARSE_MOSAIC" == "1" ]]; then
-  # v4 uses full 30-frame tracked regions. Keep it separate from the old
-  # six-frame v3 cache so a quality run can never reuse the softer result.
-  RESTORED_DIR="$WORK_DIR/restored-sparse-crop-v4-temporal-$VR_PROJECTION"
-  CACHE_DIR="$WORK_DIR/cache-sparse-crop-v4-temporal-$VR_PROJECTION"
+  # v15 adds a focused lower-edge detail crop to each oversized masked region.
+  RESTORED_DIR="$WORK_DIR/restored-sparse-crop-v15-lower-detail-$VR_PROJECTION"
+  CACHE_DIR="$WORK_DIR/cache-sparse-crop-v15-lower-detail-$VR_PROJECTION"
 fi
 OUTPUT_DONE="$RESTORED_DIR/${EYE}-joined.done"
 SOURCE_DONE="$WORK_DIR/source.done"
@@ -123,6 +122,16 @@ echo "Fast encoding:    $FAST_ENCODE"
 if [[ "$SPARSE_MOSAIC" == "1" ]]; then
   echo "Detector:         $DETECT_DECODE_MODE decode, batch $DETECT_BATCH_SIZE"
   echo "Temporal clips:   $REGION_DURATION seconds"
+  echo "Detection quality: confidence ${JASNA_DETECT_CONFIDENCE:-0.15}, padding ${JASNA_TEMPORAL_PADDING:-1.0}s"
+  echo "Region overlap:    suppress at IoU ${JASNA_REGION_NMS_IOU:-0.45}"
+  echo "Mask expansion:    ${JASNA_MASK_EXPANSION:-0.10} of mask resolution"
+  echo "Mask resolution:   ${JASNA_MASK_SIZE:-128}x${JASNA_MASK_SIZE:-128}"
+  echo "Mask timing:       interpolated per output frame"
+  echo "Large crop grid:   max ${JASNA_LARGE_REGION_MAX_BLEND:-768}px, overlap ${JASNA_LARGE_REGION_OVERLAP:-96}px"
+  echo "Large split limit: ${JASNA_LARGE_REGION_SPLIT_LIMIT:-1} region(s)/window, max ${JASNA_LARGE_REGION_MAX_AXIS_CROPS:-3}/axis"
+  echo "Large crop blend:  normalized Metal delta accumulation"
+  echo "Block mask halo:    ${JASNA_LARGE_REGION_BLOCK_GROWTH:-0.04}; temporal radius ${JASNA_LARGE_REGION_MASK_TEMPORAL_RADIUS:-1}"
+  echo "Lower detail crop:  ${JASNA_LARGE_REGION_DETAIL_CROPS:-1} at ${JASNA_LARGE_REGION_DETAIL_DIMENSION:-576}px"
 fi
 
 IFS=, read -r SOURCE_WIDTH SOURCE_HEIGHT < <(

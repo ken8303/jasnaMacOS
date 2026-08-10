@@ -311,10 +311,14 @@ private func correctnessTest(runner: MetalDeformConv) throws {
     print("Temporal condition/second-order flow: PASS (max abs \(String(format: "%.3g", temporalError)))")
 }
 
-private func benchmark(runner: MetalDeformConv, weightSet: DeformConvWeightSet? = nil) throws {
-    let result = try runner.benchmarkJasnaShape(weightSet: weightSet)
+private func benchmark(
+    runner: MetalDeformConv,
+    weightSet: DeformConvWeightSet? = nil,
+    batch: Int = 1
+) throws {
+    let result = try runner.benchmarkJasnaShape(weightSet: weightSet, batch: batch)
     if let weightSet { print("Checkpoint weights: \(weightSet.direction)") }
-    print("Jasna DCNv2 shape: 1×128×64×64 → 1×64×64×64, FP16")
+    print("Jasna DCNv2 shape: \(batch)×128×64×64 → \(batch)×64×64×64, FP16")
     print("Baseline median: \(String(format: "%.3f", result.baselineMedianMilliseconds)) ms")
     print("Baseline range:  \(String(format: "%.3f", result.baselineMinimumMilliseconds))–\(String(format: "%.3f", result.baselineMaximumMilliseconds)) ms")
     print("Baseline P10–P90/stddev: \(String(format: "%.3f–%.3f / %.3f", result.baselineStatistics.percentile10, result.baselineStatistics.percentile90, result.baselineStatistics.standardDeviation)) ms")
@@ -346,8 +350,12 @@ func runJasnaCLI() async throws {
     try await commandLine.dispatch(.selfTest, whenNoArguments: true) { _ in
         try correctnessTest(runner: runner)
     }
-    try await commandLine.dispatch(.benchmark, whenNoArguments: true) { _ in
-        try benchmark(runner: runner)
+    try await commandLine.dispatch(.benchmark, whenNoArguments: true) { benchmarkIndex in
+        let batch = commandLine.arguments.indices.contains(benchmarkIndex + 1)
+            ? Int(commandLine.arguments[benchmarkIndex + 1]) ?? 1
+            : 1
+        guard batch > 0 else { throw DeformConvError.invalidShape }
+        try benchmark(runner: runner, batch: batch)
     }
     try await commandLine.dispatch(.planSBSVideo) { planIndex in
         guard commandLine.arguments.indices.contains(planIndex + 4),
@@ -582,6 +590,59 @@ func runJasnaCLI() async throws {
         print("VR projection: \(projection.rawValue)")
         print("Completed jobs: \(jobCount)")
     }
+    try await commandLine.dispatch(.restoreStereoSparseBatch) { batchIndex in
+        let values = Array(commandLine.arguments[(batchIndex + 1)...])
+        guard values.count >= 10, (values.count - 3).isMultiple(of: 7) else {
+            throw DeformConvError.commandFailed(
+                "--restore-stereo-sparse-batch requires groups of left input, right input, "
+                    + "output, left manifest, right manifest, left work directory, and "
+                    + "right work directory, followed by MetalML, DeformConv, and projection"
+            )
+        }
+        guard #available(macOS 27.0, *) else {
+            throw DeformConvError.commandFailed("direct sparse SBS restoration requires macOS 27")
+        }
+        let fixedArgumentStart = values.count - 3
+        let modelsURL = URL(fileURLWithPath: values[fixedArgumentStart])
+        let weightsURL = URL(fileURLWithPath: values[fixedArgumentStart + 1])
+        guard let projection = VRMosaicProjection(rawValue: values[fixedArgumentStart + 2]) else {
+            throw DeformConvError.commandFailed(
+                "unknown sparse VR projection '\(values[fixedArgumentStart + 2])'; "
+                    + "use raw or fisheye"
+            )
+        }
+        let jobCount = fixedArgumentStart / 7
+        for jobIndex in 0..<jobCount {
+            let offset = jobIndex * 7
+            print(
+                "Direct SBS batch job \(jobIndex + 1)/\(jobCount): "
+                    + "\(values[offset]) + \(values[offset + 1])"
+            )
+            let count = try await SideBySideRestoration.restoreSparseStereoEyeSegment(
+                device: runner.device,
+                leftInputURL: URL(fileURLWithPath: values[offset]),
+                rightInputURL: URL(fileURLWithPath: values[offset + 1]),
+                outputURL: URL(fileURLWithPath: values[offset + 2]),
+                leftManifestURL: URL(fileURLWithPath: values[offset + 3]),
+                rightManifestURL: URL(fileURLWithPath: values[offset + 4]),
+                modelsURL: modelsURL,
+                weightsURL: weightsURL,
+                projection: projection,
+                leftWorkDirectoryURL: URL(
+                    fileURLWithPath: values[offset + 5], isDirectory: true
+                ),
+                rightWorkDirectoryURL: URL(
+                    fileURLWithPath: values[offset + 6], isDirectory: true
+                )
+            )
+            print(
+                "Direct SBS batch job \(jobIndex + 1)/\(jobCount): PASS, "
+                    + "\(count) windows"
+            )
+        }
+        print("Direct sparse SBS batch: PASS")
+        print("Completed jobs: \(jobCount)")
+    }
     try await commandLine.dispatch(.restoreEyeWindowsSparse) { sparseWindowsIndex in
         guard commandLine.arguments.indices.contains(sparseWindowsIndex + 5) else {
             throw DeformConvError.commandFailed(
@@ -641,9 +702,13 @@ func runJasnaCLI() async throws {
         guard commandLine.arguments.indices.contains(realBenchmarkIndex + 1) else {
             throw DeformConvError.commandFailed("--benchmark-real-weights requires a directory")
         }
+        let batch = commandLine.arguments.indices.contains(realBenchmarkIndex + 2)
+            ? Int(commandLine.arguments[realBenchmarkIndex + 2]) ?? 1
+            : 1
+        guard batch > 0 else { throw DeformConvError.invalidShape }
         let directoryURL = URL(fileURLWithPath: commandLine.arguments[realBenchmarkIndex + 1], isDirectory: true)
         for set in try loadDeformConvWeightSets(directoryURL: directoryURL) {
-            try benchmark(runner: runner, weightSet: set)
+            try benchmark(runner: runner, weightSet: set, batch: batch)
         }
     }
     try await commandLine.dispatch(.metalMLProbe) { probeIndex in
@@ -943,10 +1008,15 @@ func runJasnaCLI() async throws {
         let oracleURL = URL(
             fileURLWithPath: commandLine.arguments[spynetIndex + 2], isDirectory: true
         )
+        let batch = commandLine.arguments.indices.contains(spynetIndex + 3)
+            ? Int(commandLine.arguments[spynetIndex + 3]) ?? 1 : 1
+        guard batch > 0 else { throw DeformConvError.invalidShape }
         let result = try verifySPyNetPair(
-            device: runner.device, modelsURL: modelsURL, oracleURL: oracleURL
+            device: runner.device, modelsURL: modelsURL, oracleURL: oracleURL,
+            validateOracle: batch == 1, batch: batch
         )
         print("Bidirectional six-level SPyNet graph: PASS")
+        print("Batch:                   \(batch)")
         print("Chain: normalized pyramids → warp/upsample → 12 Metal ML blocks → residual flow adds")
         print("Flow elements checked: \(result.elementCount)")
         print("GPU median:            \(String(format: "%.3f", result.medianMilliseconds)) ms")
@@ -1343,24 +1413,82 @@ func runJasnaCLI() async throws {
         let weightsURL = URL(
             fileURLWithPath: commandLine.arguments[productionIndex + 3], isDirectory: true
         )
+        let batch = commandLine.arguments.indices.contains(productionIndex + 4)
+            ? Int(commandLine.arguments[productionIndex + 4]) ?? 1 : 1
+        guard batch > 0 else { throw DeformConvError.invalidShape }
+        let inputFrames = (0..<frameCount).map { frame in
+            (0..<batch).flatMap { sample in
+                makeJasnaSyntheticFrame(index: frame + sample * frameCount)
+            }
+        }
         let fused = try verifyFusedFourPassRecurrence(
             device: runner.device,
             modelsURL: modelsURL,
             weightsURL: weightsURL,
             backwardFlows: [],
             forwardFlows: [],
-            inputFrames: (0..<frameCount).map(makeJasnaSyntheticFrame),
+            inputFrames: inputFrames,
             stagedBranchFrames: [],
             stagedRestoredFrames: [],
             warmupCount: 0,
-            measurementCount: 1
+            measurementCount: 1,
+            collectDiagnostics: batch == 1,
+            batch: batch
         )
+        var batchReferenceMaximumError: Float?
+        if batch > 1, commandLine.arguments.indices.contains(productionIndex + 5) {
+            let referenceModelsURL = URL(
+                fileURLWithPath: commandLine.arguments[productionIndex + 5],
+                isDirectory: true
+            )
+            let elementsPerFrame = 3 * 256 * 256
+            var maximumError: Float = 0
+            for sample in 0..<batch {
+                let reference = try verifyFusedFourPassRecurrence(
+                    device: runner.device,
+                    modelsURL: referenceModelsURL,
+                    weightsURL: weightsURL,
+                    backwardFlows: [],
+                    forwardFlows: [],
+                    inputFrames: (0..<frameCount).map {
+                        makeJasnaSyntheticFrame(index: $0 + sample * frameCount)
+                    },
+                    stagedBranchFrames: [],
+                    stagedRestoredFrames: [],
+                    warmupCount: 0,
+                    measurementCount: 1,
+                    collectDiagnostics: false
+                )
+                for frame in 0..<frameCount {
+                    let start = sample * elementsPerFrame
+                    for index in 0..<elementsPerFrame {
+                        maximumError = max(
+                            maximumError,
+                            abs(
+                                Float(fused.restoredFrames[frame][start + index])
+                                    - Float(reference.restoredFrames[frame][index])
+                            )
+                        )
+                    }
+                }
+            }
+            guard maximumError <= 0.02 else {
+                throw DeformConvError.commandFailed(
+                    "batch output mismatch (maximum error \(maximumError))"
+                )
+            }
+            batchReferenceMaximumError = maximumError
+        }
         print("Production single-run \(frameCount)-frame graph: PASS")
+        print("Batch:              \(batch)")
         print("GPU timeline:       \(String(format: "%.3f", fused.statistics.median)) ms")
         print("Executions:         \(fused.statistics.samples.count)")
         print("Restored frames:    \(fused.restoredFrames.count)")
         print("Output elements:    \(fused.restoredFrames.reduce(0) { $0 + $1.count })")
         print("Flow/frame repeat:  \(fused.flowRepeatMaximumError) / \(fused.restoredRepeatMaximumError)")
+        if let batchReferenceMaximumError {
+            print("Batch/reference max: \(batchReferenceMaximumError)")
+        }
         print("Frame checksums:    \(fused.restoredChecksums.map { String(format: "%.6f", $0) }.joined(separator: " / "))")
     }
     try await commandLine.dispatch(.schedule) { scheduleIndex in

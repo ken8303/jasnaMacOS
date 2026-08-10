@@ -25,6 +25,7 @@ private struct SPyNetGraphPrepareShape {
     var sourceFlowHeight: UInt32
     var sourceFlowRowStride: UInt32
     var firstLevel: UInt32
+    var batch: UInt32 = 1
 }
 
 @available(macOS 27.0, *)
@@ -52,12 +53,16 @@ func verifySPyNetPair(
     inputVariant: Int = 0,
     validateOracle: Bool = true,
     referenceInput: [Float16]? = nil,
-    supportInput: [Float16]? = nil
+    supportInput: [Float16]? = nil,
+    batch: Int = 1
 ) throws -> SPyNetPairResult {
     let sizes = [2, 4, 8, 16, 32, 64]
-    guard (referenceInput == nil) == (supportInput == nil),
-          referenceInput?.count == nil || referenceInput?.count == 3 * 64 * 64,
-          supportInput?.count == nil || supportInput?.count == 3 * 64 * 64
+    let frameElements = batch * 3 * 64 * 64
+    guard batch > 0,
+          !validateOracle || batch == 1,
+          (referenceInput == nil) == (supportInput == nil),
+          referenceInput?.count == nil || referenceInput?.count == frameElements,
+          supportInput?.count == nil || supportInput?.count == frameElements
     else { throw DeformConvError.invalidShape }
 
     func makeBuffer(elements: Int) throws -> MTLBuffer {
@@ -133,10 +138,10 @@ func verifySPyNetPair(
         return heap
     }
 
-    let referenceFrame = try makeBuffer(elements: 3 * 64 * 64)
-    let supportFrame = try makeBuffer(elements: 3 * 64 * 64)
-    let referencePyramid = try sizes.map { try makeBuffer(elements: 3 * $0 * $0) }
-    let supportPyramid = try sizes.map { try makeBuffer(elements: 3 * $0 * $0) }
+    let referenceFrame = try makeBuffer(elements: frameElements)
+    let supportFrame = try makeBuffer(elements: frameElements)
+    let referencePyramid = try sizes.map { try makeBuffer(elements: batch * 3 * $0 * $0) }
+    let supportPyramid = try sizes.map { try makeBuffer(elements: batch * 3 * $0 * $0) }
     let zeroFlow = try makeBuffer(elements: 2 * 32 * 2)
 
     let library = try device.makeLibrary(source: MetalShader.source, options: nil)
@@ -166,13 +171,13 @@ func verifySPyNetPair(
             let rowStride = max(size, 32)
             let storagePlane = rowStride * size
             let (featureTensor, featureBuffer) = try makeTensor(
-                dimensions: [size, size, 8, 1], rowStride: rowStride
+                dimensions: [size, size, 8, batch], rowStride: rowStride
             )
             let (residualTensor, residualBuffer) = try makeTensor(
-                dimensions: [size, size, 2, 1], rowStride: rowStride
+                dimensions: [size, size, 2, batch], rowStride: rowStride
             )
-            let baseFlowBuffer = try makeBuffer(elements: 2 * storagePlane)
-            let outputFlowBuffer = try makeBuffer(elements: 2 * storagePlane)
+            let baseFlowBuffer = try makeBuffer(elements: batch * 2 * storagePlane)
+            let outputFlowBuffer = try makeBuffer(elements: batch * 2 * storagePlane)
             let previousFlow = level == 0 ? zeroFlow : directions[direction][level - 1].outputFlowBuffer
             let reference = direction == 0 ? referencePyramid[level] : supportPyramid[level]
             let support = direction == 0 ? supportPyramid[level] : referencePyramid[level]
@@ -183,7 +188,8 @@ func verifySPyNetPair(
                 sourceFlowWidth: UInt32(level == 0 ? 2 : sizes[level - 1]),
                 sourceFlowHeight: UInt32(level == 0 ? 2 : sizes[level - 1]),
                 sourceFlowRowStride: UInt32(level == 0 ? 32 : max(sizes[level - 1], 32)),
-                firstLevel: level == 0 ? 1 : 0
+                firstLevel: level == 0 ? 1 : 0,
+                batch: UInt32(batch)
             )
             let shapeBuffer = try makeConstant(&shape)
             let pipeline = levelPipelines[level]
@@ -244,8 +250,8 @@ func verifySPyNetPair(
         for buffer in transientBuffers {
             buffer.contents().initializeMemory(as: UInt8.self, repeating: 0, count: buffer.length)
         }
-        let reference = referenceFrame.contents().bindMemory(to: Float16.self, capacity: 3 * 4096)
-        let support = supportFrame.contents().bindMemory(to: Float16.self, capacity: 3 * 4096)
+        let reference = referenceFrame.contents().bindMemory(to: Float16.self, capacity: frameElements)
+        let support = supportFrame.contents().bindMemory(to: Float16.self, capacity: frameElements)
         if let referenceInput, let supportInput {
             referenceInput.withUnsafeBufferPointer { source in
                 reference.update(from: source.baseAddress!, count: source.count)
@@ -255,15 +261,17 @@ func verifySPyNetPair(
             }
             return
         }
-        for index in 0..<(3 * 4096) {
-            if inputVariant == 0 {
-                reference[index] = Float16(Float((index * 29 + 17) % 1021) / 1020)
-                support[index] = Float16(Float((index * 43 + 31) % 1019) / 1018)
+        for index in 0..<frameElements {
+            let sample = index / (3 * 4096)
+            let sampleIndex = index % (3 * 4096)
+            if (inputVariant + sample).isMultiple(of: 2) {
+                reference[index] = Float16(Float((sampleIndex * 29 + 17) % 1021) / 1020)
+                support[index] = Float16(Float((sampleIndex * 43 + 31) % 1019) / 1018)
             } else {
                 // The second adjacent pair starts with the first pair's support
                 // frame so a three-frame clip has a consistent middle frame.
-                reference[index] = Float16(Float((index * 43 + 31) % 1019) / 1018)
-                support[index] = Float16(Float((index * 53 + 47) % 1013) / 1012)
+                reference[index] = Float16(Float((sampleIndex * 43 + 31) % 1019) / 1018)
+                support[index] = Float16(Float((sampleIndex * 53 + 47) % 1013) / 1012)
             }
         }
     }
@@ -282,7 +290,7 @@ func verifySPyNetPair(
         pyramidEncoder.setComputePipelineState(pyramidPipeline)
         pyramidEncoder.setArgumentTable(pyramidArguments)
         pyramidEncoder.dispatchThreads(
-            threadsPerGrid: MTLSize(width: 3 * 64 * 64, height: 6, depth: 1),
+            threadsPerGrid: MTLSize(width: 3 * 64 * 64, height: 6, depth: batch),
             threadsPerThreadgroup: MTLSize(width: min(pyramidPipeline.threadExecutionWidth * 4, 256), height: 1, depth: 1)
         )
         pyramidEncoder.barrier(
@@ -302,7 +310,7 @@ func verifySPyNetPair(
                 prepareEncoder.setComputePipelineState(preparePipeline)
                 prepareEncoder.setArgumentTable(runtime.prepareArguments)
                 prepareEncoder.dispatchThreads(
-                    threadsPerGrid: MTLSize(width: runtime.size * runtime.size, height: 1, depth: 1),
+                    threadsPerGrid: MTLSize(width: batch * runtime.size * runtime.size, height: 1, depth: 1),
                     threadsPerThreadgroup: MTLSize(width: preparePipeline.threadExecutionWidth, height: 1, depth: 1)
                 )
             }
@@ -333,7 +341,7 @@ func verifySPyNetPair(
                 addEncoder.setComputePipelineState(addPipeline)
                 addEncoder.setArgumentTable(runtime.addArguments)
                 addEncoder.dispatchThreads(
-                    threadsPerGrid: MTLSize(width: 2 * runtime.size * runtime.size, height: 1, depth: 1),
+                    threadsPerGrid: MTLSize(width: batch * 2 * runtime.size * runtime.size, height: 1, depth: 1),
                     threadsPerThreadgroup: MTLSize(width: addPipeline.threadExecutionWidth, height: 1, depth: 1)
                 )
             }
@@ -361,16 +369,21 @@ func verifySPyNetPair(
         let outputs = directions.map { direction -> [Float16] in
             let runtime = direction[5]
             let pointer = runtime.outputFlowBuffer.contents().bindMemory(
-                to: Float16.self, capacity: 2 * runtime.rowStride * runtime.size
+                to: Float16.self, capacity: batch * 2 * runtime.rowStride * runtime.size
             )
-            var packed = [Float16](repeating: 0, count: 2 * runtime.size * runtime.size)
+            var packed = [Float16](
+                repeating: 0, count: batch * 2 * runtime.size * runtime.size
+            )
             let plane = runtime.size * runtime.size
             let storagePlane = runtime.rowStride * runtime.size
-            for channel in 0..<2 {
-                for y in 0..<runtime.size {
-                    for x in 0..<runtime.size {
-                        packed[channel * plane + y * runtime.size + x]
-                            = pointer[channel * storagePlane + y * runtime.rowStride + x]
+            for sample in 0..<batch {
+                for channel in 0..<2 {
+                    for y in 0..<runtime.size {
+                        for x in 0..<runtime.size {
+                            packed[(sample * 2 + channel) * plane + y * runtime.size + x]
+                                = pointer[(sample * 2 + channel) * storagePlane
+                                    + y * runtime.rowStride + x]
+                        }
                     }
                 }
             }
@@ -436,7 +449,7 @@ func verifySPyNetPair(
         minimumMilliseconds: samples[0],
         maximumMilliseconds: samples[samples.count - 1],
         iterations: samples.count,
-        elementCount: 2 * 2 * 4096,
+        elementCount: batch * 2 * 2 * 4096,
         backwardMaximum: maxima[0],
         forwardMaximum: maxima[1],
         repeatMaximumError: repeatError,
