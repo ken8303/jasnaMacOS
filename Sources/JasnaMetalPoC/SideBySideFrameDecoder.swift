@@ -6,11 +6,13 @@ import Foundation
 extension SideBySideRestoration {
     final class FrameDecoder {
         private let reader: AVAssetReader
-        private let output: AVAssetReaderTrackOutput
+        private let provider: AVAssetReaderOutput.Provider<
+            CMReadySampleBuffer<CMSampleBuffer.DynamicContent>
+        >
         private let dimensions: VideoDimensions
         private let cropX: Int
-        private var previous: CMSampleBuffer?
-        private var next: CMSampleBuffer?
+        private var previous: CMReadySampleBuffer<CMSampleBuffer.DynamicContent>?
+        private var next: CMReadySampleBuffer<CMSampleBuffer.DynamicContent>?
 
         init(
             inputURL: URL,
@@ -36,7 +38,7 @@ extension SideBySideRestoration {
                 )
             }
             reader = try AVAssetReader(asset: asset)
-            output = AVAssetReaderTrackOutput(
+            let output = AVAssetReaderTrackOutput(
                 track: track,
                 outputSettings: [
                     kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
@@ -45,29 +47,24 @@ extension SideBySideRestoration {
             )
             dimensions = plan.dimensions
             self.cropX = cropX
-            output.alwaysCopiesSampleData = false
             guard reader.canAdd(output) else {
                 throw DeformConvError.commandFailed("video reader rejected BGRA output")
             }
-            reader.add(output)
-            guard reader.startReading() else {
-                throw reader.error ?? DeformConvError.commandFailed("video reader failed to start")
-            }
-            next = output.copyNextSampleBuffer()
+            provider = reader.outputProvider(for: output)
+            try reader.start()
+            next = try await provider.next()
         }
 
         deinit { reader.cancelReading() }
 
-        func copyFrame(outputIndex: Int) throws -> CVPixelBuffer {
+        func copyFrame(outputIndex: Int) async throws -> CVPixelBuffer {
             let target = CMTime(value: CMTimeValue(outputIndex), timescale: 30)
             while let candidate = next,
-                  CMTimeCompare(CMSampleBufferGetPresentationTimeStamp(candidate), target) < 0 {
+                  CMTimeCompare(candidate.presentationTimeStamp, target) < 0 {
                 previous = candidate
-                next = output.copyNextSampleBuffer()
+                next = try await provider.next()
             }
-            guard let sample = Self.closest(previous: previous, next: next, to: target),
-                  let source = CMSampleBufferGetImageBuffer(sample)
-            else {
+            guard let sample = Self.closest(previous: previous, next: next, to: target) else {
                 if let error = reader.error as NSError?,
                    error.domain == AVFoundationErrorDomain,
                    error.code == AVError.Code.decoderNotFound.rawValue {
@@ -80,19 +77,31 @@ extension SideBySideRestoration {
                 throw reader.error
                     ?? DeformConvError.commandFailed("decoder ended before frame \(outputIndex)")
             }
-            return try Self.copyBGRA(source, dimensions: dimensions, cropX: cropX)
+            guard case .pixelBuffer(let source) = sample.content else {
+                throw DeformConvError.commandFailed("decoded video sample has no pixel buffer")
+            }
+            var copiedFrame: CVPixelBuffer?
+            try source.withUnsafeBuffer {
+                copiedFrame = try Self.copyBGRA($0, dimensions: dimensions, cropX: cropX)
+            }
+            guard let copiedFrame else {
+                throw DeformConvError.commandFailed("decoded frame copy was not created")
+            }
+            return copiedFrame
         }
 
         private static func closest(
-            previous: CMSampleBuffer?, next: CMSampleBuffer?, to target: CMTime
-        ) -> CMSampleBuffer? {
+            previous: CMReadySampleBuffer<CMSampleBuffer.DynamicContent>?,
+            next: CMReadySampleBuffer<CMSampleBuffer.DynamicContent>?,
+            to target: CMTime
+        ) -> CMReadySampleBuffer<CMSampleBuffer.DynamicContent>? {
             guard let previous else { return next }
             guard let next else { return previous }
             let priorDistance = abs(CMTimeGetSeconds(
-                CMTimeSubtract(CMSampleBufferGetPresentationTimeStamp(previous), target)
+                CMTimeSubtract(previous.presentationTimeStamp, target)
             ))
             let nextDistance = abs(CMTimeGetSeconds(
-                CMTimeSubtract(CMSampleBufferGetPresentationTimeStamp(next), target)
+                CMTimeSubtract(next.presentationTimeStamp, target)
             ))
             return priorDistance <= nextDistance ? previous : next
         }

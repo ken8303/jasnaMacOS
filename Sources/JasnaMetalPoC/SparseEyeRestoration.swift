@@ -164,8 +164,12 @@ extension SideBySideRestoration {
                             + "added \(subdivision.addedModelCropCount) overlapping crop(s)"
                     )
                 }
-                let baseFrames = try (0..<outputCount).map {
-                    try decoder.copyFrame(outputIndex: windowStart + $0)
+                var baseFrames = [CVPixelBuffer]()
+                baseFrames.reserveCapacity(outputCount)
+                for localFrame in 0..<outputCount {
+                    baseFrames.append(
+                        try await decoder.copyFrame(outputIndex: windowStart + localFrame)
+                    )
                 }
                 let attachments = baseFrames.map {
                     CVBufferCopyAttachments($0, .shouldPropagate)
@@ -402,11 +406,17 @@ extension SideBySideRestoration {
                         + "\(rightSubdivision.addedModelCropCount)"
                 )
             }
-            var leftFrames = try (0..<outputCount).map {
-                try leftDecoder.copyFrame(outputIndex: windowStart + $0)
-            }
-            var rightFrames = try (0..<outputCount).map {
-                try rightDecoder.copyFrame(outputIndex: windowStart + $0)
+            var leftFrames = [CVPixelBuffer]()
+            var rightFrames = [CVPixelBuffer]()
+            leftFrames.reserveCapacity(outputCount)
+            rightFrames.reserveCapacity(outputCount)
+            for localFrame in 0..<outputCount {
+                leftFrames.append(
+                    try await leftDecoder.copyFrame(outputIndex: windowStart + localFrame)
+                )
+                rightFrames.append(
+                    try await rightDecoder.copyFrame(outputIndex: windowStart + localFrame)
+                )
             }
             let leftOutputFrames = leftFrames
             let rightOutputFrames = rightFrames

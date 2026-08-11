@@ -1,5 +1,8 @@
 # Jasna Metal proof of concept
 
+This branch requires macOS 27 and Xcode 27 (Swift 6.4). It intentionally no
+longer targets older macOS releases.
+
 This project tests the highest-risk operation in a native Apple Silicon port of
 Jasna: the modulated deformable convolution used by BasicVSR++. It contains:
 
@@ -58,6 +61,29 @@ the same Metal 4 command buffer:
 ./script/build_and_run.sh --metal-ml-interop
 ```
 
+Export and benchmark the experimental Core AI version of the real Jasna feature
+extractor (the generated model and fixtures remain local under `Models/CoreAI`):
+
+```sh
+python3.13 -m venv .venv-coreai
+.venv-coreai/bin/pip install coreai-torch torch torchvision mmengine
+.venv-coreai/bin/python tools/convert_coreai_feature_extract.py \
+  --jasna-source ../../work/jasna \
+  --weights Models/SourceWeights/lada_mosaic_restoration_model_generic_v1.2.pth \
+  --output Models/CoreAI/feature_extract.aimodel
+./script/build_and_run.sh --core-ai-feature-extract
+```
+
+The Core AI spike is a measured experiment, not the restoration default. On an
+Apple M4, its GPU-specialized output matched the PyTorch reference with maximum
+error `3.05e-5`. A persistent `ComputeStream` and reusable zero-copy Metal input
+and output buffers reduced a 30-frame stream to `1.221 ms/frame` median, versus
+about `2.8 ms` when waiting after every inference. The existing Metal ML feature
+extractor still measured `0.445 ms`, so Core AI remained about 2.7× slower even
+under the streamed comparison. GPU-specialized loading measured about
+`13–20 ms` once cached. The project therefore keeps Metal ML for the hot
+restoration graph while retaining this probe for later Xcode beta comparisons.
+
 Run a complete first propagation body in one Metal 4 command buffer, using the
 real offset and backbone packages plus the checkpoint DCNv2 weights:
 
@@ -100,6 +126,9 @@ Metal-compatible pixel buffers, selects the nearest source frame for every
 exact `n/30` output timestamp, and writes HEVC. A generated 512×256 SBS smoke
 video converted from 60 fps to 30 fps with 30 frames written and the output
 metadata re-opened and validated. Existing output files are never overwritten.
+The macOS 27 path uses `AVAssetReaderOutput.Provider.next()` and asynchronous
+pixel-buffer receivers throughout. It no longer uses deprecated reader/writer
+adaptors or polls encoder readiness with one-millisecond sleeps.
 This first path is video-only and BGRA/SDR: audio copying, HDR/10-bit color
 preservation, rotated tracks, and Metal restoration insertion remain explicit
 follow-up work.
@@ -855,7 +884,7 @@ own batching gain is only about 2%; the larger expected win remains in the
 Metal ML packages above.
 
 The converter intentionally emits the iOS 18 Core ML operation set, even though
-the runtime target is macOS 26+. Xcode 27 beta 4's Metal package builder crashes
+the runtime target is macOS 27. Xcode 27 beta 4's Metal package builder crashes
 on the newer `ios19.add` representation; the equivalent `ios18.add` compiles.
 
 After conversion, `tools/build_metal_packages.sh` turns each `.mlpackage` into

@@ -753,6 +753,32 @@ func runJasnaCLI() async throws {
         print("Model output max: \(result.baselineMaximum)")
         print("Model checksum:   \(String(format: "%.6f", result.baselineChecksum))")
     }
+    try await commandLine.dispatch(.coreAIFeatureExtract) { coreAIIndex in
+        guard commandLine.arguments.indices.contains(coreAIIndex + 1) else {
+            throw DeformConvError.commandFailed(
+                "--core-ai-feature-extract requires feature_extract.aimodel"
+            )
+        }
+        let modelURL = URL(fileURLWithPath: commandLine.arguments[coreAIIndex + 1])
+        let fixtureBaseURL = modelURL.deletingPathExtension()
+        let result = try await probeCoreAIFeatureExtract(
+            modelURL: modelURL,
+            inputURL: fixtureBaseURL.appendingPathExtension("input.f32"),
+            referenceURL: fixtureBaseURL.appendingPathExtension("reference.f32")
+        )
+        print("Core AI feature extraction: PASS")
+        print("Execution:          GPU specialization + zero-copy Metal buffers")
+        print("Output shape:       \(result.outputShape)")
+        print("Specialize + load:  \(String(format: "%.3f", result.specializationAndLoadMilliseconds)) ms")
+        print("Warm median:        \(String(format: "%.3f", result.statistics.median)) ms")
+        print("Warm P10–P90:       \(String(format: "%.3f–%.3f", result.statistics.percentile10, result.statistics.percentile90)) ms")
+        print("Warm best/worst:    \(String(format: "%.3f / %.3f", result.statistics.minimum, result.statistics.maximum)) ms")
+        print("Streamed \(result.streamedBatchSize)-frame median: \(String(format: "%.3f", result.streamedStatistics.median)) ms/frame")
+        print("Streamed P10–P90:   \(String(format: "%.3f–%.3f", result.streamedStatistics.percentile10, result.streamedStatistics.percentile90)) ms/frame")
+        print("Maximum error:      \(result.maximumError)")
+        print("Mean error:         \(String(format: "%.8f", result.meanError))")
+        print("Output checksum:    \(String(format: "%.6f", result.checksum))")
+    }
     try await commandLine.dispatch(.propagationSmoke) { propagationIndex in
         guard commandLine.arguments.indices.contains(propagationIndex + 2) else {
             throw DeformConvError.commandFailed(
