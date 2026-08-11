@@ -188,12 +188,24 @@ video_duration() {
     -of default=noprint_wrappers=1:nokey=1 "$1" 2>/dev/null
 }
 
+video_stream_duration() {
+  "$FFPROBE_PATH" -v error -select_streams v:0 \
+    -show_entries stream=duration \
+    -of default=noprint_wrappers=1:nokey=1 "$1" 2>/dev/null
+}
+
+video_frame_count() {
+  "$FFPROBE_PATH" -v error -select_streams v:0 \
+    -show_entries stream=nb_frames \
+    -of default=noprint_wrappers=1:nokey=1 "$1" 2>/dev/null
+}
+
 duration_matches() {
   local candidate="$1"
   local expected="$2"
   [[ -s "$candidate" ]] || return 1
   local candidate_duration
-  candidate_duration="$(video_duration "$candidate")" || return 1
+  candidate_duration="$(video_stream_duration "$candidate")" || return 1
   [[ "$candidate_duration" =~ ^[0-9]+([.][0-9]+)?$ ]] || return 1
   /usr/bin/awk -v expected="$expected" -v candidate="$candidate_duration" \
     'BEGIN { delta = expected - candidate; if (delta < 0) delta = -delta; exit !(delta <= 0.05) }'
@@ -300,13 +312,22 @@ else
 fi
 
 TEST_DURATION="$(video_duration "$TEST_INPUT")"
-EXPECTED_FRAME_COUNT="$(
-  /usr/bin/awk -v duration="$TEST_DURATION" 'BEGIN { printf "%d\n", int(duration * 30 + 0.5) }'
-)"
+TEST_VIDEO_DURATION="$(video_stream_duration "$TEST_INPUT")"
+[[ "$TEST_VIDEO_DURATION" =~ ^[0-9]+([.][0-9]+)?$ ]] || {
+  echo "error: unable to read prepared source video duration" >&2
+  exit 1
+}
+EXPECTED_FRAME_COUNT="$(video_frame_count "$TEST_INPUT")"
+if [[ ! "$EXPECTED_FRAME_COUNT" =~ ^[0-9]+$ ]]; then
+  EXPECTED_FRAME_COUNT="$(
+    /usr/bin/awk -v duration="$TEST_VIDEO_DURATION" \
+      'BEGIN { printf "%d\n", int(duration * 30 + 0.5) }'
+  )"
+fi
 
 completed_sbs_output() {
   local candidate="$1"
-  duration_matches "$candidate" "$TEST_DURATION" || return 1
+  duration_matches "$candidate" "$TEST_VIDEO_DURATION" || return 1
   local codec width height frame_rate frame_count extra
   IFS=, read -r codec width height frame_rate frame_count extra < <(
     "$FFPROBE_PATH" -v error -select_streams v:0 \
@@ -492,6 +513,13 @@ if [[ "$DIRECT_SBS_OUTPUT" == "1" ]]; then
   done
   if completed_sbs_output "$OUTPUT_PATH"; then
     echo "Final direct SBS output already complete"
+  elif completed_sbs_output "$FINAL_TEMP"; then
+    echo "Promoting previously joined and validated direct SBS output"
+    if [[ -e "$OUTPUT_PATH" ]]; then
+      mv "$OUTPUT_PATH" \
+        "$OUTPUT_DIR/${OUTPUT_STEM}.previous-$(date '+%Y%m%d-%H%M%S').${OUTPUT_NAME##*.}"
+    fi
+    mv "$FINAL_TEMP" "$OUTPUT_PATH"
   else
     if [[ -e "$FINAL_TEMP" ]]; then
       mv "$FINAL_TEMP" "$WORK_DIR/direct-sbs.interrupted-$(date '+%Y%m%d-%H%M%S').mov"
@@ -558,6 +586,13 @@ JASNA_VR_PROJECTION=fisheye \
 if completed_sbs_output "$OUTPUT_PATH" \
     && [[ "$OUTPUT_PATH" -nt "$LEFT_OUTPUT" && "$OUTPUT_PATH" -nt "$RIGHT_OUTPUT" ]]; then
   echo "Stage 4/4: combined SBS output already complete"
+elif completed_sbs_output "$FINAL_TEMP"; then
+  echo "Stage 4/4: promoting previously joined and validated SBS output"
+  if [[ -e "$OUTPUT_PATH" ]]; then
+    mv "$OUTPUT_PATH" \
+      "$OUTPUT_DIR/${OUTPUT_STEM}.previous-$(date '+%Y%m%d-%H%M%S').${OUTPUT_NAME##*.}"
+  fi
+  mv "$FINAL_TEMP" "$OUTPUT_PATH"
 else
   if [[ -e "$FINAL_TEMP" ]]; then
     mv "$FINAL_TEMP" "$WORK_DIR/joined-sbs.interrupted-$(date '+%Y%m%d-%H%M%S').mov"
