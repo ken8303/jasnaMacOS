@@ -6,7 +6,7 @@ usage() {
   echo "example: $0 input.mp4 restored-test.mov 00:12:00" >&2
   echo "optional: JASNA_TEST_SECONDS=30 (1-300, or full)" >&2
   echo "          JASNA_ENCODER_WINDOWS_PER_SEGMENT=120" >&2
-  echo "          JASNA_METAL_WINDOWS_PER_PROCESS=12 (releases Metal memory between parts)" >&2
+  echo "          JASNA_METAL_WINDOWS_PER_PROCESS=1 (bounds macOS 27 writer memory)" >&2
   echo "          JASNA_EYE_BITRATE=20000000 JASNA_VR_BITRATE=40000000" >&2
   echo "          JASNA_DIRECT_SBS_OUTPUT=1 (set 0 for the legacy three-encode path)" >&2
   echo "          JASNA_LARGE_REGION_MAX_BLEND=768 JASNA_LARGE_REGION_OVERLAP=96" >&2
@@ -28,7 +28,7 @@ VR_BITRATE="${JASNA_VR_BITRATE:-40000000}"
 FAST_ENCODE="${JASNA_FAST_ENCODE:-1}"
 FAST_SOURCE_COPY="${JASNA_FAST_SOURCE_COPY:-auto}"
 DIRECT_SBS_OUTPUT="${JASNA_DIRECT_SBS_OUTPUT:-1}"
-METAL_WINDOWS_PER_PROCESS="${JASNA_METAL_WINDOWS_PER_PROCESS:-12}"
+METAL_WINDOWS_PER_PROCESS="${JASNA_METAL_WINDOWS_PER_PROCESS:-1}"
 MODEL_BATCH="${JASNA_MODEL_BATCH:-1}"
 
 [[ -f "$INPUT_PATH" ]] || {
@@ -160,14 +160,20 @@ large_region_mask_temporal_radius=${JASNA_LARGE_REGION_MASK_TEMPORAL_RADIUS:-1}
 large_region_detail_crops=${JASNA_LARGE_REGION_DETAIL_CROPS:-1}
 large_region_detail_dimension=${JASNA_LARGE_REGION_DETAIL_DIMENSION:-576}
 projection=fisheye"
-if [[ -s "$RUN_CONFIG_PATH" && "$(<"$RUN_CONFIG_PATH")" != "$RUN_CONFIG" ]]; then
-  echo "error: this output path belongs to a different test configuration" >&2
-  echo "use a new output filename, or restore the original input/start/settings" >&2
-  exit 1
+if [[ -s "$RUN_CONFIG_PATH" ]]; then
+  EXISTING_STABLE_CONFIG="$(
+    /usr/bin/sed '/^metal_windows_per_process=/d' "$RUN_CONFIG_PATH"
+  )"
+  CURRENT_STABLE_CONFIG="$(
+    printf '%s\n' "$RUN_CONFIG" | /usr/bin/sed '/^metal_windows_per_process=/d'
+  )"
+  if [[ "$EXISTING_STABLE_CONFIG" != "$CURRENT_STABLE_CONFIG" ]]; then
+    echo "error: this output path belongs to a different test configuration" >&2
+    echo "use a new output filename, or restore the original input/start/settings" >&2
+    exit 1
+  fi
 fi
-if [[ ! -s "$RUN_CONFIG_PATH" ]]; then
-  printf '%s\n' "$RUN_CONFIG" > "$RUN_CONFIG_PATH"
-fi
+printf '%s\n' "$RUN_CONFIG" > "$RUN_CONFIG_PATH"
 exec > >(/usr/bin/tee -a "$LOG_PATH") 2>&1
 
 echo
@@ -351,6 +357,60 @@ completed_sbs_output() {
     -frames:v 1 -f null - </dev/null >/dev/null 2>&1
 }
 
+valid_direct_segment() {
+  local candidate="$1"
+  local expected_frames="$2"
+  [[ -s "$candidate" ]] || return 1
+  local codec width height frame_rate frame_count extra
+  IFS=, read -r codec width height frame_rate frame_count extra < <(
+    "$FFPROBE_PATH" -v error -select_streams v:0 \
+      -show_entries stream=codec_name,width,height,avg_frame_rate,nb_frames \
+      -of csv=p=0 "$candidate" 2>/dev/null
+  )
+  [[ -z "$extra" \
+    && "$codec" == "hevc" \
+    && "$width" == "$SOURCE_WIDTH" \
+    && "$height" == "$SOURCE_HEIGHT" \
+    && "$frame_count" =~ ^[0-9]+$ ]] || return 1
+  /usr/bin/awk -F/ '
+    NF == 2 && $2 != 0 { rate = $1 / $2 }
+    NF == 1 { rate = $1 }
+    END { exit !(rate >= 29.99 && rate <= 30.01) }
+  ' <<< "$frame_rate" || return 1
+  /usr/bin/awk -v actual="$frame_count" -v expected="$expected_frames" '
+    BEGIN { delta = actual - expected; if (delta < 0) delta = -delta; exit !(delta <= 1) }
+  ' || return 1
+  "$FFMPEG_PATH" -v error -i "$candidate" -map '0:v:0' \
+    -frames:v 1 -f null - </dev/null >/dev/null 2>&1
+}
+
+reusable_direct_segment() {
+  local job_index="$1"
+  local window_start="$2"
+  local job_window_count="$3"
+  local job_frame_count="$4"
+  local prefix candidate filename end expected_frames
+  local best_end=0
+  local best_path=""
+  prefix="$(printf 'segment-%05d-windows-%05d-' "$job_index" "$window_start")"
+  for candidate in "$DIRECT_SEGMENT_DIR"/"$prefix"*.mov; do
+    [[ -e "$candidate" ]] || continue
+    filename="$(basename "$candidate")"
+    [[ "$filename" =~ ^${prefix}([0-9]{5})[.]mov$ ]] || continue
+    end=$((10#${BASH_REMATCH[1]}))
+    (( end > window_start && end <= job_window_count )) || continue
+    expected_frames=$((end * 30))
+    (( expected_frames > job_frame_count )) && expected_frames="$job_frame_count"
+    expected_frames=$((expected_frames - window_start * 30))
+    if (( end > best_end )) && valid_direct_segment "$candidate" "$expected_frames"; then
+      best_end="$end"
+      best_path="$candidate"
+    fi
+  done
+  [[ -n "$best_path" ]] || return 1
+  printf '%s\t%s\n' "$best_end" "$best_path"
+}
+
 if [[ -z "${JASNA_APP_BINARY:-}" ]]; then
   for CANDIDATE in \
     "$ROOT_DIR/.build/out/Products/Release/JasnaMetalPoC" \
@@ -474,8 +534,20 @@ if [[ "$DIRECT_SBS_OUTPUT" == "1" ]]; then
       )"
     fi
     JOB_WINDOW_COUNT=$(( (JOB_FRAME_COUNT + 29) / 30 ))
-    for ((WINDOW_START = 0; WINDOW_START < JOB_WINDOW_COUNT; \
-      WINDOW_START += METAL_WINDOWS_PER_PROCESS)); do
+    WINDOW_START=0
+    while (( WINDOW_START < JOB_WINDOW_COUNT )); do
+      REUSABLE_SEGMENT="$(
+        reusable_direct_segment \
+          "$JOB_INDEX" "$WINDOW_START" "$JOB_WINDOW_COUNT" "$JOB_FRAME_COUNT" \
+          || true
+      )"
+      if [[ -n "$REUSABLE_SEGMENT" ]]; then
+        IFS=$'\t' read -r REUSABLE_END DIRECT_SEGMENT <<< "$REUSABLE_SEGMENT"
+        DIRECT_SEGMENTS+=("$DIRECT_SEGMENT")
+        echo "Reusing validated direct SBS windows $((WINDOW_START + 1))-$REUSABLE_END/$JOB_WINDOW_COUNT"
+        WINDOW_START="$REUSABLE_END"
+        continue
+      fi
       WINDOW_COUNT=$((JOB_WINDOW_COUNT - WINDOW_START))
       (( WINDOW_COUNT > METAL_WINDOWS_PER_PROCESS )) \
         && WINDOW_COUNT="$METAL_WINDOWS_PER_PROCESS"
@@ -498,6 +570,7 @@ if [[ "$DIRECT_SBS_OUTPUT" == "1" ]]; then
           "${RIGHT_JOB_MANIFESTS[$JOB_INDEX]}" \
           "${LEFT_JOB_CACHES[$JOB_INDEX]}" \
           "${RIGHT_JOB_CACHES[$JOB_INDEX]}"
+      WINDOW_START="$WINDOW_END"
     done
   done
   echo "Restored ${#DIRECT_SEGMENTS[@]} isolated 8K SBS part(s)"
