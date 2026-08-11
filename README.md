@@ -260,22 +260,24 @@ crops required by a full 3x3 grid. Tune `JASNA_LARGE_REGION_DETAIL_CROPS` from
 `0` through `2` and `JASNA_LARGE_REGION_DETAIL_DIMENSION` from 256 pixels up to
 the configured large-region maximum.
 Metal 4/MPSGraph allocations on the macOS 27 beta are released reliably only when
-the restoration process exits. Direct SBS restoration therefore defaults to six
-temporal windows per subprocess, writes a validated HEVC part, exits to release
-`IOAccelerator` and `IOSurface` memory, and concatenates the parts without another
-video encode. Set `JASNA_METAL_WINDOWS_PER_PROCESS` from 1 through 30 to tune the
-peak-memory/startup tradeoff; twelve is the measured default for a 16 GB M4 Mac.
-Set it to `6` for the earlier conservative limit.
+the restoration process exits. The macOS 27 asynchronous AVFoundation receiver
+can also retain queued 8K BGRA frames until an HEVC part finishes. Direct SBS
+restoration therefore defaults to one temporal window per subprocess, writes a
+validated HEVC part, exits to release `IOAccelerator`, `IOSurface`, and encoder
+buffers, and concatenates the parts without another video encode. Set
+`JASNA_METAL_WINDOWS_PER_PROCESS` from 1 through 30 only to make an explicit
+peak-memory/startup tradeoff. Completed larger parts are validated and reused if
+the limit is lowered while resuming an interrupted run.
 Each work directory also has its own process lock. A second command targeting the
 same resume data fails clearly, while unrelated restorations are left running.
 Every isolated restoration subprocess logs `Runtime memory: peak resident` at
 exit. This uses Darwin's per-process high-water mark and makes six- versus
 twelve-window memory comparisons visible in the persistent restoration log.
-Set `JASNA_LOG_PEAK_MEMORY=0` only when this telemetry is not wanted. A real
-30-second 8K SBS batch-1 comparison completed in three 12-window processes at
-5.74, 5.82, and 5.57 GiB peak resident memory, without progressive growth. Its
-restoration span was 182 seconds versus 201 seconds for five six-window
-processes, a 9.5% reduction.
+Set `JASNA_LOG_PEAK_MEMORY=0` only when this telemetry is not wanted. The former
+12-window default measured 5.57–5.82 GiB before the macOS 27 receiver migration,
+but the new receiver allowed retained encoder surfaces to grow beyond 32 GiB in
+a long 8K run. One-window isolation is the safe default until that beta behavior
+is fixed or a bounded writer handoff is available.
 The current sparse VR path decodes and encodes 8-bit BGRA/SDR. A Main 10 or HDR
 source therefore does not retain its original bit depth or HDR transfer
 characteristics; do not use this path when HDR preservation is required.
