@@ -172,8 +172,10 @@ enum SideBySideRestoration {
                 "Window \(windowIndex + 1)/\(plan.temporalWindowCount): decoding "
                     + "\(outputCount) output frames from frame \(windowStart)"
             )
-            var decoded = try (0..<outputCount).map {
-                try decoder.copyFrame(outputIndex: windowStart + $0)
+            var decoded = [CVPixelBuffer]()
+            decoded.reserveCapacity(outputCount)
+            for localFrame in 0..<outputCount {
+                decoded.append(try await decoder.copyFrame(outputIndex: windowStart + localFrame))
             }
             let attachments = decoded.map { CVBufferCopyAttachments($0, .shouldPropagate) }
             while decoded.count < 3 {
@@ -294,8 +296,10 @@ enum SideBySideRestoration {
                 "Window \(windowIndex + 1)/\(plan.temporalWindowCount): decoding "
                     + "\(outputCount) output frames from frame \(windowStart)"
             )
-            var decoded = try (0..<outputCount).map {
-                try decoder.copyFrame(outputIndex: windowStart + $0)
+            var decoded = [CVPixelBuffer]()
+            decoded.reserveCapacity(outputCount)
+            for localFrame in 0..<outputCount {
+                decoded.append(try await decoder.copyFrame(outputIndex: windowStart + localFrame))
             }
             let attachments = decoded.map { CVBufferCopyAttachments($0, .shouldPropagate) }
             while decoded.count < 3 {
@@ -370,7 +374,11 @@ enum SideBySideRestoration {
                 + "x \(tile.x), y \(tile.y) with \(outputCount) frames"
         )
         let decoder = try await FrameDecoder(inputURL: inputURL, plan: plan)
-        var decoded = try (0..<outputCount).map { try decoder.copyFrame(outputIndex: $0) }
+        var decoded = [CVPixelBuffer]()
+        decoded.reserveCapacity(outputCount)
+        for outputIndex in 0..<outputCount {
+            decoded.append(try await decoder.copyFrame(outputIndex: outputIndex))
+        }
         while decoded.count < 3 {
             guard let last = decoded.last else { throw DeformConvError.invalidShape }
             decoded.append(last)

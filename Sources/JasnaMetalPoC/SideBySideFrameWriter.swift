@@ -6,6 +6,11 @@ import Metal
 @available(macOS 27.0, *)
 extension SideBySideRestoration {
     final class RestoredFrameWriter {
+        // Created only after all CPU/Metal writes finish; the receiver gets read-only ownership.
+        private struct FinishedPixelBuffer: @unchecked Sendable {
+            let value: CVPixelBuffer
+        }
+
         private struct CompositedRegionFrame {
             let localFrame: Int
             let pixelBuffer: CVPixelBuffer
@@ -255,8 +260,8 @@ extension SideBySideRestoration {
         }
 
         private let writer: AVAssetWriter
-        private let input: AVAssetWriterInput
-        private let adaptor: AVAssetWriterInputPixelBufferAdaptor
+        private let receiver: AVAssetWriterInput.PixelBufferReceiver
+        private let pixelBufferPool: CVPixelBufferPool
         private let metalCompositor: MetalMosaicCompositor?
 
         init(device: MTLDevice, outputURL: URL, plan: SideBySideVideoPlan) throws {
@@ -270,7 +275,7 @@ extension SideBySideRestoration {
             let bitRate = min(
                 160_000_000, max(8_000_000, configuredBitRate ?? automaticBitRate)
             )
-            input = AVAssetWriterInput(
+            let input = AVAssetWriterInput(
                 mediaType: .video,
                 outputSettings: [
                     AVVideoCodecKey: AVVideoCodecType.hevc,
@@ -284,23 +289,38 @@ extension SideBySideRestoration {
                     ],
                 ]
             )
-            adaptor = AVAssetWriterInputPixelBufferAdaptor(
-                assetWriterInput: input,
-                sourcePixelBufferAttributes: [
-                    kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
-                    kCVPixelBufferWidthKey as String: plan.dimensions.width,
-                    kCVPixelBufferHeightKey as String: plan.dimensions.height,
-                    kCVPixelBufferMetalCompatibilityKey as String: true,
-                    kCVPixelBufferIOSurfacePropertiesKey as String: [:],
-                ]
-            )
             guard writer.canAdd(input) else {
                 throw DeformConvError.commandFailed("video writer rejected restored frames")
             }
-            writer.add(input)
-            guard writer.startWriting() else {
-                throw writer.error ?? DeformConvError.commandFailed("video writer failed to start")
+            var creationAttributes = CVPixelBufferCreationAttributes(
+                pixelFormatType: CVPixelFormatType(
+                    rawValue: kCVPixelFormatType_32BGRA
+                ),
+                size: CVImageSize(
+                    width: plan.dimensions.width, height: plan.dimensions.height
+                ),
+                compatibility: [.metalTexture]
+            )
+            creationAttributes.backing = .ioSurface
+            receiver = writer.inputPixelBufferReceiver(
+                for: input, pixelBufferAttributes: creationAttributes
+            )
+            let legacyAttributes: CFDictionary = [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                kCVPixelBufferWidthKey as String: plan.dimensions.width,
+                kCVPixelBufferHeightKey as String: plan.dimensions.height,
+                kCVPixelBufferMetalCompatibilityKey as String: true,
+                kCVPixelBufferIOSurfacePropertiesKey as String: [:],
+            ] as CFDictionary
+            var optionalPool: CVPixelBufferPool?
+            let poolStatus = CVPixelBufferPoolCreate(
+                nil, nil, legacyAttributes, &optionalPool
+            )
+            guard poolStatus == kCVReturnSuccess, let optionalPool else {
+                throw DeformConvError.commandFailed("failed creating restored-frame pool")
             }
+            pixelBufferPool = optionalPool
+            try writer.start()
             writer.startSession(atSourceTime: .zero)
         }
 
@@ -342,17 +362,10 @@ extension SideBySideRestoration {
                     restoredTiles.append((tile, values))
                 }
                 try cache.close()
-                while !input.isReadyForMoreMediaData {
-                    if writer.status == .failed {
-                        throw writer.error ?? DeformConvError.commandFailed("video writer failed")
-                    }
-                    try await Task.sleep(for: .milliseconds(1))
-                }
-                guard let pool = adaptor.pixelBufferPool else {
-                    throw DeformConvError.commandFailed("video writer has no pixel-buffer pool")
-                }
                 var optionalBuffer: CVPixelBuffer?
-                let status = CVPixelBufferPoolCreatePixelBuffer(nil, pool, &optionalBuffer)
+                let status = CVPixelBufferPoolCreatePixelBuffer(
+                    nil, pixelBufferPool, &optionalBuffer
+                )
                 guard status == kCVReturnSuccess, let pixelBuffer = optionalBuffer else {
                     throw DeformConvError.commandFailed("failed allocating restored output frame")
                 }
@@ -377,10 +390,7 @@ extension SideBySideRestoration {
                 }
                 let outputFrame = startFrame + localFrame
                 let time = CMTime(value: CMTimeValue(outputFrame), timescale: 30)
-                guard adaptor.append(pixelBuffer, withPresentationTime: time) else {
-                    throw writer.error
-                        ?? DeformConvError.commandFailed("failed encoding frame \(outputFrame)")
-                }
+                try await append(FinishedPixelBuffer(value: pixelBuffer), at: time, frame: outputFrame)
                 report(
                     "Queued output frame \(progressFrame + 1)/"
                         + "\(plan.frameRate.outputFrameCount) in "
@@ -428,9 +438,6 @@ extension SideBySideRestoration {
                             ? "Metal zero-copy texture" : "Metal buffer-copy fallback"
                     }()
             )
-            guard let pool = adaptor.pixelBufferPool else {
-                throw DeformConvError.commandFailed("video writer has no pixel-buffer pool")
-            }
             var nextFrame = 0
             while nextFrame < cacheURLs.count {
                 let batchEnd = min(cacheURLs.count, nextFrame + compositeConcurrency)
@@ -439,7 +446,9 @@ extension SideBySideRestoration {
                 outputBuffers.reserveCapacity(localFrames.count)
                 for localFrame in localFrames {
                     var optionalBuffer: CVPixelBuffer?
-                    let status = CVPixelBufferPoolCreatePixelBuffer(nil, pool, &optionalBuffer)
+                    let status = CVPixelBufferPoolCreatePixelBuffer(
+                        nil, pixelBufferPool, &optionalBuffer
+                    )
                     guard status == kCVReturnSuccess, let pixelBuffer = optionalBuffer else {
                         throw DeformConvError.commandFailed(
                             "failed allocating restored output frame"
@@ -470,21 +479,12 @@ extension SideBySideRestoration {
                     }
                 }
                 for composited in try batch.results() {
-                    while !input.isReadyForMoreMediaData {
-                        if writer.status == .failed {
-                            throw writer.error
-                                ?? DeformConvError.commandFailed("video writer failed")
-                        }
-                        try await Task.sleep(for: .milliseconds(1))
-                    }
                     let outputFrame = startFrame + composited.localFrame
                     let time = CMTime(value: CMTimeValue(outputFrame), timescale: 30)
-                    guard adaptor.append(composited.pixelBuffer, withPresentationTime: time) else {
-                        throw writer.error
-                            ?? DeformConvError.commandFailed(
-                                "failed encoding frame \(outputFrame)"
-                            )
-                    }
+                    try await append(
+                        FinishedPixelBuffer(value: composited.pixelBuffer),
+                        at: time, frame: outputFrame
+                    )
                     report(
                         "Queued crop-restored output frame "
                             + "\(progressStartFrame + composited.localFrame + 1)/"
@@ -519,23 +519,16 @@ extension SideBySideRestoration {
                   rightRegions.count == rightSamplingMaps.count,
                   plan.eyeLayout == .sideBySide
             else { throw DeformConvError.invalidShape }
-            guard let pool = adaptor.pixelBufferPool else {
-                throw DeformConvError.commandFailed("video writer has no pixel-buffer pool")
-            }
             report(
                 "Direct SBS compositing \(frameCount) frame(s), left/right regions "
                     + "\(leftRegions.count)/\(rightRegions.count)"
             )
             for localFrame in 0..<frameCount {
                 let frameStarted = ContinuousClock.now
-                while !input.isReadyForMoreMediaData {
-                    if writer.status == .failed {
-                        throw writer.error ?? DeformConvError.commandFailed("video writer failed")
-                    }
-                    try await Task.sleep(for: .milliseconds(1))
-                }
                 var optionalOutput: CVPixelBuffer?
-                let status = CVPixelBufferPoolCreatePixelBuffer(nil, pool, &optionalOutput)
+                let status = CVPixelBufferPoolCreatePixelBuffer(
+                    nil, pixelBufferPool, &optionalOutput
+                )
                 guard status == kCVReturnSuccess, let outputBuffer = optionalOutput else {
                     throw DeformConvError.commandFailed("failed allocating direct SBS frame")
                 }
@@ -596,10 +589,10 @@ extension SideBySideRestoration {
                 let presentationTime = CMTime(
                     value: CMTimeValue(presentationStartFrame + localFrame), timescale: 30
                 )
-                guard adaptor.append(outputBuffer, withPresentationTime: presentationTime) else {
-                    throw writer.error
-                        ?? DeformConvError.commandFailed("failed encoding direct SBS frame")
-                }
+                try await append(
+                    FinishedPixelBuffer(value: outputBuffer), at: presentationTime,
+                    frame: presentationStartFrame + localFrame
+                )
                 report(
                     "Queued direct SBS frame \(absoluteFrame + 1)/"
                         + "\(progressFrameCount); composite "
@@ -714,12 +707,28 @@ extension SideBySideRestoration {
         }
 
         func finish() async throws {
-            input.markAsFinished()
+            receiver.finish()
             await withCheckedContinuation { continuation in
                 writer.finishWriting { continuation.resume() }
             }
             guard writer.status == .completed else {
                 throw writer.error ?? DeformConvError.commandFailed("video writer did not complete")
+            }
+        }
+
+        private func append(
+            _ pixelBuffer: consuming FinishedPixelBuffer,
+            at presentationTime: CMTime,
+            frame: Int
+        ) async throws {
+            let readOnly = CVReadOnlyPixelBuffer(unsafeBuffer: pixelBuffer.value)
+            do {
+                try await receiver.append(readOnly, with: presentationTime)
+            } catch {
+                throw writer.error
+                    ?? DeformConvError.commandFailed(
+                        "failed encoding frame \(frame): \(error)"
+                    )
             }
         }
     }

@@ -77,11 +77,10 @@ enum SideBySideVideoIO {
                 kCVPixelBufferMetalCompatibilityKey as String: true,
             ]
         )
-        readerOutput.alwaysCopiesSampleData = false
         guard reader.canAdd(readerOutput) else {
             throw DeformConvError.commandFailed("AVAssetReader rejected the video output")
         }
-        reader.add(readerOutput)
+        let provider = reader.outputProvider(for: readerOutput)
 
         let writer = try AVAssetWriter(outputURL: outputURL, fileType: .mov)
         let bitRate = min(160_000_000, max(8_000_000, inputInfo.dimensions.pixelCount * 5 / 2))
@@ -98,82 +97,70 @@ enum SideBySideVideoIO {
                 ],
             ]
         )
-        writerInput.expectsMediaDataInRealTime = false
-        let adaptor = AVAssetWriterInputPixelBufferAdaptor(
-            assetWriterInput: writerInput,
-            sourcePixelBufferAttributes: [
-                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
-                kCVPixelBufferWidthKey as String: inputInfo.dimensions.width,
-                kCVPixelBufferHeightKey as String: inputInfo.dimensions.height,
-                kCVPixelBufferMetalCompatibilityKey as String: true,
-            ]
-        )
         guard writer.canAdd(writerInput) else {
             throw DeformConvError.commandFailed("AVAssetWriter rejected the HEVC video input")
         }
-        writer.add(writerInput)
-        guard writer.startWriting(), reader.startReading() else {
-            throw writer.error ?? reader.error
-                ?? DeformConvError.commandFailed("video reader/writer failed to start")
-        }
+        var creationAttributes = CVPixelBufferCreationAttributes(
+            pixelFormatType: CVPixelFormatType(rawValue: kCVPixelFormatType_32BGRA),
+            size: CVImageSize(
+                width: inputInfo.dimensions.width,
+                height: inputInfo.dimensions.height
+            ),
+            compatibility: [.metalTexture]
+        )
+        creationAttributes.backing = .ioSurface
+        let receiver = writer.inputPixelBufferReceiver(
+            for: writerInput, pixelBufferAttributes: creationAttributes
+        )
+        try writer.start()
+        try reader.start()
         writer.startSession(atSourceTime: .zero)
 
-        var previous: CMSampleBuffer?
-        var next = readerOutput.copyNextSampleBuffer()
+        var previous: CMReadySampleBuffer<CMSampleBuffer.DynamicContent>?
+        var next = try await provider.next()
         var written = 0
         for outputIndex in 0..<plan.frameRate.outputFrameCount {
             let outputTime = CMTime(value: CMTimeValue(outputIndex), timescale: 30)
             while let candidate = next,
-                  CMTimeCompare(CMSampleBufferGetPresentationTimeStamp(candidate), outputTime) < 0 {
+                  CMTimeCompare(candidate.presentationTimeStamp, outputTime) < 0 {
                 previous = candidate
-                next = readerOutput.copyNextSampleBuffer()
+                next = try await provider.next()
             }
             guard let selected = closestSample(previous: previous, next: next, to: outputTime),
-                  let decodedBuffer = CMSampleBufferGetImageBuffer(selected)
+                  case .pixelBuffer(let decodedBuffer) = selected.content
             else {
                 throw reader.error
                     ?? DeformConvError.commandFailed("decoder ended before output frame \(outputIndex)")
             }
-            while !writerInput.isReadyForMoreMediaData {
-                if writer.status == .failed {
-                    throw writer.error ?? DeformConvError.commandFailed("video writer failed")
-                }
-                try await Task.sleep(for: .milliseconds(1))
-            }
-            let outputBuffer: CVPixelBuffer
+            let outputBuffer: CVReadOnlyPixelBuffer
             if verifyTiledPixelPath {
-                var accumulator = try TileFrameAccumulator(dimensions: plan.dimensions)
-                for tile in plan.tiles {
-                    let planar = try TilePixelPipeline.extractPlanarRGB(
-                        from: decodedBuffer, tile: tile
-                    )
-                    try accumulator.accumulate(tile: tile, planarRGB: planar)
-                }
-                guard let pool = adaptor.pixelBufferPool else {
+                guard let pool = receiver.pixelBufferPool else {
                     throw DeformConvError.commandFailed("video writer has no pixel-buffer pool")
                 }
-                var optionalOutput: CVPixelBuffer?
-                let status = CVPixelBufferPoolCreatePixelBuffer(nil, pool, &optionalOutput)
-                guard status == kCVReturnSuccess, let created = optionalOutput else {
-                    throw DeformConvError.commandFailed(
-                        "failed allocating output pixel buffer (CoreVideo \(status))"
-                    )
+                let created = try pool.makeMutablePixelBuffer()
+                try decodedBuffer.withUnsafeBuffer { decodedUnsafe in
+                    var accumulator = try TileFrameAccumulator(dimensions: plan.dimensions)
+                    for tile in plan.tiles {
+                        let planar = try TilePixelPipeline.extractPlanarRGB(
+                            from: decodedUnsafe, tile: tile
+                        )
+                        try accumulator.accumulate(tile: tile, planarRGB: planar)
+                    }
+                    try created.withUnsafeBuffer { createdUnsafe in
+                        CVBufferPropagateAttachments(decodedUnsafe, createdUnsafe)
+                        try accumulator.writeBGRA(to: createdUnsafe)
+                    }
                 }
-                CVBufferPropagateAttachments(decodedBuffer, created)
-                try accumulator.writeBGRA(to: created)
-                outputBuffer = created
+                outputBuffer = CVReadOnlyPixelBuffer(created)
             } else {
                 outputBuffer = decodedBuffer
             }
-            guard adaptor.append(outputBuffer, withPresentationTime: outputTime) else {
-                throw writer.error
-                    ?? DeformConvError.commandFailed("failed writing output frame \(outputIndex)")
-            }
+            try await receiver.append(outputBuffer, with: outputTime)
             written += 1
         }
 
         reader.cancelReading()
-        writerInput.markAsFinished()
+        receiver.finish()
         await withCheckedContinuation { continuation in
             writer.finishWriting { continuation.resume() }
         }
@@ -195,17 +182,17 @@ enum SideBySideVideoIO {
     }
 
     private static func closestSample(
-        previous: CMSampleBuffer?,
-        next: CMSampleBuffer?,
+        previous: CMReadySampleBuffer<CMSampleBuffer.DynamicContent>?,
+        next: CMReadySampleBuffer<CMSampleBuffer.DynamicContent>?,
         to target: CMTime
-    ) -> CMSampleBuffer? {
+    ) -> CMReadySampleBuffer<CMSampleBuffer.DynamicContent>? {
         guard let previous else { return next }
         guard let next else { return previous }
         let previousDistance = abs(CMTimeGetSeconds(
-            CMTimeSubtract(CMSampleBufferGetPresentationTimeStamp(previous), target)
+            CMTimeSubtract(previous.presentationTimeStamp, target)
         ))
         let nextDistance = abs(CMTimeGetSeconds(
-            CMTimeSubtract(CMSampleBufferGetPresentationTimeStamp(next), target)
+            CMTimeSubtract(next.presentationTimeStamp, target)
         ))
         return previousDistance <= nextDistance ? previous : next
     }
