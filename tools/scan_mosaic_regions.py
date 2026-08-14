@@ -23,6 +23,29 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--sample-stride", type=float, default=0.1)
     parser.add_argument(
+        "--coarse-stride",
+        type=float,
+        default=1.0,
+        help="seconds between coarse gate samples before dense refinement",
+    )
+    parser.add_argument(
+        "--coarse-confidence",
+        type=float,
+        default=0.05,
+        help="sensitive gate threshold; final regions still use --confidence",
+    )
+    parser.add_argument(
+        "--refine-padding",
+        type=float,
+        default=1.0,
+        help="seconds added around coarse detections for dense temporal tracking",
+    )
+    parser.add_argument(
+        "--adaptive-scan",
+        action="store_true",
+        help="use a once-per-second gate before dense temporal refinement",
+    )
+    parser.add_argument(
         "--region-duration",
         type=float,
         default=1.0,
@@ -135,6 +158,48 @@ def detector_coverage_metrics(regions, frame_width, frame_height, frame_count):
         / (frame_width * frame_height * frame_count)
     )
     return average_active_regions, scheduled_blend_percent
+
+
+def coarse_sample_indices(frame_count, source_fps, coarse_stride):
+    """Choose one representative center frame from each coarse time interval."""
+    if frame_count <= 0 or source_fps <= 0 or coarse_stride <= 0:
+        return []
+    interval_frames = max(1, int(round(coarse_stride * source_fps)))
+    first_frame = min(frame_count - 1, interval_frames // 2)
+    return list(range(first_frame, frame_count, interval_frames))
+
+
+def refinement_sample_indices(
+    frame_count, source_fps, dense_stride, detected_frame_indices, padding_seconds
+):
+    """Return dense samples only in whole seconds surrounding coarse detections."""
+    if frame_count <= 0 or source_fps <= 0 or dense_stride <= 0:
+        return []
+    dense_frames = max(1, int(round(dense_stride * source_fps)))
+    second_frames = max(1, int(round(source_fps)))
+    padding_frames = max(0, int(round(padding_seconds * source_fps)))
+    intervals = []
+    for frame_index in sorted(set(int(frame) for frame in detected_frame_indices)):
+        second_start = max(0, (frame_index // second_frames) * second_frames)
+        intervals.append(
+            (
+                max(0, second_start - padding_frames),
+                min(frame_count, second_start + second_frames + padding_frames),
+            )
+        )
+    if not intervals:
+        return []
+    merged = []
+    for start, end in intervals:
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    samples = []
+    for start, end in merged:
+        first = ((start + dense_frames - 1) // dense_frames) * dense_frames
+        samples.extend(range(first, end, dense_frames))
+    return samples
 
 
 def track_boxes(boxes):
@@ -463,6 +528,10 @@ def main() -> int:
         raise SystemExit(f"mosaic detector not found: {args.model}")
     if (
         args.sample_stride <= 0
+        or args.coarse_stride <= 0
+        or args.coarse_confidence <= 0
+        or args.coarse_confidence > 1
+        or args.refine_padding < 0
         or args.region_duration <= 0
         or args.region_duration > 1.0
         or args.temporal_padding < 0
@@ -475,7 +544,9 @@ def main() -> int:
         or args.mask_size & (args.mask_size - 1) != 0
     ):
         raise SystemExit(
-            "sample stride must be positive, region duration must be in (0, 1], "
+            "sample and coarse strides must be positive, coarse confidence must be "
+            "in (0, 1], refinement padding cannot be negative, region duration must "
+            "be in (0, 1], "
             "temporal padding cannot be negative, region NMS IoU must be in (0, 1], "
             "mask expansion must be in (0, 0.25], and mask size must be a power "
             "of two from 32 through 256"
@@ -519,6 +590,7 @@ def main() -> int:
         raise SystemExit("video metadata is incomplete")
     if abs(source_fps - 30.0) > 0.05:
         raise SystemExit(f"sparse restoration requires a 30 fps eye video, got {source_fps:.3f}")
+    capture.release()
 
     device = choose_device(torch, args.device)
     print(
@@ -540,17 +612,16 @@ def main() -> int:
     padding_frames = int(round(args.temporal_padding * source_fps))
     window_frames = 30
     window_boxes: dict[int, list[tuple[float, float, float, float, float]]] = {}
-    sample_indices = list(range(0, frame_count, stride_frames))
     scan_started = time.perf_counter()
 
-    def predict(frames):
+    def predict(frames, confidence):
         nonlocal device, model
         try:
             if args.backend == "rfdetr":
-                return model.predict(frames, score_threshold=args.confidence)
+                return model.predict(frames, score_threshold=confidence)
             source = frames if len(frames) > 1 else frames[0]
             return model.predict(
-                source, imgsz=args.image_size, conf=args.confidence,
+                source, imgsz=args.image_size, conf=confidence,
                 device=device, verbose=False,
             )
         except Exception:
@@ -562,110 +633,178 @@ def main() -> int:
                 model = RFDetrMPSDetector(
                     args.model, device=device, max_select=args.max_detections
                 )
-                return model.predict(frames, score_threshold=args.confidence)
+                return model.predict(frames, score_threshold=confidence)
             source = frames if len(frames) > 1 else frames[0]
             return model.predict(
                 source,
                 imgsz=args.image_size,
-                conf=args.confidence,
+                conf=confidence,
                 device=device,
                 verbose=False,
             )
 
-    scanned_samples = 0
-    inference_seconds = 0.0
+    def scan_samples(sample_indices, phase_name, confidence):
+        phase_started = time.perf_counter()
+        phase_inference_seconds = 0.0
+        phase_boxes = []
+        phase_scanned_samples = 0
+        phase_capture = cv2.VideoCapture(str(args.input_video))
+        if not phase_capture.isOpened():
+            raise RuntimeError(f"unable to reopen video for {phase_name} scan")
 
-    def process_batch(frames, frame_indices):
-        nonlocal inference_seconds, scanned_samples
-        inference_started = time.perf_counter()
-        predictions = predict(frames)
-        inference_seconds += time.perf_counter() - inference_started
-        if len(predictions) != len(frame_indices):
-            raise RuntimeError(
-                f"detector returned {len(predictions)} results for "
-                f"{len(frame_indices)} frames"
-            )
-        for result, frame_index in zip(predictions, frame_indices):
-            boxes = []
-            if args.backend == "rfdetr":
-                boxes = [
-                    tuple(coords)
-                    + (float(conf), frame_index, polygon)
-                    for coords, conf, polygon in zip(
-                        result.boxes_xyxy, result.confidences, result.polygons
-                    )
-                ]
-            elif result.boxes is not None:
-                coordinates = result.boxes.xyxy.detach().cpu().tolist()
-                confidences = result.boxes.conf.detach().cpu().tolist()
-                polygons = result.masks.xy if result.masks is not None else []
-                boxes = [
-                    tuple(coords)
-                    + (
-                        float(conf),
-                        frame_index,
-                        polygons[index].tolist() if index < len(polygons) else [],
-                    )
-                    for index, (coords, conf) in enumerate(zip(coordinates, confidences))
-                ]
-            if boxes:
-                first_window = max(0, frame_index - padding_frames) // window_frames
-                last_window = min(frame_count - 1, frame_index + padding_frames) // window_frames
-                for window_index in range(first_window, last_window + 1):
-                    window_boxes.setdefault(window_index, []).extend(boxes)
-            scanned_samples += 1
-            if (
-                scanned_samples == 1
-                or scanned_samples == len(sample_indices)
-                or scanned_samples % 10 == 0
-            ):
-                print(
-                    f"Scanned sample {scanned_samples}/{len(sample_indices)} at "
-                    f"{frame_index / source_fps:.2f}s; detections {len(boxes)}",
-                    flush=True,
+        def process_batch(frames, frame_indices):
+            nonlocal phase_inference_seconds, phase_scanned_samples
+            inference_started = time.perf_counter()
+            predictions = predict(frames, confidence)
+            phase_inference_seconds += time.perf_counter() - inference_started
+            if len(predictions) != len(frame_indices):
+                raise RuntimeError(
+                    f"detector returned {len(predictions)} results for "
+                    f"{len(frame_indices)} frames"
                 )
+            for result, frame_index in zip(predictions, frame_indices):
+                boxes = []
+                if args.backend == "rfdetr":
+                    boxes = [
+                        tuple(coords) + (float(conf), frame_index, polygon)
+                        for coords, conf, polygon in zip(
+                            result.boxes_xyxy, result.confidences, result.polygons
+                        )
+                    ]
+                elif result.boxes is not None:
+                    coordinates = result.boxes.xyxy.detach().cpu().tolist()
+                    confidences = result.boxes.conf.detach().cpu().tolist()
+                    polygons = result.masks.xy if result.masks is not None else []
+                    boxes = [
+                        tuple(coords)
+                        + (
+                            float(conf),
+                            frame_index,
+                            polygons[index].tolist() if index < len(polygons) else [],
+                        )
+                        for index, (coords, conf) in enumerate(
+                            zip(coordinates, confidences)
+                        )
+                    ]
+                phase_boxes.extend(boxes)
+                phase_scanned_samples += 1
+                if (
+                    phase_scanned_samples == 1
+                    or phase_scanned_samples == len(sample_indices)
+                    or phase_scanned_samples % 10 == 0
+                ):
+                    print(
+                        f"{phase_name} sample {phase_scanned_samples}/"
+                        f"{len(sample_indices)} at {frame_index / source_fps:.2f}s; "
+                        f"detections {len(boxes)}",
+                        flush=True,
+                    )
 
-    batch_frames = []
-    batch_indices = []
+        batch_frames = []
+        batch_indices = []
 
-    def append_sample(frame, frame_index):
-        batch_frames.append(frame)
-        batch_indices.append(frame_index)
-        if len(batch_frames) >= args.batch_size:
-            process_batch(batch_frames, batch_indices)
-            batch_frames.clear()
-            batch_indices.clear()
+        def append_sample(frame, frame_index):
+            batch_frames.append(frame)
+            batch_indices.append(frame_index)
+            if len(batch_frames) >= args.batch_size:
+                process_batch(batch_frames, batch_indices)
+                batch_frames.clear()
+                batch_indices.clear()
 
-    if args.decode_mode == "seek":
-        for frame_index in sample_indices:
-            capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
-            ok, frame = capture.read()
-            if not ok:
-                print(f"warning: unable to decode sampled frame {frame_index}", file=sys.stderr)
-                continue
-            append_sample(frame, frame_index)
-    else:
-        next_sample = iter(sample_indices)
-        target_frame = next(next_sample, None)
-        for frame_index in range(frame_count):
-            ok = capture.grab()
-            if not ok:
-                print(f"warning: decoding stopped at frame {frame_index}", file=sys.stderr)
-                break
-            if frame_index != target_frame:
-                continue
-            ok, frame = capture.retrieve()
-            if not ok:
-                print(f"warning: unable to retrieve sampled frame {frame_index}", file=sys.stderr)
-            else:
+        if args.decode_mode == "seek":
+            for frame_index in sample_indices:
+                phase_capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+                ok, frame = phase_capture.read()
+                if not ok:
+                    print(
+                        f"warning: unable to decode sampled frame {frame_index}",
+                        file=sys.stderr,
+                    )
+                    continue
                 append_sample(frame, frame_index)
+        else:
+            next_sample = iter(sample_indices)
             target_frame = next(next_sample, None)
-            if target_frame is None:
-                break
+            for frame_index in range(frame_count):
+                ok = phase_capture.grab()
+                if not ok:
+                    print(
+                        f"warning: decoding stopped at frame {frame_index}",
+                        file=sys.stderr,
+                    )
+                    break
+                if frame_index != target_frame:
+                    continue
+                ok, frame = phase_capture.retrieve()
+                if not ok:
+                    print(
+                        f"warning: unable to retrieve sampled frame {frame_index}",
+                        file=sys.stderr,
+                    )
+                else:
+                    append_sample(frame, frame_index)
+                target_frame = next(next_sample, None)
+                if target_frame is None:
+                    break
+        if batch_frames:
+            process_batch(batch_frames, batch_indices)
+        phase_capture.release()
+        return (
+            phase_boxes,
+            phase_scanned_samples,
+            phase_inference_seconds,
+            time.perf_counter() - phase_started,
+        )
 
-    if batch_frames:
-        process_batch(batch_frames, batch_indices)
-    capture.release()
+    if not args.adaptive_scan:
+        sample_indices = list(range(0, frame_count, stride_frames))
+        boxes, scanned_samples, inference_seconds, dense_seconds = scan_samples(
+            sample_indices, "Dense", args.confidence
+        )
+        coarse_seconds = 0.0
+        coarse_sample_count = 0
+        active_coarse_seconds = 0
+        refinement_sample_count = scanned_samples
+    else:
+        coarse_indices = coarse_sample_indices(
+            frame_count, source_fps, args.coarse_stride
+        )
+        coarse_boxes, coarse_sample_count, coarse_inference, coarse_seconds = (
+            scan_samples(coarse_indices, "Coarse", args.coarse_confidence)
+        )
+        detected_frames = [int(box[5]) for box in coarse_boxes]
+        active_coarse_seconds = len(
+            {frame_index // window_frames for frame_index in detected_frames}
+        )
+        refinement_indices = refinement_sample_indices(
+            frame_count,
+            source_fps,
+            args.sample_stride,
+            detected_frames,
+            args.refine_padding,
+        )
+        if refinement_indices:
+            (
+                refined_boxes,
+                refinement_sample_count,
+                refine_inference,
+                dense_seconds,
+            ) = scan_samples(refinement_indices, "Refine", args.confidence)
+        else:
+            refined_boxes = []
+            refinement_sample_count = 0
+            refine_inference = 0.0
+            dense_seconds = 0.0
+        boxes = refined_boxes
+        scanned_samples = coarse_sample_count + refinement_sample_count
+        inference_seconds = coarse_inference + refine_inference
+
+    for box in boxes:
+        frame_index = int(box[5])
+        first_window = max(0, frame_index - padding_frames) // window_frames
+        last_window = min(frame_count - 1, frame_index + padding_frames) // window_frames
+        for window_index in range(first_window, last_window + 1):
+            window_boxes.setdefault(window_index, []).append(box)
     scan_seconds = time.perf_counter() - scan_started
 
     regions = []
@@ -787,6 +926,18 @@ def main() -> int:
         f"{scheduled_blend_percent:.3f}% scheduled blend area/eye-frame",
         flush=True,
     )
+    if args.adaptive_scan:
+        print(
+            f"Detector coarse gate: {coarse_seconds:.3f}s, "
+            f"{coarse_sample_count} gate samples, "
+            f"{active_coarse_seconds}/{total_windows} seconds flagged",
+            flush=True,
+        )
+        print(
+            f"Detector refinement: {dense_seconds:.3f}s, "
+            f"{refinement_sample_count} dense samples around flagged seconds",
+            flush=True,
+        )
     print(
         f"Detector scan: {scan_seconds:.3f}s, "
         f"{scanned_samples / scan_seconds:.2f} sampled frames/s",

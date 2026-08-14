@@ -26,6 +26,11 @@ case "$DETECTOR" in
 esac
 DETECT_BATCH_SIZE="${JASNA_DETECT_BATCH_SIZE:-2}"
 DETECT_DECODE_MODE="${JASNA_DETECT_DECODE_MODE:-sequential}"
+DETECT_SAMPLE_STRIDE="${JASNA_DETECT_SAMPLE_STRIDE:-0.1}"
+DETECT_COARSE_STRIDE="${JASNA_DETECT_COARSE_STRIDE:-1.0}"
+DETECT_COARSE_CONFIDENCE="${JASNA_DETECT_COARSE_CONFIDENCE:-0.05}"
+DETECT_REFINE_PADDING="${JASNA_DETECT_REFINE_PADDING:-1.0}"
+ADAPTIVE_DETECT="${JASNA_ADAPTIVE_DETECT:-0}"
 REGION_DURATION="${JASNA_REGION_DURATION:-1.0}"
 DETECT_CONFIDENCE="${JASNA_DETECT_CONFIDENCE:-0.15}"
 TEMPORAL_PADDING="${JASNA_TEMPORAL_PADDING:-1.0}"
@@ -40,6 +45,31 @@ RFDETR_MAX_DETECTIONS="${JASNA_RFDETR_MAX_DETECTIONS:-64}"
 }
 [[ "$DETECT_DECODE_MODE" == "sequential" || "$DETECT_DECODE_MODE" == "seek" ]] || {
   echo "error: JASNA_DETECT_DECODE_MODE must be sequential or seek" >&2
+  exit 1
+}
+[[ "$ADAPTIVE_DETECT" == "0" || "$ADAPTIVE_DETECT" == "1" ]] || {
+  echo "error: JASNA_ADAPTIVE_DETECT must be 0 or 1" >&2
+  exit 1
+}
+for setting in \
+  "JASNA_DETECT_SAMPLE_STRIDE:$DETECT_SAMPLE_STRIDE" \
+  "JASNA_DETECT_COARSE_STRIDE:$DETECT_COARSE_STRIDE"; do
+  name="${setting%%:*}"
+  value="${setting#*:}"
+  /usr/bin/awk -v value="$value" \
+    'BEGIN { exit !(value ~ /^[0-9]+([.][0-9]+)?$/ && value > 0) }' || {
+    echo "error: $name must be greater than zero" >&2
+    exit 1
+  }
+done
+/usr/bin/awk -v value="$DETECT_COARSE_CONFIDENCE" \
+  'BEGIN { exit !(value ~ /^[0-9]+([.][0-9]+)?$/ && value > 0 && value <= 1) }' || {
+  echo "error: JASNA_DETECT_COARSE_CONFIDENCE must be greater than 0 and at most 1" >&2
+  exit 1
+}
+/usr/bin/awk -v value="$DETECT_REFINE_PADDING" \
+  'BEGIN { exit !(value ~ /^[0-9]+([.][0-9]+)?$/ && value >= 0) }' || {
+  echo "error: JASNA_DETECT_REFINE_PADDING must be zero or greater" >&2
   exit 1
 }
 /usr/bin/awk -v value="$DETECT_CONFIDENCE" \
@@ -86,15 +116,25 @@ RFDETR_MAX_DETECTIONS="${JASNA_RFDETR_MAX_DETECTIONS:-64}"
 }
 
 export PYTORCH_ENABLE_MPS_FALLBACK=1
+ADAPTIVE_ARGUMENTS=(
+  --coarse-stride "$DETECT_COARSE_STRIDE"
+  --coarse-confidence "$DETECT_COARSE_CONFIDENCE"
+  --refine-padding "$DETECT_REFINE_PADDING"
+)
+if [[ "$ADAPTIVE_DETECT" == "1" ]]; then
+  ADAPTIVE_ARGUMENTS+=(--adaptive-scan)
+fi
 "$PYTHON_PATH" "$ROOT_DIR/tools/scan_mosaic_regions.py" \
   "$1" "$2" --model "$MODEL_PATH" \
   --backend "$DETECTOR_BACKEND" \
   --batch-size "$DETECT_BATCH_SIZE" \
   --max-detections "$RFDETR_MAX_DETECTIONS" \
   --decode-mode "$DETECT_DECODE_MODE" \
+  --sample-stride "$DETECT_SAMPLE_STRIDE" \
   --region-duration "$REGION_DURATION" \
   --confidence "$DETECT_CONFIDENCE" \
   --temporal-padding "$TEMPORAL_PADDING" \
   --region-nms-iou "$REGION_NMS_IOU" \
   --mask-expansion "$MASK_EXPANSION" \
-  --mask-size "$MASK_SIZE"
+  --mask-size "$MASK_SIZE" \
+  "${ADAPTIVE_ARGUMENTS[@]}"

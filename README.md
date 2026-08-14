@@ -205,7 +205,16 @@ fixed-width rectangular transition.
 Detection defaults to confidence 0.15 with one second of temporal
 padding so short or fast-moving mosaic appearances are less likely to be
 missed. `JASNA_DETECT_CONFIDENCE` and `JASNA_TEMPORAL_PADDING` can override
-those quality settings for controlled comparisons. The
+those quality settings for controlled comparisons. An experimental adaptive mode
+checks one center frame per second at a sensitive 0.05 gate threshold, then runs
+0.1-second temporal mask tracking at the normal confidence only within flagged
+seconds plus one second on either side. Gate detections never become restoration
+masks directly. Enable it with `JASNA_ADAPTIVE_DETECT=1`, or tune
+`JASNA_DETECT_COARSE_STRIDE`,
+`JASNA_DETECT_COARSE_CONFIDENCE`, `JASNA_DETECT_SAMPLE_STRIDE`, and
+`JASNA_DETECT_REFINE_PADDING` for controlled comparisons. It is not the default:
+both one- and two-snapshot-per-second gates missed a short moving mosaic in the
+accepted 30-second coverage fixture, while the normal 10 Hz scan found it. The
 Metal restorer then runs only the detected 256×256 model crops. Clean
 one-second windows bypass the Jasna model. Following Jasna's VR180 path, the
 sparse wrapper defaults to fisheye projection: each region is flattened before
@@ -327,6 +336,18 @@ area per eye-frame. These normalized values make RF-DETR and YOLO coverage load
 comparable even when they emit different region counts. Direct SBS runs finish
 with a stereo compositor fallback summary; `fused 0, CPU 0` confirms that the
 Metal beta fallback chain was not exercised during that session.
+
+The direct SBS workflow groups consecutive one-second windows with no detected
+regions and copies those packets from the prepared 30 fps SBS source. Only active
+ranges enter the Metal restoration writer; the validated bypass and restored
+segments are joined before source audio is copied. If a source cut is not
+keyframe-exact, the workflow automatically falls back to the Metal writer for
+that range instead of accepting a damaged or incorrectly timed segment.
+Before restoration, a conservative stereo reconciliation checks for complete
+one-second detection gaps: when one eye has regions and the counterpart eye has
+none, it transfers those regions using disparity measured from nearby matched
+tracks. Windows already active in both eyes are unchanged. Set
+`JASNA_STEREO_MANIFEST_RECONCILE=0` for an A/B comparison.
 
 Test the left eye with:
 
@@ -517,7 +538,9 @@ eye movies and then encoding their SBS stack again. Each direct SBS segment is
 still independently restartable and remains in the persistent work directory.
 Set `JASNA_DIRECT_SBS_OUTPUT=0` to compare with the legacy three-encode path.
 Sparse mosaic scans decode HEVC sequentially and infer two sampled frames at a
-time. Set `JASNA_DETECT_BATCH_SIZE=1` to minimize memory, or
+time. Set `JASNA_ADAPTIVE_DETECT=1` only for speed/coverage comparisons; the full
+10 Hz scan remains the quality default. Set `JASNA_DETECT_BATCH_SIZE=1` to
+minimize memory, or
 `JASNA_DETECT_DECODE_MODE=seek` to compare with the former random-seek path.
 Detector logs separate neural inference from decode/batching time. On a
 60-second 4096×4096 M4 fixture, the accepted 2048-pixel, 0.1-second-stride,

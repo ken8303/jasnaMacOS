@@ -5,14 +5,36 @@ import unittest
 
 from scan_mosaic_regions import (
     box_polygon_groups,
+    coarse_sample_indices,
     detector_coverage_metrics,
     has_box_polygons,
     mask_expansion_radius,
     mask_keyframe_box_groups,
     mask_source_boxes,
+    refinement_sample_indices,
     suppress_duplicate_regions,
     suppress_nested_regions,
 )
+
+
+class AdaptiveScanScheduleTests(unittest.TestCase):
+    def test_coarse_scan_uses_center_frame_once_per_second(self):
+        self.assertEqual(coarse_sample_indices(95, 30.0, 1.0), [15, 45, 75])
+
+    def test_refines_complete_detected_second_with_padding(self):
+        indices = refinement_sample_indices(150, 30.0, 0.1, [45], 1.0)
+
+        self.assertEqual(indices[0], 0)
+        self.assertEqual(indices[-1], 87)
+        self.assertEqual(len(indices), 30)
+
+    def test_merges_overlapping_refinement_intervals(self):
+        indices = refinement_sample_indices(180, 30.0, 0.1, [45, 75], 1.0)
+
+        self.assertEqual(indices, list(range(0, 120, 3)))
+
+    def test_empty_gate_performs_no_dense_refinement(self):
+        self.assertEqual(refinement_sample_indices(900, 30.0, 0.1, [], 1.0), [])
 
 
 class DetectorCoverageMetricsTests(unittest.TestCase):

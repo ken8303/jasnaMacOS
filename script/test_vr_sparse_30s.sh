@@ -211,6 +211,12 @@ metal_compositor=${JASNA_METAL_COMPOSITOR:-1}
 quality_profile=lower-detail-crop-v15
 detect_batch_size=${JASNA_DETECT_BATCH_SIZE:-2}
 detect_decode_mode=${JASNA_DETECT_DECODE_MODE:-sequential}
+adaptive_detect=${JASNA_ADAPTIVE_DETECT:-0}
+detect_sample_stride=${JASNA_DETECT_SAMPLE_STRIDE:-0.1}
+detect_coarse_stride=${JASNA_DETECT_COARSE_STRIDE:-1.0}
+detect_coarse_confidence=${JASNA_DETECT_COARSE_CONFIDENCE:-0.05}
+detect_refine_padding=${JASNA_DETECT_REFINE_PADDING:-1.0}
+stereo_manifest_reconcile=${JASNA_STEREO_MANIFEST_RECONCILE:-1}
 rfdetr_max_detections=${JASNA_RFDETR_MAX_DETECTIONS:-64}
 detect_confidence=${JASNA_DETECT_CONFIDENCE:-0.15}
 temporal_padding=${JASNA_TEMPORAL_PADDING:-1.0}
@@ -678,8 +684,30 @@ if [[ "$DIRECT_SBS_OUTPUT" == "1" ]]; then
     echo "error: no paired eye segments were prepared for direct SBS restoration" >&2
     exit 1
   }
+  STEREO_MANIFEST_RECONCILE="${JASNA_STEREO_MANIFEST_RECONCILE:-1}"
+  [[ "$STEREO_MANIFEST_RECONCILE" == "0" \
+    || "$STEREO_MANIFEST_RECONCILE" == "1" ]] || {
+    echo "error: JASNA_STEREO_MANIFEST_RECONCILE must be 0 or 1" >&2
+    exit 1
+  }
+  if [[ "$STEREO_MANIFEST_RECONCILE" == "1" ]]; then
+    RECONCILED_MANIFEST_DIR="$WORK_DIR/stereo-reconciled-manifests"
+    mkdir -p "$RECONCILED_MANIFEST_DIR"
+    for ((JOB_INDEX = 0; JOB_INDEX < ${#LEFT_JOB_INPUTS[@]}; JOB_INDEX++)); do
+      RECONCILED_LEFT="$RECONCILED_MANIFEST_DIR/$(printf 'left-%05d.json' "$JOB_INDEX")"
+      RECONCILED_RIGHT="$RECONCILED_MANIFEST_DIR/$(printf 'right-%05d.json' "$JOB_INDEX")"
+      /usr/bin/python3 "$ROOT_DIR/tools/reconcile_stereo_manifests.py" \
+        "${LEFT_JOB_MANIFESTS[$JOB_INDEX]}" \
+        "${RIGHT_JOB_MANIFESTS[$JOB_INDEX]}" \
+        "$RECONCILED_LEFT" "$RECONCILED_RIGHT"
+      LEFT_JOB_MANIFESTS[$JOB_INDEX]="$RECONCILED_LEFT"
+      RIGHT_JOB_MANIFESTS[$JOB_INDEX]="$RECONCILED_RIGHT"
+    done
+  fi
   mkdir -p "$DIRECT_SEGMENT_DIR"
   DIRECT_SEGMENTS=()
+  BYPASSED_WINDOW_COUNT=0
+  RESTORED_WINDOW_COUNT=0
   echo "Metal process isolation: at most $METAL_WINDOWS_PER_PROCESS temporal windows/process"
   for ((JOB_INDEX = 0; JOB_INDEX < ${#LEFT_JOB_INPUTS[@]}; JOB_INDEX++)); do
     JOB_FRAME_COUNT="$(
@@ -719,28 +747,73 @@ if [[ "$DIRECT_SBS_OUTPUT" == "1" ]]; then
         WINDOW_START="$REUSABLE_END"
         continue
       fi
-      WINDOW_COUNT=$((JOB_WINDOW_COUNT - WINDOW_START))
-      (( WINDOW_COUNT > METAL_WINDOWS_PER_PROCESS )) \
-        && WINDOW_COUNT="$METAL_WINDOWS_PER_PROCESS"
+      WINDOW_ACTIVITY="$(
+        /usr/bin/python3 "$ROOT_DIR/tools/manifest_window_runs.py" \
+          "${LEFT_JOB_MANIFESTS[$JOB_INDEX]}" \
+          "${RIGHT_JOB_MANIFESTS[$JOB_INDEX]}" \
+          "$WINDOW_START"
+      )"
+      IFS=$'\t' read -r WINDOW_MODE WINDOW_RUN_COUNT WINDOW_EXTRA <<< "$WINDOW_ACTIVITY"
+      [[ ( "$WINDOW_MODE" == "active" || "$WINDOW_MODE" == "empty" ) \
+        && "$WINDOW_RUN_COUNT" =~ ^[1-9][0-9]*$ && -z "$WINDOW_EXTRA" ]] || {
+        echo "error: invalid manifest window activity: $WINDOW_ACTIVITY" >&2
+        exit 1
+      }
+      WINDOW_COUNT="$WINDOW_RUN_COUNT"
+      if [[ "$WINDOW_MODE" == "active" ]] \
+        && (( WINDOW_COUNT > METAL_WINDOWS_PER_PROCESS )); then
+        WINDOW_COUNT="$METAL_WINDOWS_PER_PROCESS"
+      fi
       WINDOW_END=$((WINDOW_START + WINDOW_COUNT))
       DIRECT_SEGMENT="$DIRECT_SEGMENT_DIR/$(
         printf 'segment-%05d-windows-%05d-%05d.mov' \
           "$JOB_INDEX" "$WINDOW_START" "$WINDOW_END"
       )"
       JOB_DIRECT_SEGMENTS+=("$DIRECT_SEGMENT")
-      echo "Restoring source segment $((JOB_INDEX + 1))/${#LEFT_JOB_INPUTS[@]}, windows $((WINDOW_START + 1))-$WINDOW_END/$JOB_WINDOW_COUNT"
-      JASNA_WINDOW_START="$WINDOW_START" \
-      JASNA_WINDOW_COUNT="$WINDOW_COUNT" \
-      JASNA_VIDEO_BITRATE="$VR_BITRATE" \
-      JASNA_VR_PROJECTION=fisheye \
-        "$ROOT_DIR/script/build_and_run.sh" --restore-stereo-sparse-batch \
-          "${LEFT_JOB_INPUTS[$JOB_INDEX]}" \
-          "${RIGHT_JOB_INPUTS[$JOB_INDEX]}" \
-          "$DIRECT_SEGMENT" \
-          "${LEFT_JOB_MANIFESTS[$JOB_INDEX]}" \
-          "${RIGHT_JOB_MANIFESTS[$JOB_INDEX]}" \
-          "${LEFT_JOB_CACHES[$JOB_INDEX]}" \
-          "${RIGHT_JOB_CACHES[$JOB_INDEX]}"
+      BYPASS_SUCCEEDED=0
+      if [[ "$WINDOW_MODE" == "empty" ]]; then
+        BYPASS_TEMP="${DIRECT_SEGMENT%.mov}.bypass-writing.mov"
+        if [[ -e "$BYPASS_TEMP" ]]; then
+          mv "$BYPASS_TEMP" \
+            "${BYPASS_TEMP%.mov}.interrupted-$(date '+%Y%m%d-%H%M%S').mov"
+        fi
+        GLOBAL_START_SECONDS=$((JOB_INDEX * TEST_SEGMENT_SECONDS + WINDOW_START))
+        EXPECTED_BYPASS_FRAMES=$((WINDOW_COUNT * 30))
+        echo "Bypassing empty source windows $((WINDOW_START + 1))-$WINDOW_END/$JOB_WINDOW_COUNT with SBS packet copy"
+        if "$FFMPEG_PATH" -hide_banner -loglevel error \
+            -ss "$GLOBAL_START_SECONDS" -i "$TEST_INPUT" \
+            -t "$WINDOW_COUNT" -map '0:v:0' -an -c copy \
+            -avoid_negative_ts make_zero -video_track_timescale 600 \
+            -movflags +faststart "$BYPASS_TEMP" \
+          && valid_direct_segment "$BYPASS_TEMP" "$EXPECTED_BYPASS_FRAMES"; then
+          mv "$BYPASS_TEMP" "$DIRECT_SEGMENT"
+          BYPASS_SUCCEEDED=1
+          BYPASSED_WINDOW_COUNT=$((BYPASSED_WINDOW_COUNT + WINDOW_COUNT))
+          echo "Bypassed and validated $WINDOW_COUNT empty window(s): $DIRECT_SEGMENT"
+        else
+          if [[ -e "$BYPASS_TEMP" ]]; then
+            mv "$BYPASS_TEMP" \
+              "${BYPASS_TEMP%.mov}.invalid-$(date '+%Y%m%d-%H%M%S').mov"
+          fi
+          echo "WARNING: empty-window packet copy was not frame-exact; using Metal writer fallback"
+        fi
+      fi
+      if [[ "$BYPASS_SUCCEEDED" == "0" ]]; then
+        echo "Restoring source segment $((JOB_INDEX + 1))/${#LEFT_JOB_INPUTS[@]}, windows $((WINDOW_START + 1))-$WINDOW_END/$JOB_WINDOW_COUNT"
+        JASNA_WINDOW_START="$WINDOW_START" \
+        JASNA_WINDOW_COUNT="$WINDOW_COUNT" \
+        JASNA_VIDEO_BITRATE="$VR_BITRATE" \
+        JASNA_VR_PROJECTION=fisheye \
+          "$ROOT_DIR/script/build_and_run.sh" --restore-stereo-sparse-batch \
+            "${LEFT_JOB_INPUTS[$JOB_INDEX]}" \
+            "${RIGHT_JOB_INPUTS[$JOB_INDEX]}" \
+            "$DIRECT_SEGMENT" \
+            "${LEFT_JOB_MANIFESTS[$JOB_INDEX]}" \
+            "${RIGHT_JOB_MANIFESTS[$JOB_INDEX]}" \
+            "${LEFT_JOB_CACHES[$JOB_INDEX]}" \
+            "${RIGHT_JOB_CACHES[$JOB_INDEX]}"
+        RESTORED_WINDOW_COUNT=$((RESTORED_WINDOW_COUNT + WINDOW_COUNT))
+      fi
       WINDOW_START="$WINDOW_END"
     done
     if (( ${#JOB_DIRECT_SEGMENTS[@]} == 1 )); then
@@ -784,7 +857,7 @@ if [[ "$DIRECT_SBS_OUTPUT" == "1" ]]; then
     fi
     DIRECT_SEGMENTS+=("$BATCH_SEGMENT")
   done
-  echo "Restored ${#DIRECT_SEGMENTS[@]} grouped 8K SBS batch(es)"
+  echo "Prepared ${#DIRECT_SEGMENTS[@]} grouped 8K SBS batch(es); bypassed/restored windows $BYPASSED_WINDOW_COUNT/$RESTORED_WINDOW_COUNT"
 
   : > "$DIRECT_CONCAT_PATH"
   for DIRECT_SEGMENT in "${DIRECT_SEGMENTS[@]}"; do
