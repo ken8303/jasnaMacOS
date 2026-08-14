@@ -322,6 +322,12 @@ speed default. The bounded batch-2 scan peaked at 1.84 GiB resident memory with
 zero swap activity on the M4, compared with the rejected wrapper path's
 12.5 GiB allocation request for one frame.
 
+Detector logs also report average active regions per frame and scheduled blend
+area per eye-frame. These normalized values make RF-DETR and YOLO coverage load
+comparable even when they emit different region counts. Direct SBS runs finish
+with a stereo compositor fallback summary; `fused 0, CPU 0` confirms that the
+Metal beta fallback chain was not exercised during that session.
+
 Test the left eye with:
 
 ```sh

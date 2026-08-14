@@ -250,7 +250,27 @@ fi
 RUN_CONFIG_TEMP="$WORK_DIR/.run-config-writing-$$"
 printf '%s\n' "$RUN_CONFIG" > "$RUN_CONFIG_TEMP"
 mv "$RUN_CONFIG_TEMP" "$RUN_CONFIG_PATH"
+LOG_SESSION_START_LINE=0
+if [[ -f "$LOG_PATH" ]]; then
+  LOG_SESSION_START_LINE="$(/usr/bin/wc -l < "$LOG_PATH")"
+fi
 exec > >(/usr/bin/tee -a "$LOG_PATH") 2>&1
+
+report_compositor_fallback_summary() {
+  local summary
+  summary="$(/usr/bin/awk -v start="$LOG_SESSION_START_LINE" '
+    NR > start && /WARNING: Fused Metal stereo composite failed/ { fused += 1 }
+    NR > start && /WARNING: Metal stereo copy failed/ { cpu += 1 }
+    END { printf "%d %d", fused + 0, cpu + 0 }
+  ' "$LOG_PATH")"
+  local fused_count="${summary%% *}"
+  local cpu_count="${summary##* }"
+  if (( fused_count == 0 && cpu_count == 0 )); then
+    echo "Stereo compositor fallback summary: PASS, fused 0, CPU 0 (this session)"
+  else
+    echo "Stereo compositor fallback summary: WARNING, fused $fused_count, CPU $cpu_count (this session)"
+  fi
+}
 
 echo
 echo "===== Jasna sparse VR test $(date -u '+%Y-%m-%dT%H:%M:%SZ') ====="
@@ -817,6 +837,7 @@ if [[ "$DIRECT_SBS_OUTPUT" == "1" ]]; then
     -show_entries format=duration,size -of default=noprint_wrappers=1 "$OUTPUT_PATH")"
   echo "Sparse SBS VR restoration ($RUN_DESCRIPTION): PASS"
   echo "$FINAL_INFO"
+  report_compositor_fallback_summary
   echo "Output: $OUTPUT_PATH"
   echo "Log:    $LOG_PATH"
   cleanup_successful_work
@@ -908,6 +929,7 @@ FINAL_INFO="$("$FFPROBE_PATH" \
 
 echo "Sparse VR restoration ($RUN_DESCRIPTION): PASS"
 echo "$FINAL_INFO"
+report_compositor_fallback_summary
 echo "Output:   $OUTPUT_PATH"
 echo "Left eye: $LEFT_OUTPUT"
 echo "Right eye:$RIGHT_OUTPUT"

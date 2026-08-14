@@ -263,6 +263,9 @@ extension SideBySideRestoration {
         private let receiver: AVAssetWriterInput.PixelBufferReceiver
         private let pixelBufferPool: CVPixelBufferPool
         private let metalCompositor: MetalMosaicCompositor?
+        private var directStereoFrameCount = 0
+        private var fusedStereoFallbackCount = 0
+        private var cpuStereoFallbackCount = 0
 
         init(device: MTLDevice, outputURL: URL, plan: SideBySideVideoPlan) throws {
             metalCompositor = ProcessInfo.processInfo.environment["JASNA_METAL_COMPOSITOR"] == "0"
@@ -528,6 +531,7 @@ extension SideBySideRestoration {
             var totalPreparationMilliseconds = 0.0
             var totalEncoderWaitMilliseconds = 0.0
             for localFrame in 0..<frameCount {
+                directStereoFrameCount += 1
                 let frameStarted = ContinuousClock.now
                 var optionalOutput: CVPixelBuffer?
                 let status = CVPixelBufferPoolCreatePixelBuffer(
@@ -563,6 +567,7 @@ extension SideBySideRestoration {
                             inputs: leftInputs + rightInputs
                         )
                     } catch {
+                        fusedStereoFallbackCount += 1
                         report(
                             "WARNING: Fused Metal stereo composite failed; "
                                 + "using split path for frame \(absoluteFrame + 1) (\(error))"
@@ -575,6 +580,7 @@ extension SideBySideRestoration {
                                 dimensions: plan.dimensions
                             )
                         } catch {
+                            cpuStereoFallbackCount += 1
                             report(
                                 "WARNING: Metal stereo copy failed; using CPU for frame "
                                     + "\(absoluteFrame + 1) (\(error))"
@@ -770,6 +776,16 @@ extension SideBySideRestoration {
             }
             guard writer.status == .completed else {
                 throw writer.error ?? DeformConvError.commandFailed("video writer did not complete")
+            }
+            if directStereoFrameCount > 0 {
+                let status = fusedStereoFallbackCount == 0 && cpuStereoFallbackCount == 0
+                    ? "PASS" : "WARNING"
+                report(
+                    "Stereo compositor safety summary: \(status), "
+                        + "\(directStereoFrameCount) frames, fused fallbacks "
+                        + "\(fusedStereoFallbackCount), CPU fallbacks "
+                        + "\(cpuStereoFallbackCount)"
+                )
             }
         }
 

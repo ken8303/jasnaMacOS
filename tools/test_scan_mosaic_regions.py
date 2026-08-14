@@ -5,6 +5,7 @@ import unittest
 
 from scan_mosaic_regions import (
     box_polygon_groups,
+    detector_coverage_metrics,
     has_box_polygons,
     mask_expansion_radius,
     mask_keyframe_box_groups,
@@ -12,6 +13,47 @@ from scan_mosaic_regions import (
     suppress_duplicate_regions,
     suppress_nested_regions,
 )
+
+
+class DetectorCoverageMetricsTests(unittest.TestCase):
+    def test_reports_average_active_regions_and_scheduled_blend_area(self):
+        regions = [
+            {
+                "startFrame": 0,
+                "endFrame": 30,
+                "blendWidth": 100,
+                "blendHeight": 50,
+            },
+            {
+                "startFrame": 15,
+                "endFrame": 30,
+                "blendWidth": 200,
+                "blendHeight": 100,
+            },
+        ]
+
+        active, area = detector_coverage_metrics(regions, 1_000, 500, 30)
+
+        self.assertEqual(active, 1.5)
+        self.assertEqual(area, 3.0)
+
+    def test_clamps_region_ranges_and_accepts_legacy_crop_dimensions(self):
+        regions = [
+            {
+                "startFrame": -10,
+                "endFrame": 40,
+                "width": 100,
+                "height": 100,
+            }
+        ]
+
+        active, area = detector_coverage_metrics(regions, 1_000, 1_000, 30)
+
+        self.assertEqual(active, 1.0)
+        self.assertEqual(area, 1.0)
+
+    def test_returns_zero_for_invalid_video_dimensions(self):
+        self.assertEqual(detector_coverage_metrics([], 0, 1_000, 30), (0.0, 0.0))
 
 
 class PolygonGroupTests(unittest.TestCase):

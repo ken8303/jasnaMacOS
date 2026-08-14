@@ -114,6 +114,29 @@ def tracking_distance(left, right):
     return distance / scale
 
 
+def detector_coverage_metrics(regions, frame_width, frame_height, frame_count):
+    """Return normalized scheduling load without rasterizing full-resolution masks."""
+    if frame_width <= 0 or frame_height <= 0 or frame_count <= 0:
+        return 0.0, 0.0
+    active_region_frames = 0
+    scheduled_blend_pixel_frames = 0
+    for region in regions:
+        start = max(0, min(frame_count, int(region.get("startFrame", 0))))
+        end = max(start, min(frame_count, int(region.get("endFrame", start))))
+        duration = end - start
+        blend_width = max(0, int(region.get("blendWidth", region.get("width", 0))))
+        blend_height = max(0, int(region.get("blendHeight", region.get("height", 0))))
+        active_region_frames += duration
+        scheduled_blend_pixel_frames += blend_width * blend_height * duration
+    average_active_regions = active_region_frames / frame_count
+    scheduled_blend_percent = (
+        100.0
+        * scheduled_blend_pixel_frames
+        / (frame_width * frame_height * frame_count)
+    )
+    return average_active_regions, scheduled_blend_percent
+
+
 def track_boxes(boxes):
     """Associate detections over time without merging two subjects in one frame."""
     by_frame = {}
@@ -722,6 +745,9 @@ def main() -> int:
     temporal_mask_count = sum(
         len(region.get("maskKeyframes", [])) for region in regions
     )
+    average_active_regions, scheduled_blend_percent = detector_coverage_metrics(
+        regions, width, height, frame_count
+    )
 
     manifest = {
         "version": 1,
@@ -754,6 +780,11 @@ def main() -> int:
     print(
         f"Temporal masks: {temporal_mask_count} keyframes across "
         f"{temporal_mask_region_count}/{len(regions)} regions",
+        flush=True,
+    )
+    print(
+        f"Detector coverage: {average_active_regions:.2f} active regions/frame, "
+        f"{scheduled_blend_percent:.3f}% scheduled blend area/eye-frame",
         flush=True,
     )
     print(
