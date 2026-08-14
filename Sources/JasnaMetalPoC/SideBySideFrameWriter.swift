@@ -523,6 +523,10 @@ extension SideBySideRestoration {
                 "Direct SBS compositing \(frameCount) frame(s), left/right regions "
                     + "\(leftRegions.count)/\(rightRegions.count)"
             )
+            guard frameCount > 0 else { return }
+            let writerStarted = ContinuousClock.now
+            var totalPreparationMilliseconds = 0.0
+            var totalEncoderWaitMilliseconds = 0.0
             for localFrame in 0..<frameCount {
                 let frameStarted = ContinuousClock.now
                 var optionalOutput: CVPixelBuffer?
@@ -549,19 +553,52 @@ extension SideBySideRestoration {
                     absoluteFrame: absoluteFrame,
                     xOffset: plan.eyeDimensions.width
                 )
-                try Self.copyStereoPixelBuffers(
-                    left: leftBaseFrames[localFrame],
-                    right: rightBaseFrames[localFrame],
-                    destination: outputBuffer,
-                    dimensions: plan.dimensions
-                )
                 if projection == .fisheye, let metalCompositor {
-                    try metalCompositor.compositeInPlace(
-                        pixelBuffer: outputBuffer,
-                        dimensions: plan.dimensions,
-                        inputs: leftInputs + rightInputs
-                    )
+                    do {
+                        try metalCompositor.compositeStereo(
+                            leftPixelBuffer: leftBaseFrames[localFrame],
+                            rightPixelBuffer: rightBaseFrames[localFrame],
+                            outputPixelBuffer: outputBuffer,
+                            dimensions: plan.dimensions,
+                            inputs: leftInputs + rightInputs
+                        )
+                    } catch {
+                        report(
+                            "WARNING: Fused Metal stereo composite failed; "
+                                + "using split path for frame \(absoluteFrame + 1) (\(error))"
+                        )
+                        do {
+                            try metalCompositor.copyStereo(
+                                leftPixelBuffer: leftBaseFrames[localFrame],
+                                rightPixelBuffer: rightBaseFrames[localFrame],
+                                outputPixelBuffer: outputBuffer,
+                                dimensions: plan.dimensions
+                            )
+                        } catch {
+                            report(
+                                "WARNING: Metal stereo copy failed; using CPU for frame "
+                                    + "\(absoluteFrame + 1) (\(error))"
+                            )
+                            try Self.copyStereoPixelBuffers(
+                                left: leftBaseFrames[localFrame],
+                                right: rightBaseFrames[localFrame],
+                                destination: outputBuffer,
+                                dimensions: plan.dimensions
+                            )
+                        }
+                        try metalCompositor.compositeInPlace(
+                            pixelBuffer: outputBuffer,
+                            dimensions: plan.dimensions,
+                            inputs: leftInputs + rightInputs
+                        )
+                    }
                 } else {
+                    try Self.copyStereoPixelBuffers(
+                        left: leftBaseFrames[localFrame],
+                        right: rightBaseFrames[localFrame],
+                        destination: outputBuffer,
+                        dimensions: plan.dimensions
+                    )
                     guard projection == .raw else {
                         throw DeformConvError.commandFailed(
                             "direct fisheye SBS output requires the Metal compositor"
@@ -574,8 +611,7 @@ extension SideBySideRestoration {
                         try accumulator.composite(
                             region: composite.region,
                             planarRGB: composite.restored,
-                            originalPlanarRGB: projection == .fisheye
-                                ? composite.original : nil,
+                            originalPlanarRGB: nil,
                             projection: .raw
                         )
                     }
@@ -586,19 +622,40 @@ extension SideBySideRestoration {
                 ) {
                     CVBufferSetAttachments(outputBuffer, attachments, .shouldPropagate)
                 }
+                let preparationMilliseconds = SideBySideRestoration.elapsedMilliseconds(
+                    since: frameStarted
+                )
                 let presentationTime = CMTime(
                     value: CMTimeValue(presentationStartFrame + localFrame), timescale: 30
                 )
+                let appendStarted = ContinuousClock.now
                 try await append(
                     FinishedPixelBuffer(value: outputBuffer), at: presentationTime,
                     frame: presentationStartFrame + localFrame
                 )
-                report(
-                    "Queued direct SBS frame \(absoluteFrame + 1)/"
-                        + "\(progressFrameCount); composite "
-                        + "\(String(format: "%.3f", SideBySideRestoration.elapsedMilliseconds(since: frameStarted))) ms"
+                let appendMilliseconds = SideBySideRestoration.elapsedMilliseconds(
+                    since: appendStarted
                 )
+                totalPreparationMilliseconds += preparationMilliseconds
+                totalEncoderWaitMilliseconds += appendMilliseconds
+                if localFrame == frameCount - 1
+                    || (absoluteFrame + 1).isMultiple(of: 30)
+                    || appendMilliseconds >= 250
+                {
+                    report(
+                        "Queued direct SBS frame \(absoluteFrame + 1)/"
+                            + "\(progressFrameCount); prepare/composite "
+                            + "\(String(format: "%.3f", preparationMilliseconds)) ms, "
+                            + "encoder wait \(String(format: "%.3f", appendMilliseconds)) ms"
+                    )
+                }
             }
+            report(
+                "Direct SBS writer phases: \(frameCount) frames, wall "
+                    + "\(String(format: "%.3f", SideBySideRestoration.elapsedMilliseconds(since: writerStarted))) ms, "
+                    + "preparation sum \(String(format: "%.3f", totalPreparationMilliseconds)) ms, "
+                    + "encoder wait sum \(String(format: "%.3f", totalEncoderWaitMilliseconds)) ms"
+            )
         }
 
         private static func readCompositeInputs(

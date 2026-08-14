@@ -134,6 +134,39 @@ import Testing
     #expect(middle.maskKeyframes == nil)
 }
 
+@Test func diagnosticFullDetectedRegionBlendRemovesMaskAndUsesTheWholeCrop() {
+    let region = MosaicRegion(
+        startFrame: 0,
+        endFrame: 30,
+        x: 100,
+        y: 200,
+        width: 400,
+        height: 300,
+        confidence: 0.9,
+        blendX: 150,
+        blendY: 250,
+        blendWidth: 250,
+        blendHeight: 150,
+        maskWidth: 2,
+        maskHeight: 2,
+        maskData: Data(repeating: 255, count: 4),
+        maskKeyframes: [
+            MosaicMaskKeyframe(frame: 0, maskData: Data(repeating: 255, count: 4))
+        ]
+    )
+
+    let diagnostic = region.usingFullDetectedRegionBlend()
+
+    #expect(diagnostic.effectiveBlendX == region.x)
+    #expect(diagnostic.effectiveBlendY == region.y)
+    #expect(diagnostic.effectiveBlendWidth == region.width)
+    #expect(diagnostic.effectiveBlendHeight == region.height)
+    #expect(diagnostic.maskWidth == nil)
+    #expect(diagnostic.maskHeight == nil)
+    #expect(diagnostic.maskData == nil)
+    #expect(diagnostic.maskKeyframes == nil)
+}
+
 @available(macOS 27.0, *)
 @Test func sparseCacheVariantIsStableForTheSameTiles() throws {
     let plan = try SideBySideVideoPlan(

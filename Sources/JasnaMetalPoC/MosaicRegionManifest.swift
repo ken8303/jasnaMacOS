@@ -117,6 +117,26 @@ struct MosaicRegion: Codable, Equatable, Sendable {
         )
     }
 
+    /// Diagnostic coverage mode that applies the restored delta throughout the
+    /// complete detected crop. This isolates model quality from segmentation-
+    /// mask coverage; normal restoration should retain the softer mask path.
+    func usingFullDetectedRegionBlend() -> MosaicRegion {
+        MosaicRegion(
+            startFrame: startFrame,
+            endFrame: endFrame,
+            x: x,
+            y: y,
+            width: width,
+            height: height,
+            confidence: confidence,
+            blendX: x,
+            blendY: y,
+            blendWidth: width,
+            blendHeight: height,
+            subdivisionGroup: subdivisionGroup
+        )
+    }
+
     private func interpolatedSegmentationMask(at frame: Int) -> Data? {
         guard let maskKeyframes, !maskKeyframes.isEmpty,
               let maskWidth, let maskHeight

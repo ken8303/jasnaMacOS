@@ -13,6 +13,7 @@ INPUT_PATH="$1"
 EYE="$2"
 OUTPUT_PATH="$3"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$ROOT_DIR/script/restoration_identity.sh"
 SEGMENT_SECONDS="${JASNA_SEGMENT_SECONDS:-120}"
 EYE_BITRATE="${JASNA_EYE_BITRATE:-20000000}"
 SPARSE_MOSAIC="${JASNA_SPARSE_MOSAIC:-0}"
@@ -23,6 +24,7 @@ DETECT_DECODE_MODE="${JASNA_DETECT_DECODE_MODE:-sequential}"
 REGION_DURATION="${JASNA_REGION_DURATION:-1.0}"
 SPARSE_BATCH_MODE="${JASNA_SPARSE_BATCH_MODE:-run}"
 SPARSE_BATCH_FILE="${JASNA_SPARSE_BATCH_FILE:-}"
+DETECTOR="${JASNA_DETECTOR:-rfdetr-vr-v1}"
 
 [[ "$EYE" == "left" || "$EYE" == "right" ]] || usage
 [[ -f "$INPUT_PATH" ]] || {
@@ -64,6 +66,12 @@ if [[ "$SPARSE_BATCH_MODE" != "run" ]]; then
     exit 1
   }
 fi
+if [[ "$SPARSE_MOSAIC" == "1" \
+  && "$DETECTOR" != "rfdetr-vr-v1" \
+  && "$DETECTOR" != "yolo-v2-fast" ]]; then
+  echo "error: JASNA_DETECTOR must be rfdetr-vr-v1 or yolo-v2-fast" >&2
+  exit 1
+fi
 
 ENCODER_SPEED_ARGS=()
 if [[ "$FAST_ENCODE" == "1" ]]; then
@@ -98,15 +106,98 @@ RESTORED_DIR="$WORK_DIR/restored"
 CACHE_DIR="$WORK_DIR/cache"
 if [[ "$SPARSE_MOSAIC" == "1" ]]; then
   # v15 adds a focused lower-edge detail crop to each oversized masked region.
-  RESTORED_DIR="$WORK_DIR/restored-sparse-crop-v15-lower-detail-$VR_PROJECTION"
-  CACHE_DIR="$WORK_DIR/cache-sparse-crop-v15-lower-detail-$VR_PROJECTION"
+  RESTORED_DIR="$WORK_DIR/restored-sparse-crop-v15-lower-detail-$VR_PROJECTION-$DETECTOR"
+  CACHE_DIR="$WORK_DIR/cache-sparse-crop-v15-lower-detail-$VR_PROJECTION-$DETECTOR"
 fi
 OUTPUT_DONE="$RESTORED_DIR/${EYE}-joined.done"
 SOURCE_DONE="$WORK_DIR/source.done"
 MANIFEST_PATH="$WORK_DIR/restored-concat.txt"
 TEMP_OUTPUT="$WORK_DIR/${EYE}-joined.mov"
+RUN_CONFIG_PATH="$WORK_DIR/run-config.txt"
+WORKFLOW_LOCK="$WORK_DIR/.jasna-eye-workflow-lock"
 
 mkdir -p "$WORK_DIR" "$RESTORED_DIR" "$CACHE_DIR"
+if ! mkdir "$WORKFLOW_LOCK" 2>/dev/null; then
+  EXISTING_WORKFLOW_PID="$(/bin/cat "$WORKFLOW_LOCK/pid" 2>/dev/null || true)"
+  if [[ "$EXISTING_WORKFLOW_PID" =~ ^[0-9]+$ ]] \
+    && kill -0 "$EXISTING_WORKFLOW_PID" 2>/dev/null; then
+    echo "error: this $EYE-eye restoration workflow is already active (PID $EXISTING_WORKFLOW_PID)" >&2
+    echo "work dir: $WORK_DIR" >&2
+    exit 1
+  fi
+  if [[ ! "$EXISTING_WORKFLOW_PID" =~ ^[0-9]+$ ]]; then
+    echo "error: eye workflow lock exists without a valid owner PID: $WORKFLOW_LOCK" >&2
+    exit 1
+  fi
+  STALE_WORKFLOW_LOCK="$WORK_DIR/.jasna-eye-workflow-lock.stale-$(date '+%Y%m%d-%H%M%S')-$$"
+  mv "$WORKFLOW_LOCK" "$STALE_WORKFLOW_LOCK"
+  mkdir "$WORKFLOW_LOCK"
+fi
+printf '%s\n' "$$" > "$WORKFLOW_LOCK/pid"
+cleanup_eye_workflow_lock() {
+  [[ -d "$WORKFLOW_LOCK" ]] || return 0
+  local owner_pid
+  owner_pid="$(/bin/cat "$WORKFLOW_LOCK/pid" 2>/dev/null || true)"
+  [[ "$owner_pid" == "$$" ]] || return 0
+  rm -f "$WORKFLOW_LOCK/pid"
+  rmdir "$WORKFLOW_LOCK" 2>/dev/null || true
+}
+trap cleanup_eye_workflow_lock EXIT
+trap 'exit 130' INT
+trap 'exit 143' HUP TERM
+
+SOURCE_FINGERPRINT="$(jasna_source_fingerprint "$INPUT_PATH")"
+IMPLEMENTATION_FINGERPRINT="$(jasna_implementation_fingerprint "$ROOT_DIR")"
+MODEL_FINGERPRINT="$(jasna_model_fingerprint "$ROOT_DIR" "$DETECTOR")"
+RUN_CONFIG="input=$INPUT_PATH
+source_fingerprint=$SOURCE_FINGERPRINT
+implementation_fingerprint=$IMPLEMENTATION_FINGERPRINT
+model_fingerprint=$MODEL_FINGERPRINT
+eye=$EYE
+segment_seconds=$SEGMENT_SECONDS
+eye_bitrate=$EYE_BITRATE
+sparse_mosaic=$SPARSE_MOSAIC
+projection=$VR_PROJECTION
+fast_encode=$FAST_ENCODE
+detector=$DETECTOR
+detect_batch_size=$DETECT_BATCH_SIZE
+detect_decode_mode=$DETECT_DECODE_MODE
+rfdetr_max_detections=${JASNA_RFDETR_MAX_DETECTIONS:-64}
+region_duration=$REGION_DURATION
+detect_confidence=${JASNA_DETECT_CONFIDENCE:-0.15}
+temporal_padding=${JASNA_TEMPORAL_PADDING:-1.0}
+region_nms_iou=${JASNA_REGION_NMS_IOU:-0.45}
+mask_expansion=${JASNA_MASK_EXPANSION:-0.10}
+mask_size=${JASNA_MASK_SIZE:-128}
+large_region_max_blend=${JASNA_LARGE_REGION_MAX_BLEND:-768}
+large_region_overlap=${JASNA_LARGE_REGION_OVERLAP:-96}
+large_region_split_limit=${JASNA_LARGE_REGION_SPLIT_LIMIT:-1}
+large_region_max_axis_crops=${JASNA_LARGE_REGION_MAX_AXIS_CROPS:-3}
+large_region_mask_growth=${JASNA_LARGE_REGION_MASK_GROWTH:-0.05}
+large_region_mask_feather=${JASNA_LARGE_REGION_MASK_FEATHER:-0.025}
+large_region_block_growth=${JASNA_LARGE_REGION_BLOCK_GROWTH:-0.04}
+large_region_mask_temporal_radius=${JASNA_LARGE_REGION_MASK_TEMPORAL_RADIUS:-1}
+large_region_detail_crops=${JASNA_LARGE_REGION_DETAIL_CROPS:-1}
+large_region_detail_dimension=${JASNA_LARGE_REGION_DETAIL_DIMENSION:-576}
+model_batch=${JASNA_MODEL_BATCH:-1}
+diagnostic_full_region_blend=${JASNA_DIAGNOSTIC_FULL_REGION_BLEND:-0}
+metal_texture_compositor=${JASNA_METAL_TEXTURE_COMPOSITOR:-1}
+metal_compositor=${JASNA_METAL_COMPOSITOR:-1}"
+if [[ -s "$RUN_CONFIG_PATH" ]]; then
+  if [[ "$(/bin/cat "$RUN_CONFIG_PATH")" != "$RUN_CONFIG" ]]; then
+    echo "error: this eye output path belongs to a different source or restoration configuration" >&2
+    echo "use a new output filename, or restore the original settings" >&2
+    exit 1
+  fi
+elif [[ "$SPARSE_BATCH_MODE" != "prepare" \
+  && ( -f "$SOURCE_DONE" || -d "$SOURCE_DIR" ) ]]; then
+  echo "error: legacy eye resume data has no configuration identity" >&2
+  echo "use a new output filename so stale manifests cannot be reused" >&2
+  exit 1
+fi
+RUN_CONFIG_TEMP="$WORK_DIR/.run-config-writing-$$"
+printf '%s\n' "$RUN_CONFIG" > "$RUN_CONFIG_TEMP"
+mv "$RUN_CONFIG_TEMP" "$RUN_CONFIG_PATH"
 exec > >(/usr/bin/tee -a "$LOG_PATH") 2>&1
 
 echo
@@ -120,7 +211,7 @@ echo "Sparse mosaic:    $SPARSE_MOSAIC"
 echo "VR projection:    $VR_PROJECTION"
 echo "Fast encoding:    $FAST_ENCODE"
 if [[ "$SPARSE_MOSAIC" == "1" ]]; then
-  echo "Detector:         $DETECT_DECODE_MODE decode, batch $DETECT_BATCH_SIZE"
+  echo "Detector:         $DETECTOR; $DETECT_DECODE_MODE decode, batch $DETECT_BATCH_SIZE"
   echo "Temporal clips:   $REGION_DURATION seconds"
   echo "Detection quality: confidence ${JASNA_DETECT_CONFIDENCE:-0.15}, padding ${JASNA_TEMPORAL_PADDING:-1.0}s"
   echo "Region overlap:    suppress at IoU ${JASNA_REGION_NMS_IOU:-0.45}"

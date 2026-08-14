@@ -26,6 +26,10 @@ private let sharedBatch2CircuitBreaker = RestorationBatchCircuitBreaker()
 
 @available(macOS 27.0, *)
 extension SideBySideRestoration {
+    static var fullDetectedRegionBlendEnabled: Bool {
+        ProcessInfo.processInfo.environment["JASNA_DIAGNOSTIC_FULL_REGION_BLEND"] == "1"
+    }
+
     static func elapsedMilliseconds(since start: ContinuousClock.Instant) -> Double {
         let elapsed = start.duration(to: .now).components
         return Double(elapsed.seconds) * 1_000
@@ -356,6 +360,12 @@ extension SideBySideRestoration {
     static func reportSubdivisionConfiguration(
         _ configuration: MosaicRegionSubdivisionConfiguration
     ) {
+        if fullDetectedRegionBlendEnabled {
+            report(
+                "WARNING: diagnostic full detected-region blend enabled; "
+                    + "segmentation masks are bypassed"
+            )
+        }
         guard configuration.maximumBlendDimension > 0,
               configuration.splitLimit > 0
         else {
@@ -368,7 +378,7 @@ extension SideBySideRestoration {
                 + "\(configuration.overlap)px, up to "
                 + "\(configuration.splitLimit) region(s)/window and "
                 + "\(configuration.maximumAxisCrops) crops/axis; "
-                + "normalized Metal overlap; adaptive parent mask growth "
+                + "normalized Metal overlap; all-region mask growth "
                 + "\(String(format: "%.3f", configuration.maskGrowthFraction)), feather "
                 + "\(String(format: "%.3f", configuration.maskFeatherFraction)), block halo "
                 + "\(String(format: "%.3f", configuration.blockResidualGrowthFraction)), "

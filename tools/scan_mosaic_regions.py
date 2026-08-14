@@ -18,6 +18,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("input_video", type=Path)
     parser.add_argument("output_manifest", type=Path)
     parser.add_argument("--model", type=Path, required=True)
+    parser.add_argument(
+        "--backend", choices=("yolo", "rfdetr"), default="yolo"
+    )
     parser.add_argument("--sample-stride", type=float, default=0.1)
     parser.add_argument(
         "--region-duration",
@@ -48,6 +51,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--device", default="auto")
     parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument(
+        "--max-detections",
+        type=int,
+        default=64,
+        help="maximum RF-DETR object queries retained per sampled frame",
+    )
     parser.add_argument(
         "--decode-mode",
         choices=("sequential", "seek"),
@@ -295,11 +304,37 @@ def mask_expansion_radius(size, expansion_fraction):
     return max(1, int(math.ceil(size * expansion_fraction)))
 
 
+def box_polygon_groups(box):
+    """Normalize one legacy polygon or several RF-DETR mask islands."""
+    if len(box) <= 6 or not box[6]:
+        return []
+    payload = box[6]
+    first = payload[0]
+    if (
+        isinstance(first, (list, tuple))
+        and len(first) == 2
+        and all(isinstance(value, (int, float)) for value in first)
+    ):
+        return [payload]
+    return [
+        polygon
+        for polygon in payload
+        if isinstance(polygon, (list, tuple)) and len(polygon) >= 3
+    ]
+
+
+def has_box_polygons(box):
+    return any(len(polygon) >= 3 for polygon in box_polygon_groups(box))
+
+
 def segmentation_alpha_mask(
     boxes, rectangle, cv2, np, size=64, expansion_fraction=0.10
 ):
     """Rasterize tracked YOLO polygons into a compact soft region mask."""
-    polygons = [box[6] for box in boxes if len(box) > 6 and len(box[6]) >= 3]
+    polygons = [
+        polygon for box in boxes for polygon in box_polygon_groups(box)
+        if len(polygon) >= 3
+    ]
     if not polygons:
         return None
     x, y, width, height = rectangle
@@ -333,9 +368,9 @@ def segmentation_alpha_mask(
 
 def mask_source_boxes(cluster, nearby, start_frame, end_frame):
     """Ensure padded/interpolated segments inherit the nearest real polygon."""
-    if any(len(box) > 6 and len(box[6]) >= 3 for box in nearby):
+    if any(has_box_polygons(box) for box in nearby):
         return nearby
-    polygon_boxes = [box for box in cluster if len(box) > 6 and len(box[6]) >= 3]
+    polygon_boxes = [box for box in cluster if has_box_polygons(box)]
     if not polygon_boxes:
         return nearby
     midpoint = (start_frame + end_frame - 1) / 2
@@ -344,7 +379,7 @@ def mask_source_boxes(cluster, nearby, start_frame, end_frame):
 
 def mask_keyframe_box_groups(cluster, start_frame, end_frame, stride_frames):
     """Group real detector polygons into ordered, clamped mask keyframes."""
-    polygon_boxes = [box for box in cluster if len(box) > 6 and len(box[6]) >= 3]
+    polygon_boxes = [box for box in cluster if has_box_polygons(box)]
     selected = [
         box for box in polygon_boxes
         if start_frame - stride_frames <= int(box[5]) < end_frame + stride_frames
@@ -422,18 +457,33 @@ def main() -> int:
             "mask expansion must be in (0, 0.25], and mask size must be a power "
             "of two from 32 through 256"
         )
-    if args.batch_size <= 0:
-        raise SystemExit("batch size must be positive")
+    if args.batch_size <= 0 or args.max_detections <= 0 or args.max_detections > 200:
+        raise SystemExit("batch size must be positive and max detections must be from 1 to 200")
 
     try:
         import cv2
         import numpy as np
         import torch
-        from ultralytics import YOLO
     except ImportError as error:
         raise SystemExit(
             "mosaic detector dependencies are missing; run script/setup_mosaic_detector.sh"
         ) from error
+
+    if args.backend == "yolo":
+        try:
+            from ultralytics import YOLO
+        except ImportError as error:
+            raise SystemExit(
+                "YOLO detector dependencies are missing; run "
+                "script/setup_mosaic_detector.sh"
+            ) from error
+    else:
+        try:
+            from rfdetr_mps_detector import RFDetrMPSDetector
+        except ImportError as error:
+            raise SystemExit(
+                "RF-DETR dependencies are missing from .venv-rfdetr"
+            ) from error
 
     capture = cv2.VideoCapture(str(args.input_video))
     if not capture.isOpened():
@@ -450,12 +500,18 @@ def main() -> int:
     device = choose_device(torch, args.device)
     print(
         f"Scanning {width}x{height}, {frame_count} frames at {source_fps:.3f} fps "
-        f"on {device}; {args.decode_mode} decode, batch {args.batch_size}",
+        f"on {device}; {args.backend} detector, {args.decode_mode} decode, "
+        f"batch {args.batch_size}",
         flush=True,
     )
-    # Exported Core ML packages do not reliably retain enough metadata for
-    # Ultralytics to infer that this checkpoint is a segmentation model.
-    model = YOLO(str(args.model), task="segment")
+    if args.backend == "yolo":
+        # Exported Core ML packages do not reliably retain enough metadata for
+        # Ultralytics to infer that this checkpoint is a segmentation model.
+        model = YOLO(str(args.model), task="segment")
+    else:
+        model = RFDetrMPSDetector(
+            args.model, device=device, max_select=args.max_detections
+        )
     stride_frames = max(1, int(round(args.sample_stride * source_fps)))
     region_frames = max(stride_frames, int(round(args.region_duration * source_fps)))
     padding_frames = int(round(args.temporal_padding * source_fps))
@@ -465,21 +521,26 @@ def main() -> int:
     scan_started = time.perf_counter()
 
     def predict(frames):
-        nonlocal device
-        source = frames if len(frames) > 1 else frames[0]
+        nonlocal device, model
         try:
+            if args.backend == "rfdetr":
+                return model.predict(frames, score_threshold=args.confidence)
+            source = frames if len(frames) > 1 else frames[0]
             return model.predict(
-                source,
-                imgsz=args.image_size,
-                conf=args.confidence,
-                device=device,
-                verbose=False,
+                source, imgsz=args.image_size, conf=args.confidence,
+                device=device, verbose=False,
             )
         except Exception:
             if device != "mps":
                 raise
             print("MPS detector failed; retrying the scan on CPU", file=sys.stderr, flush=True)
             device = "cpu"
+            if args.backend == "rfdetr":
+                model = RFDetrMPSDetector(
+                    args.model, device=device, max_select=args.max_detections
+                )
+                return model.predict(frames, score_threshold=args.confidence)
+            source = frames if len(frames) > 1 else frames[0]
             return model.predict(
                 source,
                 imgsz=args.image_size,
@@ -503,7 +564,15 @@ def main() -> int:
             )
         for result, frame_index in zip(predictions, frame_indices):
             boxes = []
-            if result.boxes is not None:
+            if args.backend == "rfdetr":
+                boxes = [
+                    tuple(coords)
+                    + (float(conf), frame_index, polygon)
+                    for coords, conf, polygon in zip(
+                        result.boxes_xyxy, result.confidences, result.polygons
+                    )
+                ]
+            elif result.boxes is not None:
                 coordinates = result.boxes.xyxy.detach().cpu().tolist()
                 confidences = result.boxes.conf.detach().cpu().tolist()
                 polygons = result.masks.xy if result.masks is not None else []

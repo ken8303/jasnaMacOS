@@ -173,6 +173,105 @@ final class MetalMosaicCompositor: @unchecked Sendable {
         }
     }
 
+    func copyStereo(
+        leftPixelBuffer: CVPixelBuffer,
+        rightPixelBuffer: CVPixelBuffer,
+        outputPixelBuffer: CVPixelBuffer,
+        dimensions: VideoDimensions
+    ) throws {
+        let eyeDimensions = VideoDimensions(
+            width: dimensions.width / 2,
+            height: dimensions.height
+        )
+        guard dimensions.width.isMultiple(of: 2),
+              CVPixelBufferGetPixelFormatType(leftPixelBuffer) == kCVPixelFormatType_32BGRA,
+              CVPixelBufferGetPixelFormatType(rightPixelBuffer) == kCVPixelFormatType_32BGRA,
+              CVPixelBufferGetPixelFormatType(outputPixelBuffer) == kCVPixelFormatType_32BGRA,
+              CVPixelBufferGetWidth(leftPixelBuffer) == eyeDimensions.width,
+              CVPixelBufferGetHeight(leftPixelBuffer) == eyeDimensions.height,
+              CVPixelBufferGetWidth(rightPixelBuffer) == eyeDimensions.width,
+              CVPixelBufferGetHeight(rightPixelBuffer) == eyeDimensions.height,
+              CVPixelBufferGetWidth(outputPixelBuffer) == dimensions.width,
+              CVPixelBufferGetHeight(outputPixelBuffer) == dimensions.height,
+              let left = makeTexture(
+                  pixelBuffer: leftPixelBuffer, dimensions: eyeDimensions
+              ),
+              let right = makeTexture(
+                  pixelBuffer: rightPixelBuffer, dimensions: eyeDimensions
+              ),
+              let destination = makeTexture(
+                  pixelBuffer: outputPixelBuffer, dimensions: dimensions
+              ),
+              let commandBuffer = queue.makeCommandBuffer(),
+              let encoder = commandBuffer.makeBlitCommandEncoder()
+        else { throw DeformConvError.metalUnavailable }
+        let eyeSize = MTLSize(
+            width: eyeDimensions.width, height: eyeDimensions.height, depth: 1
+        )
+        encoder.copy(
+            from: left.texture,
+            sourceSlice: 0,
+            sourceLevel: 0,
+            sourceOrigin: .init(x: 0, y: 0, z: 0),
+            sourceSize: eyeSize,
+            to: destination.texture,
+            destinationSlice: 0,
+            destinationLevel: 0,
+            destinationOrigin: .init(x: 0, y: 0, z: 0)
+        )
+        encoder.copy(
+            from: right.texture,
+            sourceSlice: 0,
+            sourceLevel: 0,
+            sourceOrigin: .init(x: 0, y: 0, z: 0),
+            sourceSize: eyeSize,
+            to: destination.texture,
+            destinationSlice: 0,
+            destinationLevel: 0,
+            destinationOrigin: .init(x: eyeDimensions.width, y: 0, z: 0)
+        )
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        if let error = commandBuffer.error { throw error }
+        withExtendedLifetime((left.reference, right.reference, destination.reference)) {}
+    }
+
+    func compositeStereo(
+        leftPixelBuffer: CVPixelBuffer,
+        rightPixelBuffer: CVPixelBuffer,
+        outputPixelBuffer: CVPixelBuffer,
+        dimensions: VideoDimensions,
+        inputs: [MetalMosaicCompositeInput]
+    ) throws {
+        let eyeDimensions = VideoDimensions(
+            width: dimensions.width / 2, height: dimensions.height
+        )
+        guard prefersTextureSurfaces,
+              dimensions.width.isMultiple(of: 2),
+              CVPixelBufferGetPixelFormatType(leftPixelBuffer) == kCVPixelFormatType_32BGRA,
+              CVPixelBufferGetPixelFormatType(rightPixelBuffer) == kCVPixelFormatType_32BGRA,
+              CVPixelBufferGetPixelFormatType(outputPixelBuffer) == kCVPixelFormatType_32BGRA,
+              CVPixelBufferGetWidth(leftPixelBuffer) == eyeDimensions.width,
+              CVPixelBufferGetHeight(leftPixelBuffer) == eyeDimensions.height,
+              CVPixelBufferGetWidth(rightPixelBuffer) == eyeDimensions.width,
+              CVPixelBufferGetHeight(rightPixelBuffer) == eyeDimensions.height,
+              CVPixelBufferGetWidth(outputPixelBuffer) == dimensions.width,
+              CVPixelBufferGetHeight(outputPixelBuffer) == dimensions.height,
+              try compositeUsingTextures(
+                  basePixelBuffer: nil,
+                  stereoBasePixelBuffers: (leftPixelBuffer, rightPixelBuffer),
+                  outputPixelBuffer: outputPixelBuffer,
+                  dimensions: dimensions,
+                  inputs: inputs
+              )
+        else {
+            throw DeformConvError.commandFailed(
+                "fused stereo mosaic compositing requires Metal texture surfaces"
+            )
+        }
+    }
+
     private func compositeUsingBufferCopies(
         basePixelBuffer: CVPixelBuffer,
         outputPixelBuffer: CVPixelBuffer,
@@ -278,6 +377,7 @@ final class MetalMosaicCompositor: @unchecked Sendable {
 
     private func compositeUsingTextures(
         basePixelBuffer: CVPixelBuffer?,
+        stereoBasePixelBuffers: (CVPixelBuffer, CVPixelBuffer)? = nil,
         outputPixelBuffer: CVPixelBuffer,
         dimensions: VideoDimensions,
         inputs: [MetalMosaicCompositeInput]
@@ -285,13 +385,60 @@ final class MetalMosaicCompositor: @unchecked Sendable {
         let source = basePixelBuffer.flatMap {
             makeTexture(pixelBuffer: $0, dimensions: dimensions)
         }
+        let eyeDimensions = VideoDimensions(
+            width: dimensions.width / 2, height: dimensions.height
+        )
+        let stereoSources: (
+            (reference: CVMetalTexture, texture: MTLTexture),
+            (reference: CVMetalTexture, texture: MTLTexture)
+        )?
+        if let stereoBasePixelBuffers {
+            guard let left = makeTexture(
+                pixelBuffer: stereoBasePixelBuffers.0, dimensions: eyeDimensions
+            ), let right = makeTexture(
+                pixelBuffer: stereoBasePixelBuffers.1, dimensions: eyeDimensions
+            ) else { return false }
+            stereoSources = (left, right)
+        } else {
+            stereoSources = nil
+        }
         guard (basePixelBuffer == nil || source != nil),
+              (stereoBasePixelBuffers == nil || stereoSources != nil),
+              !(basePixelBuffer != nil && stereoBasePixelBuffers != nil),
               let destination = makeTexture(
                   pixelBuffer: outputPixelBuffer, dimensions: dimensions
               ),
               let commandBuffer = queue.makeCommandBuffer()
         else { return false }
-        if let source {
+        if let stereoSources {
+            guard let blitEncoder = commandBuffer.makeBlitCommandEncoder() else { return false }
+            let eyeSize = MTLSize(
+                width: eyeDimensions.width, height: eyeDimensions.height, depth: 1
+            )
+            blitEncoder.copy(
+                from: stereoSources.0.texture,
+                sourceSlice: 0,
+                sourceLevel: 0,
+                sourceOrigin: .init(x: 0, y: 0, z: 0),
+                sourceSize: eyeSize,
+                to: destination.texture,
+                destinationSlice: 0,
+                destinationLevel: 0,
+                destinationOrigin: .init(x: 0, y: 0, z: 0)
+            )
+            blitEncoder.copy(
+                from: stereoSources.1.texture,
+                sourceSlice: 0,
+                sourceLevel: 0,
+                sourceOrigin: .init(x: 0, y: 0, z: 0),
+                sourceSize: eyeSize,
+                to: destination.texture,
+                destinationSlice: 0,
+                destinationLevel: 0,
+                destinationOrigin: .init(x: eyeDimensions.width, y: 0, z: 0)
+            )
+            blitEncoder.endEncoding()
+        } else if let source {
             guard let blitEncoder = commandBuffer.makeBlitCommandEncoder() else { return false }
             blitEncoder.copy(
                 from: source.texture,
@@ -465,7 +612,15 @@ final class MetalMosaicCompositor: @unchecked Sendable {
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
         if let error = commandBuffer.error { throw error }
-        withExtendedLifetime((source?.reference, destination.reference, heldBuffers)) {}
+        withExtendedLifetime(
+            (
+                source?.reference,
+                stereoSources?.0.reference,
+                stereoSources?.1.reference,
+                destination.reference,
+                heldBuffers
+            )
+        ) {}
         return true
     }
 

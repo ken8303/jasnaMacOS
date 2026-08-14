@@ -7,8 +7,23 @@ set -euo pipefail
 }
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PYTHON_PATH="$ROOT_DIR/.venv-mosaic/bin/python"
-MODEL_PATH="$ROOT_DIR/Models/MosaicDetection/lada_vr_mosaic_detection_model_v2_fast.pt"
+DETECTOR="${JASNA_DETECTOR:-rfdetr-vr-v1}"
+case "$DETECTOR" in
+  yolo-v2-fast)
+    PYTHON_PATH="$ROOT_DIR/.venv-mosaic/bin/python"
+    MODEL_PATH="$ROOT_DIR/Models/MosaicDetection/lada_vr_mosaic_detection_model_v2_fast.pt"
+    DETECTOR_BACKEND="yolo"
+    ;;
+  rfdetr-vr-v1)
+    PYTHON_PATH="$ROOT_DIR/.venv-rfdetr/bin/python"
+    MODEL_PATH="$ROOT_DIR/Models/MosaicDetection/rfdetr-vr-v1.pt"
+    DETECTOR_BACKEND="rfdetr"
+    ;;
+  *)
+    echo "error: JASNA_DETECTOR must be yolo-v2-fast or rfdetr-vr-v1" >&2
+    exit 1
+    ;;
+esac
 DETECT_BATCH_SIZE="${JASNA_DETECT_BATCH_SIZE:-2}"
 DETECT_DECODE_MODE="${JASNA_DETECT_DECODE_MODE:-sequential}"
 REGION_DURATION="${JASNA_REGION_DURATION:-1.0}"
@@ -17,6 +32,7 @@ TEMPORAL_PADDING="${JASNA_TEMPORAL_PADDING:-1.0}"
 REGION_NMS_IOU="${JASNA_REGION_NMS_IOU:-0.45}"
 MASK_EXPANSION="${JASNA_MASK_EXPANSION:-0.10}"
 MASK_SIZE="${JASNA_MASK_SIZE:-128}"
+RFDETR_MAX_DETECTIONS="${JASNA_RFDETR_MAX_DETECTIONS:-64}"
 
 [[ "$DETECT_BATCH_SIZE" =~ ^[1-9][0-9]*$ ]] || {
   echo "error: JASNA_DETECT_BATCH_SIZE must be a positive integer" >&2
@@ -52,16 +68,29 @@ MASK_SIZE="${JASNA_MASK_SIZE:-128}"
   echo "error: JASNA_MASK_SIZE must be a power of two from 32 through 256" >&2
   exit 1
 }
-
-[[ -x "$PYTHON_PATH" && -s "$MODEL_PATH" ]] || {
-  echo "error: mosaic detector is not set up" >&2
-  echo "run: $ROOT_DIR/script/setup_mosaic_detector.sh" >&2
+[[ "$RFDETR_MAX_DETECTIONS" =~ ^[0-9]+$ ]] \
+  && (( RFDETR_MAX_DETECTIONS >= 1 && RFDETR_MAX_DETECTIONS <= 200 )) || {
+  echo "error: JASNA_RFDETR_MAX_DETECTIONS must be an integer from 1 through 200" >&2
   exit 1
 }
 
+[[ -x "$PYTHON_PATH" && -s "$MODEL_PATH" ]] || {
+  echo "error: $DETECTOR mosaic detector is not set up" >&2
+  if [[ "$DETECTOR" == "yolo-v2-fast" ]]; then
+    echo "run: $ROOT_DIR/script/setup_mosaic_detector.sh" >&2
+  else
+    echo "expected environment: $ROOT_DIR/.venv-rfdetr" >&2
+    echo "expected model: $MODEL_PATH" >&2
+  fi
+  exit 1
+}
+
+export PYTORCH_ENABLE_MPS_FALLBACK=1
 "$PYTHON_PATH" "$ROOT_DIR/tools/scan_mosaic_regions.py" \
   "$1" "$2" --model "$MODEL_PATH" \
+  --backend "$DETECTOR_BACKEND" \
   --batch-size "$DETECT_BATCH_SIZE" \
+  --max-detections "$RFDETR_MAX_DETECTIONS" \
   --decode-mode "$DETECT_DECODE_MODE" \
   --region-duration "$REGION_DURATION" \
   --confidence "$DETECT_CONFIDENCE" \

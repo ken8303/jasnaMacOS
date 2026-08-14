@@ -87,7 +87,6 @@ enum MosaicRegionSubdivision {
         configuration: MosaicRegionSubdivisionConfiguration
     ) -> Result {
         guard configuration.maximumBlendDimension > 0,
-              configuration.splitLimit > 0,
               !regions.isEmpty
         else {
             return Result(regions: regions, splitRegionCount: 0, addedModelCropCount: 0)
@@ -106,22 +105,19 @@ enum MosaicRegionSubdivision {
             return leftArea > rightArea
         }
         let selected = Set(candidates.prefix(configuration.splitLimit))
-        guard !selected.isEmpty else {
-            return Result(regions: regions, splitRegionCount: 0, addedModelCropCount: 0)
-        }
         var expanded = [MosaicRegion]()
         expanded.reserveCapacity(
             regions.count + selected.count * (3 + configuration.detailCropCount)
         )
         var added = 0
         for (index, region) in regions.enumerated() {
-            guard selected.contains(index) else {
-                expanded.append(region)
-                continue
-            }
             let expandedMaskRegion = expandingMaskCoverage(
                 of: region, configuration: configuration
             )
+            guard selected.contains(index) else {
+                expanded.append(expandedMaskRegion)
+                continue
+            }
             let children = subdivide(
                 expandedMaskRegion,
                 configuration: configuration,

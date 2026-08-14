@@ -5,10 +5,11 @@ usage() {
   echo "usage: $0 INPUT_SBS_VIDEO OUTPUT_SBS_VIDEO [START_TIME]" >&2
   echo "example: $0 input.mp4 restored-test.mov 00:12:00" >&2
   echo "optional: JASNA_TEST_SECONDS=30 (1-300, or full)" >&2
-  echo "          JASNA_ENCODER_WINDOWS_PER_SEGMENT=120" >&2
-  echo "          JASNA_METAL_WINDOWS_PER_PROCESS=1 (bounds macOS 27 writer memory)" >&2
+  echo "          JASNA_ENCODER_WINDOWS_PER_SEGMENT=4 (bounded eye-by-eye disk use)" >&2
+  echo "          JASNA_METAL_WINDOWS_PER_PROCESS=4 (fast; set 2 balanced or 1 minimum memory)" >&2
   echo "          JASNA_EYE_BITRATE=20000000 JASNA_VR_BITRATE=40000000" >&2
-  echo "          JASNA_DIRECT_SBS_OUTPUT=1 (set 0 for the legacy three-encode path)" >&2
+  echo "          JASNA_DIRECT_SBS_OUTPUT=1 (set 0 for lower-memory eye-by-eye output)" >&2
+  echo "          JASNA_CLEAN_WORK_ON_SUCCESS=0 (set 1 to remove restart data after PASS)" >&2
   echo "          JASNA_LARGE_REGION_MAX_BLEND=768 JASNA_LARGE_REGION_OVERLAP=96" >&2
   echo "          JASNA_LARGE_REGION_MASK_GROWTH=0.05 JASNA_LARGE_REGION_MASK_FEATHER=0.025" >&2
   echo "          JASNA_LARGE_REGION_BLOCK_GROWTH=0.04 JASNA_LARGE_REGION_MASK_TEMPORAL_RADIUS=1" >&2
@@ -22,14 +23,17 @@ INPUT_PATH="$1"
 OUTPUT_PATH="$2"
 START_TIME="${3:-0}"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$ROOT_DIR/script/restoration_identity.sh"
 TEST_SECONDS="${JASNA_TEST_SECONDS:-30}"
 EYE_BITRATE="${JASNA_EYE_BITRATE:-20000000}"
 VR_BITRATE="${JASNA_VR_BITRATE:-40000000}"
 FAST_ENCODE="${JASNA_FAST_ENCODE:-1}"
 FAST_SOURCE_COPY="${JASNA_FAST_SOURCE_COPY:-auto}"
 DIRECT_SBS_OUTPUT="${JASNA_DIRECT_SBS_OUTPUT:-1}"
-METAL_WINDOWS_PER_PROCESS="${JASNA_METAL_WINDOWS_PER_PROCESS:-1}"
-MODEL_BATCH="${JASNA_MODEL_BATCH:-1}"
+METAL_WINDOWS_PER_PROCESS="${JASNA_METAL_WINDOWS_PER_PROCESS:-4}"
+MODEL_BATCH="${JASNA_MODEL_BATCH:-2}"
+CLEAN_WORK_ON_SUCCESS="${JASNA_CLEAN_WORK_ON_SUCCESS:-0}"
+DETECTOR="${JASNA_DETECTOR:-rfdetr-vr-v1}"
 
 [[ -f "$INPUT_PATH" ]] || {
   echo "error: input video not found: $INPUT_PATH" >&2
@@ -86,6 +90,10 @@ fi
   echo "error: JASNA_MODEL_BATCH must be 1 or 2" >&2
   exit 1
 }
+[[ "$CLEAN_WORK_ON_SUCCESS" == "0" || "$CLEAN_WORK_ON_SUCCESS" == "1" ]] || {
+  echo "error: JASNA_CLEAN_WORK_ON_SUCCESS must be 0 or 1" >&2
+  exit 1
+}
 export JASNA_MODEL_BATCH="$MODEL_BATCH"
 
 ENCODER_SPEED_ARGS=()
@@ -125,14 +133,69 @@ TEST_INPUT_TEMP="$SOURCE_DIR/.test-sbs-30fps-writing.mov"
 TEST_INPUT_DONE="$SOURCE_DIR/test-sbs-30fps.done"
 LEFT_OUTPUT="$WORK_DIR/left-restored.mov"
 RIGHT_OUTPUT="$WORK_DIR/right-restored.mov"
+LEFT_EYE_WORK_DIR="$WORK_DIR/left-restored.left-segments-work"
+RIGHT_EYE_WORK_DIR="$WORK_DIR/right-restored.right-segments-work"
 FINAL_TEMP="$WORK_DIR/.joined-sbs-writing.${OUTPUT_NAME##*.}"
 LOG_PATH="$OUTPUT_DIR/${OUTPUT_STEM}.${ARTIFACT_TAG}.log"
 SHARED_BATCH_PATH="$WORK_DIR/pending-eye-restorations.tsv"
 DIRECT_SEGMENT_DIR="$WORK_DIR/direct-sbs-segments"
 DIRECT_CONCAT_PATH="$WORK_DIR/direct-sbs-concat.txt"
+WORKFLOW_LOCK="$WORK_DIR/.jasna-workflow-lock"
+
+mkdir -p "$WORK_DIR"
+if ! mkdir "$WORKFLOW_LOCK" 2>/dev/null; then
+  EXISTING_WORKFLOW_PID="$(/bin/cat "$WORKFLOW_LOCK/pid" 2>/dev/null || true)"
+  if [[ "$EXISTING_WORKFLOW_PID" =~ ^[0-9]+$ ]] \
+    && kill -0 "$EXISTING_WORKFLOW_PID" 2>/dev/null; then
+    echo "error: this restoration workflow is already active (PID $EXISTING_WORKFLOW_PID)" >&2
+    echo "work dir: $WORK_DIR" >&2
+    exit 1
+  fi
+  if [[ ! "$EXISTING_WORKFLOW_PID" =~ ^[0-9]+$ ]]; then
+    echo "error: workflow lock exists without a valid owner PID" >&2
+    echo "lock: $WORKFLOW_LOCK" >&2
+    exit 1
+  fi
+  STALE_WORKFLOW_LOCK="$WORK_DIR/.jasna-workflow-lock.stale-$(date '+%Y%m%d-%H%M%S')-$$"
+  mv "$WORKFLOW_LOCK" "$STALE_WORKFLOW_LOCK"
+  mkdir "$WORKFLOW_LOCK"
+fi
+printf '%s\n' "$$" > "$WORKFLOW_LOCK/pid"
+cleanup_workflow_lock() {
+  [[ -d "$WORKFLOW_LOCK" ]] || return 0
+  local owner_pid
+  owner_pid="$(/bin/cat "$WORKFLOW_LOCK/pid" 2>/dev/null || true)"
+  [[ "$owner_pid" == "$$" ]] || return 0
+  rm -f "$WORKFLOW_LOCK/pid"
+  rmdir "$WORKFLOW_LOCK" 2>/dev/null || true
+}
+trap cleanup_workflow_lock EXIT
+trap 'exit 130' INT
+trap 'exit 143' HUP TERM
+
+cleanup_successful_work() {
+  if [[ "$CLEAN_WORK_ON_SUCCESS" == "0" ]]; then
+    echo "Persistent segments and caches: $WORK_DIR"
+    return
+  fi
+  if [[ ! -d "$WORK_DIR" || "$WORK_DIR" == "$OUTPUT_DIR" \
+    || "$WORK_DIR" != "$OUTPUT_DIR/"* || "$WORK_DIR" != *.jasna-vr*-work ]]; then
+    echo "error: refusing unsafe successful-run cleanup path: $WORK_DIR" >&2
+    return 1
+  fi
+  echo "Final output passed validation; removing restart data: $WORK_DIR"
+  /bin/rm -rf -- "$WORK_DIR"
+  echo "Successful-run restart data removed"
+}
 
 mkdir -p "$SOURCE_DIR"
+SOURCE_FINGERPRINT="$(jasna_source_fingerprint "$INPUT_PATH")"
+IMPLEMENTATION_FINGERPRINT="$(jasna_implementation_fingerprint "$ROOT_DIR")"
+MODEL_FINGERPRINT="$(jasna_model_fingerprint "$ROOT_DIR" "$DETECTOR")"
 RUN_CONFIG="input=$INPUT_PATH
+source_fingerprint=$SOURCE_FINGERPRINT
+implementation_fingerprint=$IMPLEMENTATION_FINGERPRINT
+model_fingerprint=$MODEL_FINGERPRINT
 start=$START_TIME
 seconds=$TEST_SECONDS
 eye_bitrate=$EYE_BITRATE
@@ -142,7 +205,13 @@ fast_source_copy=$FAST_SOURCE_COPY
 direct_sbs_output=$DIRECT_SBS_OUTPUT
 model_batch=$MODEL_BATCH
 metal_windows_per_process=$METAL_WINDOWS_PER_PROCESS
+diagnostic_full_region_blend=${JASNA_DIAGNOSTIC_FULL_REGION_BLEND:-0}
+metal_texture_compositor=${JASNA_METAL_TEXTURE_COMPOSITOR:-1}
+metal_compositor=${JASNA_METAL_COMPOSITOR:-1}
 quality_profile=lower-detail-crop-v15
+detect_batch_size=${JASNA_DETECT_BATCH_SIZE:-2}
+detect_decode_mode=${JASNA_DETECT_DECODE_MODE:-sequential}
+rfdetr_max_detections=${JASNA_RFDETR_MAX_DETECTIONS:-64}
 detect_confidence=${JASNA_DETECT_CONFIDENCE:-0.15}
 temporal_padding=${JASNA_TEMPORAL_PADDING:-1.0}
 region_nms_iou=${JASNA_REGION_NMS_IOU:-0.45}
@@ -159,11 +228,16 @@ large_region_block_growth=${JASNA_LARGE_REGION_BLOCK_GROWTH:-0.04}
 large_region_mask_temporal_radius=${JASNA_LARGE_REGION_MASK_TEMPORAL_RADIUS:-1}
 large_region_detail_crops=${JASNA_LARGE_REGION_DETAIL_CROPS:-1}
 large_region_detail_dimension=${JASNA_LARGE_REGION_DETAIL_DIMENSION:-576}
-projection=fisheye"
+projection=fisheye
+detector=$DETECTOR"
 if [[ -s "$RUN_CONFIG_PATH" ]]; then
   EXISTING_STABLE_CONFIG="$(
     /usr/bin/sed '/^metal_windows_per_process=/d' "$RUN_CONFIG_PATH"
   )"
+  if ! /usr/bin/grep -q '^detector=' "$RUN_CONFIG_PATH"; then
+    EXISTING_STABLE_CONFIG="$EXISTING_STABLE_CONFIG
+detector=yolo-v2-fast"
+  fi
   CURRENT_STABLE_CONFIG="$(
     printf '%s\n' "$RUN_CONFIG" | /usr/bin/sed '/^metal_windows_per_process=/d'
   )"
@@ -173,7 +247,9 @@ if [[ -s "$RUN_CONFIG_PATH" ]]; then
     exit 1
   fi
 fi
-printf '%s\n' "$RUN_CONFIG" > "$RUN_CONFIG_PATH"
+RUN_CONFIG_TEMP="$WORK_DIR/.run-config-writing-$$"
+printf '%s\n' "$RUN_CONFIG" > "$RUN_CONFIG_TEMP"
+mv "$RUN_CONFIG_TEMP" "$RUN_CONFIG_PATH"
 exec > >(/usr/bin/tee -a "$LOG_PATH") 2>&1
 
 echo
@@ -188,6 +264,7 @@ echo "Projection:  fisheye"
 echo "Fast encode: $FAST_ENCODE"
 echo "Direct SBS:  $DIRECT_SBS_OUTPUT"
 echo "Model batch: $MODEL_BATCH"
+echo "Detector:    $DETECTOR"
 
 video_duration() {
   "$FFPROBE_PATH" -v error -show_entries format=duration \
@@ -229,7 +306,8 @@ IFS=, read -r SOURCE_WIDTH SOURCE_HEIGHT < <(
   echo "error: SBS input width must be even: $SOURCE_WIDTH" >&2
   exit 1
 }
-echo "SBS canvas: ${SOURCE_WIDTH}x${SOURCE_HEIGHT}; each eye: $((SOURCE_WIDTH / 2))x${SOURCE_HEIGHT}"
+EYE_WIDTH=$((SOURCE_WIDTH / 2))
+echo "SBS canvas: ${SOURCE_WIDTH}x${SOURCE_HEIGHT}; each eye: ${EYE_WIDTH}x${SOURCE_HEIGHT}"
 
 SOURCE_FRAME_RATE="$("$FFPROBE_PATH" -v error -select_streams v:0 \
   -show_entries stream=avg_frame_rate -of default=noprint_wrappers=1:nokey=1 "$INPUT_PATH")"
@@ -460,6 +538,69 @@ fi
 
 echo "Stage 2/4: preparing mosaic regions for both eyes"
 : > "$SHARED_BATCH_PATH"
+LEFT_SOURCE_DIR="$LEFT_EYE_WORK_DIR/source"
+RIGHT_SOURCE_DIR="$RIGHT_EYE_WORK_DIR/source"
+LEFT_SOURCE_DONE="$LEFT_EYE_WORK_DIR/source.done"
+RIGHT_SOURCE_DONE="$RIGHT_EYE_WORK_DIR/source.done"
+if [[ "$DIRECT_SBS_OUTPUT" == "1" \
+  && ! -f "$LEFT_SOURCE_DONE" && ! -f "$RIGHT_SOURCE_DONE" ]]; then
+  if [[ -d "$LEFT_SOURCE_DIR" ]]; then
+    mv "$LEFT_SOURCE_DIR" \
+      "$LEFT_EYE_WORK_DIR/source.interrupted-$(date '+%Y%m%d-%H%M%S')"
+  fi
+  if [[ -d "$RIGHT_SOURCE_DIR" ]]; then
+    mv "$RIGHT_SOURCE_DIR" \
+      "$RIGHT_EYE_WORK_DIR/source.interrupted-$(date '+%Y%m%d-%H%M%S')"
+  fi
+  mkdir -p "$LEFT_SOURCE_DIR" "$RIGHT_SOURCE_DIR"
+  echo "Preparing left/right 4K segments with one shared 8K decode"
+  "$FFMPEG_PATH" \
+    -hide_banner \
+    -i "$TEST_INPUT" \
+    -filter_complex \
+      "[0:v:0]split=2[leftbase][rightbase];[leftbase]crop=${EYE_WIDTH}:${SOURCE_HEIGHT}:0:0[left];[rightbase]crop=${EYE_WIDTH}:${SOURCE_HEIGHT}:${EYE_WIDTH}:0[right]" \
+    -map '[left]' \
+    -an \
+    -c:v hevc_videotoolbox \
+    "${ENCODER_SPEED_ARGS[@]}" \
+    -pix_fmt yuv420p \
+    -b:v "$EYE_BITRATE" \
+    -maxrate "$((EYE_BITRATE * 3 / 2))" \
+    -bufsize "$((EYE_BITRATE * 3))" \
+    -g 30 \
+    -force_key_frames "expr:gte(t,n_forced*${TEST_SEGMENT_SECONDS})" \
+    -tag:v hvc1 \
+    -f segment \
+    -segment_format mov \
+    -segment_time "$TEST_SEGMENT_SECONDS" \
+    -segment_time_delta 0.016667 \
+    -reset_timestamps 1 \
+    "$LEFT_SOURCE_DIR/left-%05d.mov" \
+    -map '[right]' \
+    -an \
+    -c:v hevc_videotoolbox \
+    "${ENCODER_SPEED_ARGS[@]}" \
+    -pix_fmt yuv420p \
+    -b:v "$EYE_BITRATE" \
+    -maxrate "$((EYE_BITRATE * 3 / 2))" \
+    -bufsize "$((EYE_BITRATE * 3))" \
+    -g 30 \
+    -force_key_frames "expr:gte(t,n_forced*${TEST_SEGMENT_SECONDS})" \
+    -tag:v hvc1 \
+    -f segment \
+    -segment_format mov \
+    -segment_time "$TEST_SEGMENT_SECONDS" \
+    -segment_time_delta 0.016667 \
+    -reset_timestamps 1 \
+    "$RIGHT_SOURCE_DIR/right-%05d.mov"
+  [[ -s "$LEFT_SOURCE_DIR/left-00000.mov" \
+    && -s "$RIGHT_SOURCE_DIR/right-00000.mov" ]] || {
+      echo "error: shared stereo source preparation did not produce both eyes" >&2
+      exit 1
+    }
+  /usr/bin/touch "$LEFT_SOURCE_DONE" "$RIGHT_SOURCE_DONE"
+  echo "Shared stereo source preparation complete"
+fi
 JASNA_SPARSE_BATCH_MODE=prepare \
 JASNA_SPARSE_BATCH_FILE="$SHARED_BATCH_PATH" \
 JASNA_SEGMENT_SECONDS="$TEST_SEGMENT_SECONDS" \
@@ -534,6 +675,16 @@ if [[ "$DIRECT_SBS_OUTPUT" == "1" ]]; then
       )"
     fi
     JOB_WINDOW_COUNT=$(( (JOB_FRAME_COUNT + 29) / 30 ))
+    BATCH_SEGMENT="$DIRECT_SEGMENT_DIR/$(
+      printf 'segment-%05d-windows-%05d-%05d.mov' \
+        "$JOB_INDEX" 0 "$JOB_WINDOW_COUNT"
+    )"
+    if valid_direct_segment "$BATCH_SEGMENT" "$JOB_FRAME_COUNT"; then
+      DIRECT_SEGMENTS+=("$BATCH_SEGMENT")
+      echo "Reusing validated two-minute SBS batch $((JOB_INDEX + 1))/${#LEFT_JOB_INPUTS[@]}"
+      continue
+    fi
+    JOB_DIRECT_SEGMENTS=()
     WINDOW_START=0
     while (( WINDOW_START < JOB_WINDOW_COUNT )); do
       REUSABLE_SEGMENT="$(
@@ -543,7 +694,7 @@ if [[ "$DIRECT_SBS_OUTPUT" == "1" ]]; then
       )"
       if [[ -n "$REUSABLE_SEGMENT" ]]; then
         IFS=$'\t' read -r REUSABLE_END DIRECT_SEGMENT <<< "$REUSABLE_SEGMENT"
-        DIRECT_SEGMENTS+=("$DIRECT_SEGMENT")
+        JOB_DIRECT_SEGMENTS+=("$DIRECT_SEGMENT")
         echo "Reusing validated direct SBS windows $((WINDOW_START + 1))-$REUSABLE_END/$JOB_WINDOW_COUNT"
         WINDOW_START="$REUSABLE_END"
         continue
@@ -556,7 +707,7 @@ if [[ "$DIRECT_SBS_OUTPUT" == "1" ]]; then
         printf 'segment-%05d-windows-%05d-%05d.mov' \
           "$JOB_INDEX" "$WINDOW_START" "$WINDOW_END"
       )"
-      DIRECT_SEGMENTS+=("$DIRECT_SEGMENT")
+      JOB_DIRECT_SEGMENTS+=("$DIRECT_SEGMENT")
       echo "Restoring source segment $((JOB_INDEX + 1))/${#LEFT_JOB_INPUTS[@]}, windows $((WINDOW_START + 1))-$WINDOW_END/$JOB_WINDOW_COUNT"
       JASNA_WINDOW_START="$WINDOW_START" \
       JASNA_WINDOW_COUNT="$WINDOW_COUNT" \
@@ -572,8 +723,48 @@ if [[ "$DIRECT_SBS_OUTPUT" == "1" ]]; then
           "${RIGHT_JOB_CACHES[$JOB_INDEX]}"
       WINDOW_START="$WINDOW_END"
     done
+    if (( ${#JOB_DIRECT_SEGMENTS[@]} == 1 )); then
+      BATCH_SEGMENT="${JOB_DIRECT_SEGMENTS[0]}"
+    else
+      BATCH_CONCAT="$DIRECT_SEGMENT_DIR/$(
+        printf '.segment-%05d.concat.txt' "$JOB_INDEX"
+      )"
+      BATCH_TEMP="$DIRECT_SEGMENT_DIR/$(
+        printf '.segment-%05d.two-minute-writing.mov' "$JOB_INDEX"
+      )"
+      : > "$BATCH_CONCAT"
+      for DIRECT_SEGMENT in "${JOB_DIRECT_SEGMENTS[@]}"; do
+        ESCAPED_SEGMENT="${DIRECT_SEGMENT//\'/\'\\\'\'}"
+        printf "file '%s'\n" "$ESCAPED_SEGMENT" >> "$BATCH_CONCAT"
+      done
+      if [[ -e "$BATCH_TEMP" ]]; then
+        mv "$BATCH_TEMP" \
+          "$DIRECT_SEGMENT_DIR/$(printf 'segment-%05d.interrupted-%s.mov' \
+            "$JOB_INDEX" "$(date '+%Y%m%d-%H%M%S')")"
+      fi
+      echo "Joining source segment $((JOB_INDEX + 1))/${#LEFT_JOB_INPUTS[@]} into one two-minute SBS batch"
+      "$FFMPEG_PATH" -hide_banner -loglevel error \
+        -f concat -safe 0 -i "$BATCH_CONCAT" -map '0:v:0' -c copy \
+        -movflags +faststart "$BATCH_TEMP"
+      valid_direct_segment "$BATCH_TEMP" "$JOB_FRAME_COUNT" || {
+        echo "error: joined two-minute SBS batch failed validation: $BATCH_TEMP" >&2
+        exit 1
+      }
+      if [[ -e "$BATCH_SEGMENT" ]]; then
+        mv "$BATCH_SEGMENT" \
+          "$DIRECT_SEGMENT_DIR/$(printf 'segment-%05d.invalid-%s.mov' \
+            "$JOB_INDEX" "$(date '+%Y%m%d-%H%M%S')")"
+      fi
+      mv "$BATCH_TEMP" "$BATCH_SEGMENT"
+      for DIRECT_SEGMENT in "${JOB_DIRECT_SEGMENTS[@]}"; do
+        [[ "$DIRECT_SEGMENT" == "$BATCH_SEGMENT" ]] || rm -f "$DIRECT_SEGMENT"
+      done
+      rm -f "$BATCH_CONCAT"
+      echo "Validated two-minute SBS batch: $BATCH_SEGMENT"
+    fi
+    DIRECT_SEGMENTS+=("$BATCH_SEGMENT")
   done
-  echo "Restored ${#DIRECT_SEGMENTS[@]} isolated 8K SBS part(s)"
+  echo "Restored ${#DIRECT_SEGMENTS[@]} grouped 8K SBS batch(es)"
 
   : > "$DIRECT_CONCAT_PATH"
   for DIRECT_SEGMENT in "${DIRECT_SEGMENTS[@]}"; do
@@ -628,7 +819,7 @@ if [[ "$DIRECT_SBS_OUTPUT" == "1" ]]; then
   echo "$FINAL_INFO"
   echo "Output: $OUTPUT_PATH"
   echo "Log:    $LOG_PATH"
-  echo "Persistent segments and caches: $WORK_DIR"
+  cleanup_successful_work
   exit 0
 elif (( ${#SHARED_BATCH_ARGS[@]} > 0 )); then
   echo "Restoring $((${#SHARED_BATCH_ARGS[@]} / 4)) left/right segment job(s) with one retained Metal ML graph"
@@ -721,4 +912,4 @@ echo "Output:   $OUTPUT_PATH"
 echo "Left eye: $LEFT_OUTPUT"
 echo "Right eye:$RIGHT_OUTPUT"
 echo "Log:      $LOG_PATH"
-echo "All source clips, manifests, windows, and caches remain under: $WORK_DIR"
+cleanup_successful_work

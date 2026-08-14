@@ -4,12 +4,31 @@
 import unittest
 
 from scan_mosaic_regions import (
+    box_polygon_groups,
+    has_box_polygons,
     mask_expansion_radius,
     mask_keyframe_box_groups,
     mask_source_boxes,
     suppress_duplicate_regions,
     suppress_nested_regions,
 )
+
+
+class PolygonGroupTests(unittest.TestCase):
+    def test_normalizes_legacy_single_polygon(self):
+        polygon = [[1.0, 2.0], [3.0, 2.0], [2.0, 4.0]]
+        box = (0, 0, 4, 4, 0.9, 0, polygon)
+
+        self.assertEqual(box_polygon_groups(box), [polygon])
+        self.assertTrue(has_box_polygons(box))
+
+    def test_preserves_disconnected_rfdetr_mask_islands(self):
+        first = [[1.0, 2.0], [3.0, 2.0], [2.0, 4.0]]
+        second = [[10.0, 20.0], [13.0, 20.0], [12.0, 24.0]]
+        box = (0, 0, 16, 32, 0.9, 0, [first, second])
+
+        self.assertEqual(box_polygon_groups(box), [first, second])
+        self.assertTrue(has_box_polygons(box))
 
 
 class MaskExpansionTests(unittest.TestCase):

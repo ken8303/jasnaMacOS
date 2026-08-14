@@ -186,8 +186,8 @@ The final merge copies audio and ordinary container metadata. Injection of
 Spherical Video `st3d`/`sv3d` atoms is not implemented yet, so players may need
 the output manually identified as left-right SBS VR.
 
-Sparse mosaic restoration follows VR Video Toolbox CE's pre-scan design. A
-YOLO detector samples each physical eye every 0.1 seconds, separates distant
+Sparse mosaic restoration follows VR Video Toolbox CE's pre-scan design. The
+detector samples each physical eye every 0.1 seconds, separates distant
 detections, and emits one-second tracked regions aligned with each 30-frame
 processing window. This gives BasicVSR++ five times more temporal context than
 the former 0.2-second clips, which reduces residual blocks and flicker on moving
@@ -261,13 +261,18 @@ crops required by a full 3x3 grid. Tune `JASNA_LARGE_REGION_DETAIL_CROPS` from
 the configured large-region maximum.
 Metal 4/MPSGraph allocations on the macOS 27 beta are released reliably only when
 the restoration process exits. The macOS 27 asynchronous AVFoundation receiver
-can also retain queued 8K BGRA frames until an HEVC part finishes. Direct SBS
-restoration therefore defaults to one temporal window per subprocess, writes a
-validated HEVC part, exits to release `IOAccelerator`, `IOSurface`, and encoder
-buffers, and concatenates the parts without another video encode. Set
-`JASNA_METAL_WINDOWS_PER_PROCESS` from 1 through 30 only to make an explicit
-peak-memory/startup tradeoff. Completed larger parts are validated and reused if
-the limit is lowered while resuming an interrupted run.
+can also retain queued 8K BGRA frames until an HEVC part finishes. Isolated
+decoders now seek directly to their first requested frame instead of rescanning a
+120-second source segment from frame zero. Direct SBS restoration uses an
+aggressive four-window subprocess default, then stream-copies completed windows
+into validated two-minute HEVC batches and removes the superseded short media
+parts. This quarters model-process initialization compared with one-window
+isolation while still forcing regular release of Metal, IOSurface, and encoder
+resources. Set `JASNA_METAL_WINDOWS_PER_PROCESS=2` for the balanced mode used by
+the completed 31.5-minute M4 validation run, or `1` for minimum peak memory.
+Values from 5 through 30 remain experimental on the current beta.
+Completed parts are validated and reused when this limit changes while resuming
+an interrupted run.
 Each work directory also has its own process lock. A second command targeting the
 same resume data fails clearly, while unrelated restorations are left running.
 Every isolated restoration subprocess logs `Runtime memory: peak resident` at
@@ -276,8 +281,11 @@ twelve-window memory comparisons visible in the persistent restoration log.
 Set `JASNA_LOG_PEAK_MEMORY=0` only when this telemetry is not wanted. The former
 12-window default measured 5.57–5.82 GiB before the macOS 27 receiver migration,
 but the new receiver allowed retained encoder surfaces to grow beyond 32 GiB in
-a long 8K run. One-window isolation is the safe default until that beta behavior
-is fixed or a bounded writer handoff is available.
+a long 8K run. Four-window process isolation is the speed-oriented default;
+two-window isolation is the validated balanced fallback and one-window isolation
+is the conservative fallback if a particular clip approaches the machine's
+memory limit. Two-minute batching happens after encoding and does not retain
+3,600 BGRA frames.
 The current sparse VR path decodes and encodes 8-bit BGRA/SDR. A Main 10 or HDR
 source therefore does not retain its original bit depth or HDR transfer
 characteristics; do not use this path when HDR preservation is required.
@@ -290,11 +298,42 @@ Detector setup is isolated from Swift:
 The setup downloads the public 6 MB
 `lada_vr_mosaic_detection_model_v2_fast.pt` model used by VR Video Toolbox CE
 and installs Ultralytics in `.venv-mosaic`. Neither environment nor model is
-tracked by Git. Test the left eye with:
+tracked by Git. Jasna v0.10's newer `rfdetr-vr-v1` detector is supported as the
+default, quality-focused Apple-MPS path. It is bundled inside the official split AMD
+archive rather than offered as a separate model download. Extract and install
+it from an already downloaded archive with:
+
+```sh
+./script/setup_rfdetr_detector.sh "/path/to/download-directory"
+```
+
+`rfdetr-vr-v1` is the quality-focused default. Set
+`JASNA_DETECTOR=yolo-v2-fast` when faster scanning is more important than
+maximum coverage. RF-DETR contours are traced at their native 192×192 resolution
+and only polygon coordinates are scaled back to 4K. All meaningful disconnected
+mask contours are retained, and up to 64 unique object queries per frame are
+considered by default; set `JASNA_RFDETR_MAX_DETECTIONS` from 1 through 200 for
+unusually crowded footage. This avoids the upstream
+convenience path's 12.5 GiB full-resolution mask allocation. On the known
+00:28 left-eye fixture, RF-DETR found four tracked regions and 35 temporal mask
+keyframes in 4.08 seconds; YOLO found three regions and 18 keyframes in 1.93
+seconds. RF-DETR is therefore the coverage-oriented option rather than the
+speed default. The bounded batch-2 scan peaked at 1.84 GiB resident memory with
+zero swap activity on the M4, compared with the rejected wrapper path's
+12.5 GiB allocation request for one frame.
+
+Test the left eye with:
 
 ```sh
 ./script/restore_vr_eye_sparse.sh \
   /path/to/input_30fps.mp4 left /path/to/restored-left.mov
+```
+
+Or run the coverage-oriented detector on a short SBS test:
+
+```sh
+./script/test_vr_sparse_30s.sh \
+  /path/to/input.mp4 /path/to/rfdetr-test.mov 00:00:28
 ```
 
 Detection manifests, source segments, restored windows, caches, and the log
@@ -318,19 +357,23 @@ submission, and encoder finish. These end-to-end phases determine whether the
 next optimization should pipeline CPU preparation, reduce cache traffic, or
 remain focused on the Metal graph without changing restoration quality.
 
-Sparse output keeps the one-second recurrence boundaries but, by default, feeds
-up to 120 consecutive windows to one HEVC writer. This produces one restored
-file per two minutes and reduces hardware-encoder startup and drain work while
-preserving restartability: model caches remain per-window, so an interrupted
-writer can rebuild its current output without rerunning completed model crops.
-Existing one- and five-window outputs are detected and reused. Set
-`JASNA_ENCODER_WINDOWS_PER_SEGMENT=5` for the earlier five-second behavior,
+Sparse output keeps the one-second recurrence boundaries and, by default, feeds
+four consecutive windows to one HEVC writer. Once that four-second output is
+validated, its FP16 model caches are removed. This bounded an 8K eye-by-eye
+five-minute run at 5.75 GiB peak resident memory and avoided the former
+120-window behavior retaining more than 7 GiB of crop caches. Existing one- and
+five-window outputs are still detected and reused. Set
 `JASNA_ENCODER_WINDOWS_PER_SEGMENT=1` for one file per recurrence window, or
-choose another positive segment size. A three-window 4096×4096 fixture reduced
-encoder-finish time from 1.431 seconds to 0.497 seconds and produced one
-validated 90-frame, 30 fps segment. The 30-second production log measured about
-0.48 seconds per encoder drain; grouping a two-minute segment avoids up to 23
-extra drains, or roughly 11 seconds per eye on that workload.
+choose another positive segment size. Larger values reduce hardware-encoder
+startup and drain work, but proportionally increase temporary disk use until
+the encoded segment is validated.
+
+All restartable source clips, manifests, restored windows, and eye videos remain
+beside the output by default. After visually checking a completed output, they
+can be removed manually. Set `JASNA_CLEAN_WORK_ON_SUCCESS=1` to remove that work
+directory automatically, but only after the final SBS output passes codec,
+dimensions, frame-count, duration, and decode validation. The log and final
+video remain beside one another.
 
 Metal ML crop execution is serialized. The first 30-frame crop builds the
 retained graph and every later crop reuses it; attempting to construct two
@@ -346,13 +389,14 @@ measured about 1.10 seconds for the initial graph build and execution, then
 about 0.45 seconds per reused 30-frame crop including roughly 0.38 seconds of
 GPU work. Decoded frame hashes matched the pre-cache output exactly.
 
-Restoration uses batch 1 by default. Set `JASNA_MODEL_BATCH=2` to experiment with
-grouping two mosaic crops of the same temporal length in one retained graph when
-`Models/MetalMLBatch2` is present. Incompatible or odd final crops stay on batch
-1. The first batch failure retries both crops individually and disables batch 2
-for the remainder of that process, preventing a bad graph from imposing another
-minute-long timeout on every later crop. Batch-2 package initialization can take
-roughly three minutes in a fresh process under Xcode 27 beta.
+Restoration uses batch 2 by default, grouping two mosaic crops of the same
+temporal length in one retained graph when `Models/MetalMLBatch2` is present.
+Incompatible or odd final crops stay on batch 1. The first batch failure retries
+both crops individually and disables batch 2 for the remainder of that process,
+preventing a bad graph from imposing another minute-long timeout on every later
+crop. Set `JASNA_MODEL_BATCH=1` for the conservative path. Batch-2 package
+initialization can take roughly three minutes in a fresh process under Xcode 27
+beta, making the larger process boundary particularly valuable.
 
 The retained graph clears its unpadded main buffers only on first use because
 every later destination is fully overwritten. SPyNet's padded-row tensors are
@@ -368,6 +412,19 @@ resume cache, and completion marker. A two-job production fixture reduced the
 second job's first-crop wall time from 786 ms to 101 ms; both decoded 30-frame
 outputs had identical frame hashes. Restarting still skips validated windows
 and resumes an interrupted crop from its segment-specific persistent cache.
+
+Each top-level SBS run and standalone eye run holds an atomic workflow lock for
+its complete lifetime, including source splitting and detector scanning. Resume
+configuration records the source metadata, detector checkpoint, restoration
+model metadata, implementation fingerprint, and every output-affecting quality
+option. A changed source, model, implementation, or quality setting therefore
+requires a new output name instead of silently reusing old media or manifests.
+
+The direct SBS launcher prepares both physical 4096×4096 eye-segment streams
+from one shared 8192×4096 decode. Both VideoToolbox encoders receive their crop
+from the same decoded frame, eliminating the former second full source decode.
+Completed `source.done` markers remain compatible with resume, so an existing
+run does not regenerate its eye segments after this optimization.
 The 30-second SBS test coordinates both eyes through the same batch as well.
 On an 8192×4096 end-to-end fixture, the right eye's first crop reused the graph
 and fell from 1.32 seconds to 456 ms. A second invocation skipped both completed
@@ -381,6 +438,13 @@ at least 16 GB of memory, then submitted to AVFoundation in presentation order.
 Set `JASNA_COMPOSITE_CONCURRENCY=1` for the lowest-memory path; values above two
 are capped. `JASNA_METAL_TEXTURE_COMPOSITOR=0` selects the Metal buffer-copy
 fallback, while `JASNA_METAL_COMPOSITOR=0` selects the CPU fallback.
+
+Direct 8K SBS output fuses left/right assembly and mosaic compositing into one
+Metal command buffer, removing one submission and synchronous wait per frame.
+Each 30-frame window logs writer wall time plus the preparation and encoder-wait
+sums. A bounded one-frame lookahead was tested and rejected: an exact M4 A/B
+measured 1,265.5 ms versus 1,228.5 ms serial because concurrent Metal
+preparation contended with VideoToolbox on the shared memory fabric.
 
 In an alternating warmed comparison, zero-copy reduced steady compositor time
 from 20.2 to 8.3 ms/frame and reduced user/system CPU time from 0.93/0.95 to
@@ -407,9 +471,10 @@ wrapper:
 
 It does not apply the test harness's 30-second cut. It uses persistent
 120-second source/restoration segments, fisheye sparse regions, direct SBS
-output, and the stable batch-1 model path by default. The launcher limits each
-Metal process to twelve temporal windows so beta-runtime allocations are released
-regularly. Set `JASNA_MODEL_BATCH=2` only for an explicit batch-2 experiment. A
+output, and the full-run-validated batch-2 model path by default. The launcher
+limits each Metal process to four temporal windows so beta-runtime allocations
+are released regularly. Set `JASNA_METAL_WINDOWS_PER_PROCESS=2` for the validated
+balanced memory mode or `JASNA_MODEL_BATCH=1` for the conservative model path. A
 restart reuses completed source segments, region manifests, restored windows,
 and validated SBS segment files. Existing and newly written final SBS outputs
 must also match the source dimensions, HEVC codec, 30 fps frame count, expected

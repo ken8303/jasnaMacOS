@@ -211,6 +211,43 @@ private let subdivisionConfiguration = MosaicRegionSubdivisionConfiguration(
     #expect(blendBottom <= region.y + region.height)
 }
 
+@Test func maskGrowthAlsoCoversRegionsBelowTheSubdivisionThreshold() throws {
+    var mask = [UInt8](repeating: 0, count: 9 * 9)
+    mask[4 * 9 + 4] = 255
+    let region = MosaicRegion(
+        startFrame: 0,
+        endFrame: 30,
+        x: 100,
+        y: 200,
+        width: 400,
+        height: 360,
+        confidence: 1,
+        blendX: 180,
+        blendY: 280,
+        blendWidth: 240,
+        blendHeight: 200,
+        maskWidth: 9,
+        maskHeight: 9,
+        maskData: Data(mask)
+    )
+
+    let result = MosaicRegionSubdivision.expand(
+        [region], configuration: subdivisionConfiguration
+    )
+    let expanded = try #require(result.regions.first)
+    let expandedMask = try #require(expanded.maskData)
+
+    #expect(result.splitRegionCount == 0)
+    #expect(result.addedModelCropCount == 0)
+    #expect(result.regions.count == 1)
+    #expect(expanded.effectiveBlendX < region.effectiveBlendX)
+    #expect(expanded.effectiveBlendY < region.effectiveBlendY)
+    #expect(expanded.effectiveBlendWidth > region.effectiveBlendWidth)
+    #expect(expanded.effectiveBlendHeight > region.effectiveBlendHeight)
+    #expect(expandedMask != region.maskData)
+    #expect(expandedMask[4 * 9 + 3] > 0)
+}
+
 @Test func lowerResidualDetailCropFollowsTheSemanticMaskBottom() throws {
     var mask = [UInt8](repeating: 0, count: 8 * 8)
     for y in 2...5 {

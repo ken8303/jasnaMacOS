@@ -5,7 +5,10 @@ import Metal
 
 @available(macOS 27.0, *)
 extension SideBySideRestoration {
-    static let defaultEncoderWindowsPerSegment = 120
+    // Keep encoded segments small enough that their per-window FP16 caches stay bounded.
+    // Four windows measured 5.75 GiB peak resident memory on an 8K eye-by-eye run,
+    // while the former 120-window default retained more than 7 GiB of crop caches.
+    static let defaultEncoderWindowsPerSegment = 4
 
     static func restorationWindowRange(
         windowCount: Int,
@@ -151,7 +154,9 @@ extension SideBySideRestoration {
                 let subdivision = MosaicRegionSubdivision.expand(
                     detectedRegions, configuration: subdivisionConfiguration
                 )
-                let activeRegions = subdivision.regions
+                let activeRegions = fullDetectedRegionBlendEnabled
+                    ? subdivision.regions.map { $0.usingFullDetectedRegionBlend() }
+                    : subdivision.regions
                 report(
                     "Window \(currentWindowIndex + 1)/\(windowFrameCounts.count): decoding "
                         + "\(outputCount) frames; mosaic regions \(detectedRegions.count), "
@@ -356,12 +361,14 @@ extension SideBySideRestoration {
         let leftDecoder = try await FrameDecoder(
             inputURL: leftInputURL,
             plan: eyePlan,
-            sourceDimensions: leftInfo.dimensions
+            sourceDimensions: leftInfo.dimensions,
+            startOutputIndex: rangeStartFrame
         )
         let rightDecoder = try await FrameDecoder(
             inputURL: rightInputURL,
             plan: eyePlan,
-            sourceDimensions: rightInfo.dimensions
+            sourceDimensions: rightInfo.dimensions,
+            startOutputIndex: rangeStartFrame
         )
         let writer = try RestoredFrameWriter(
             device: device, outputURL: outputURL, plan: stereoPlan
@@ -388,8 +395,12 @@ extension SideBySideRestoration {
             let rightSubdivision = MosaicRegionSubdivision.expand(
                 rightDetectedRegions, configuration: subdivisionConfiguration
             )
-            let leftRegions = leftSubdivision.regions
-            let rightRegions = rightSubdivision.regions
+            let leftRegions = fullDetectedRegionBlendEnabled
+                ? leftSubdivision.regions.map { $0.usingFullDetectedRegionBlend() }
+                : leftSubdivision.regions
+            let rightRegions = fullDetectedRegionBlendEnabled
+                ? rightSubdivision.regions.map { $0.usingFullDetectedRegionBlend() }
+                : rightSubdivision.regions
             report(
                 "Direct SBS window \(windowIndex + 1)/\(windowCount): "
                     + "decoding \(outputCount) frames; left/right regions "

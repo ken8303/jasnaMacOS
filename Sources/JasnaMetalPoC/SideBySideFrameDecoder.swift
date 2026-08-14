@@ -18,8 +18,10 @@ extension SideBySideRestoration {
             inputURL: URL,
             plan: SideBySideVideoPlan,
             sourceDimensions: VideoDimensions? = nil,
-            cropX: Int = 0
+            cropX: Int = 0,
+            startOutputIndex: Int = 0
         ) async throws {
+            guard startOutputIndex >= 0 else { throw DeformConvError.invalidShape }
             let asset = AVURLAsset(url: inputURL)
             guard let track = try await asset.loadTracks(withMediaType: .video).first else {
                 throw DeformConvError.commandFailed("video has no video track")
@@ -38,6 +40,22 @@ extension SideBySideRestoration {
                 )
             }
             reader = try AVAssetReader(asset: asset)
+            if startOutputIndex > 0 {
+                let assetDuration = try await asset.load(.duration)
+                let startTime = CMTime(
+                    value: CMTimeValue(startOutputIndex),
+                    timescale: CMTimeScale(SideBySideVideoPlan.outputFramesPerSecond)
+                )
+                guard CMTimeCompare(startTime, assetDuration) < 0 else {
+                    throw DeformConvError.commandFailed(
+                        "decoder start frame \(startOutputIndex) is outside the source"
+                    )
+                }
+                reader.timeRange = CMTimeRange(
+                    start: startTime,
+                    duration: CMTimeSubtract(assetDuration, startTime)
+                )
+            }
             let output = AVAssetReaderTrackOutput(
                 track: track,
                 outputSettings: [
