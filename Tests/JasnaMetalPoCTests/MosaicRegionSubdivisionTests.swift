@@ -285,7 +285,48 @@ private let subdivisionConfiguration = MosaicRegionSubdivisionConfiguration(
     #expect(detail.effectiveBlendY <= maskBottom)
     #expect(detail.effectiveBlendY + detail.effectiveBlendHeight >= maskBottom)
     #expect(detail.subdivisionGroup == 7)
+    #expect(detail.detailBlendFeather == 72)
     #expect(detail.maskData?.count == 64)
+}
+
+@Test func detailCropUsesADeepEdgeFadeWithoutChangingGridChildren() throws {
+    let mask = Data(repeating: 255, count: 8 * 8)
+    let region = MosaicRegion(
+        startFrame: 0,
+        endFrame: 30,
+        x: 100,
+        y: 200,
+        width: 1_600,
+        height: 1_400,
+        confidence: 1,
+        blendX: 200,
+        blendY: 300,
+        blendWidth: 1_400,
+        blendHeight: 1_200,
+        maskWidth: 8,
+        maskHeight: 8,
+        maskData: mask
+    )
+
+    let result = MosaicRegionSubdivision.expand(
+        [region], configuration: subdivisionConfiguration
+    )
+    let detail = try #require(result.regions.first { $0.detailBlendFeather != nil })
+    let gridChildren = result.regions.filter { $0.detailBlendFeather == nil }
+
+    #expect(detail.detailBlendFeather == 72)
+    #expect(detail.featherAlpha(
+        x: detail.effectiveBlendX,
+        y: detail.effectiveBlendY + detail.effectiveBlendHeight / 2,
+        feather: detail.detailBlendFeather!
+    ) < 0.02)
+    #expect(detail.featherAlpha(
+        x: detail.effectiveBlendX + detail.detailBlendFeather! - 1,
+        y: detail.effectiveBlendY + detail.effectiveBlendHeight / 2,
+        feather: detail.detailBlendFeather!
+    ) > 0.98)
+    #expect(!gridChildren.isEmpty)
+    #expect(gridChildren.allSatisfy { $0.subdivisionGroup == 1 })
 }
 
 @Test func adaptiveBlendGrowthDoesNotIncreaseTheModelGridDimensions() {

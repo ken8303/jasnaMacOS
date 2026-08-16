@@ -4,6 +4,7 @@ set -euo pipefail
 usage() {
   echo "usage: $0 INPUT_SBS_VIDEO left|right OUTPUT_EYE_VIDEO" >&2
   echo "optional: JASNA_SEGMENT_SECONDS=120 JASNA_EYE_BITRATE=20000000" >&2
+  echo "          JASNA_ALLOW_IMPLEMENTATION_RESUME=1 (one-time compatible resume)" >&2
   exit 2
 }
 
@@ -25,6 +26,13 @@ REGION_DURATION="${JASNA_REGION_DURATION:-1.0}"
 SPARSE_BATCH_MODE="${JASNA_SPARSE_BATCH_MODE:-run}"
 SPARSE_BATCH_FILE="${JASNA_SPARSE_BATCH_FILE:-}"
 DETECTOR="${JASNA_DETECTOR:-rfdetr-vr-v1}"
+ALLOW_IMPLEMENTATION_RESUME="${JASNA_ALLOW_IMPLEMENTATION_RESUME:-0}"
+MANUAL_RANGE_MODE=0
+MOSAIC_RANGES_RELATIVE=""
+if [[ -n "${JASNA_MOSAIC_RANGES_RELATIVE+x}" ]]; then
+  MANUAL_RANGE_MODE=1
+  MOSAIC_RANGES_RELATIVE="$JASNA_MOSAIC_RANGES_RELATIVE"
+fi
 
 [[ "$EYE" == "left" || "$EYE" == "right" ]] || usage
 [[ -f "$INPUT_PATH" ]] || {
@@ -53,6 +61,10 @@ DETECTOR="${JASNA_DETECTOR:-rfdetr-vr-v1}"
 }
 [[ "$FAST_ENCODE" == "0" || "$FAST_ENCODE" == "1" ]] || {
   echo "error: JASNA_FAST_ENCODE must be 0 or 1" >&2
+  exit 1
+}
+[[ "$ALLOW_IMPLEMENTATION_RESUME" == "0" || "$ALLOW_IMPLEMENTATION_RESUME" == "1" ]] || {
+  echo "error: JASNA_ALLOW_IMPLEMENTATION_RESUME must be 0 or 1" >&2
   exit 1
 }
 [[ "$SPARSE_BATCH_MODE" == "run" || "$SPARSE_BATCH_MODE" == "prepare" \
@@ -167,6 +179,8 @@ detect_sample_stride=${JASNA_DETECT_SAMPLE_STRIDE:-0.1}
 detect_coarse_stride=${JASNA_DETECT_COARSE_STRIDE:-1.0}
 detect_coarse_confidence=${JASNA_DETECT_COARSE_CONFIDENCE:-0.05}
 detect_refine_padding=${JASNA_DETECT_REFINE_PADDING:-1.0}
+manual_range_mode=$MANUAL_RANGE_MODE
+manual_mosaic_ranges_relative=$MOSAIC_RANGES_RELATIVE
 rfdetr_max_detections=${JASNA_RFDETR_MAX_DETECTIONS:-64}
 region_duration=$REGION_DURATION
 detect_confidence=${JASNA_DETECT_CONFIDENCE:-0.15}
@@ -189,10 +203,28 @@ diagnostic_full_region_blend=${JASNA_DIAGNOSTIC_FULL_REGION_BLEND:-0}
 metal_texture_compositor=${JASNA_METAL_TEXTURE_COMPOSITOR:-1}
 metal_compositor=${JASNA_METAL_COMPOSITOR:-1}"
 if [[ -s "$RUN_CONFIG_PATH" ]]; then
-  if [[ "$(/bin/cat "$RUN_CONFIG_PATH")" != "$RUN_CONFIG" ]]; then
-    echo "error: this eye output path belongs to a different source or restoration configuration" >&2
-    echo "use a new output filename, or restore the original settings" >&2
-    exit 1
+  EXISTING_RUN_CONFIG="$(/bin/cat "$RUN_CONFIG_PATH")"
+  if [[ "$EXISTING_RUN_CONFIG" != "$RUN_CONFIG" ]]; then
+    EXISTING_WITHOUT_IMPLEMENTATION="$(
+      printf '%s\n' "$EXISTING_RUN_CONFIG" \
+        | /usr/bin/sed '/^implementation_fingerprint=/d'
+    )"
+    CURRENT_WITHOUT_IMPLEMENTATION="$(
+      printf '%s\n' "$RUN_CONFIG" \
+        | /usr/bin/sed '/^implementation_fingerprint=/d'
+    )"
+    if [[ "$ALLOW_IMPLEMENTATION_RESUME" == "1" \
+      && "$EXISTING_WITHOUT_IMPLEMENTATION" == "$CURRENT_WITHOUT_IMPLEMENTATION" ]]; then
+      echo "WARNING: accepting one-time $EYE-eye implementation-only resume; source, model, ranges, and quality settings match"
+    else
+      echo "error: this eye output path belongs to a different source or restoration configuration" >&2
+      if [[ "$EXISTING_WITHOUT_IMPLEMENTATION" == "$CURRENT_WITHOUT_IMPLEMENTATION" ]]; then
+        echo "only the implementation changed; set JASNA_ALLOW_IMPLEMENTATION_RESUME=1 once" >&2
+      else
+        echo "use a new output filename, or restore the original settings" >&2
+      fi
+      exit 1
+    fi
   fi
 elif [[ "$SPARSE_BATCH_MODE" != "prepare" \
   && ( -f "$SOURCE_DONE" || -d "$SOURCE_DIR" ) ]]; then
@@ -348,6 +380,21 @@ if [[ "$SPARSE_MOSAIC" == "1" && "$SPARSE_BATCH_MODE" != "finalize" ]]; then
     SEGMENT_WINDOWS="$RESTORED_DIR/${SEGMENT_STEM}.windows"
     MOSAIC_MANIFEST="$RESTORED_DIR/${SEGMENT_STEM}-mosaic-regions.json"
     SEGMENT_DURATION="$(video_duration "$SOURCE_SEGMENT")"
+    SEGMENT_RANGE_ARGUMENTS=()
+    if [[ "$MANUAL_RANGE_MODE" == "1" ]]; then
+      SEGMENT_NUMBER="${SEGMENT_STEM##*-}"
+      SEGMENT_OFFSET=$((10#$SEGMENT_NUMBER * SEGMENT_SECONDS))
+      SEGMENT_ACTIVE_RANGES="$(
+        /usr/bin/python3 "$ROOT_DIR/tools/mosaic_time_ranges.py" segment \
+          "$MOSAIC_RANGES_RELATIVE" "$SEGMENT_OFFSET" "$SEGMENT_DURATION"
+      )"
+      SEGMENT_RANGE_ARGUMENTS=(JASNA_DETECT_ACTIVE_RANGES="$SEGMENT_ACTIVE_RANGES")
+      if [[ -n "$SEGMENT_ACTIVE_RANGES" ]]; then
+        echo "Manual mosaic range for $SEGMENT_NAME: $SEGMENT_ACTIVE_RANGES"
+      else
+        echo "Manual mosaic range for $SEGMENT_NAME: clean segment"
+      fi
+    fi
 
     if [[ ! -f "$SEGMENT_DONE" ]] && video_duration_matches "$RESTORED_SEGMENT" "$SEGMENT_DURATION"; then
       echo "Recovered completed marker for $SEGMENT_NAME"
@@ -356,7 +403,13 @@ if [[ "$SPARSE_MOSAIC" == "1" && "$SPARSE_BATCH_MODE" != "finalize" ]]; then
     if [[ ! -f "$SEGMENT_DONE" ]]; then
       mkdir -p "$SEGMENT_CACHE" "$SEGMENT_WINDOWS"
       if [[ ! -s "$MOSAIC_MANIFEST" ]]; then
-        "$ROOT_DIR/script/scan_mosaic_regions.sh" "$SOURCE_SEGMENT" "$MOSAIC_MANIFEST"
+        if [[ "$MANUAL_RANGE_MODE" == "1" ]]; then
+          env "${SEGMENT_RANGE_ARGUMENTS[@]}" \
+            "$ROOT_DIR/script/scan_mosaic_regions.sh" \
+              "$SOURCE_SEGMENT" "$MOSAIC_MANIFEST"
+        else
+          "$ROOT_DIR/script/scan_mosaic_regions.sh" "$SOURCE_SEGMENT" "$MOSAIC_MANIFEST"
+        fi
       else
         echo "Reusing mosaic-region manifest: $MOSAIC_MANIFEST"
       fi

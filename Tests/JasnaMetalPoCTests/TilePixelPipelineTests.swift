@@ -34,6 +34,62 @@ private func fillPixelBuffer(_ pixelBuffer: CVPixelBuffer, color: (UInt8, UInt8,
     }
 }
 
+@Test func fisheyeDetailCropFadesInFromItsRectangularEdge() {
+    let region = MosaicRegion(
+        startFrame: 0,
+        endFrame: 30,
+        x: 0,
+        y: 0,
+        width: 100,
+        height: 100,
+        confidence: 1,
+        blendX: 10,
+        blendY: 10,
+        blendWidth: 80,
+        blendHeight: 80,
+        subdivisionGroup: 1,
+        detailBlendFeather: 20
+    )
+    let map = MosaicCropSamplingMap(
+        region: region,
+        eyeWidth: 100,
+        eyeHeight: 100,
+        projection: .fisheye
+    )
+
+    let edge = map.compositeSamples[50 * 100 + 10].alpha
+    let inside = map.compositeSamples[50 * 100 + 29].alpha
+    let outside = map.compositeSamples[50 * 100 + 9].alpha
+
+    #expect(edge < 0.05)
+    #expect(inside > 0.95)
+    #expect(outside == 0)
+}
+
+@available(macOS 27.0, *)
+@Test func rightEyeTranslationPreservesDetailCropFeather() {
+    let region = MosaicRegion(
+        startFrame: 0,
+        endFrame: 30,
+        x: 100,
+        y: 200,
+        width: 576,
+        height: 576,
+        confidence: 1,
+        subdivisionGroup: 3,
+        detailBlendFeather: 72
+    )
+
+    let translated = SideBySideRestoration.RestoredFrameWriter.translated(
+        region,
+        xOffset: 4_096
+    )
+
+    #expect(translated.x == 4_196)
+    #expect(translated.subdivisionGroup == 1_000_003)
+    #expect(translated.detailBlendFeather == 72)
+}
+
 @available(macOS 27.0, *)
 @Test func fusedMetalStereoCompositePlacesBothEyesWithoutCPUAssembly() throws {
     let eyeWidth = 8

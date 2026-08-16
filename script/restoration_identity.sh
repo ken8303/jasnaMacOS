@@ -59,9 +59,11 @@ jasna_implementation_fingerprint() {
     "$root_dir/script/restore_vr_eye_segments.sh" \
     "$root_dir/script/restore_vr_eye_sparse.sh" \
     "$root_dir/script/restore_vr_sparse_sbs.sh" \
+    "$root_dir/script/restore_vr_sparse_ranges.sh" \
     "$root_dir/script/scan_mosaic_regions.sh" \
     "$root_dir/script/test_vr_sparse_30s.sh" \
     "$root_dir/tools/manifest_window_runs.py" \
+    "$root_dir/tools/mosaic_time_ranges.py" \
     "$root_dir/tools/rfdetr_mps_detector.py" \
     "$root_dir/tools/scan_mosaic_regions.py" \
     "$root_dir/tools/reconcile_stereo_manifests.py"

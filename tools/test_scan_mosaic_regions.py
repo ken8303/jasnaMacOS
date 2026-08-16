@@ -4,6 +4,7 @@
 import unittest
 
 from scan_mosaic_regions import (
+    active_frame_intervals,
     box_polygon_groups,
     coarse_sample_indices,
     detector_coverage_metrics,
@@ -12,6 +13,7 @@ from scan_mosaic_regions import (
     mask_keyframe_box_groups,
     mask_source_boxes,
     refinement_sample_indices,
+    samples_in_intervals,
     suppress_duplicate_regions,
     suppress_nested_regions,
 )
@@ -35,6 +37,11 @@ class AdaptiveScanScheduleTests(unittest.TestCase):
 
     def test_empty_gate_performs_no_dense_refinement(self):
         self.assertEqual(refinement_sample_indices(900, 30.0, 0.1, [], 1.0), [])
+
+    def test_manual_ranges_filter_dense_samples(self):
+        intervals = active_frame_intervals("1.0/2.0", 30.0, 90)
+        self.assertEqual(intervals, [(30, 60)])
+        self.assertEqual(samples_in_intervals(range(0, 90, 3), intervals), list(range(30, 60, 3)))
 
 
 class DetectorCoverageMetricsTests(unittest.TestCase):

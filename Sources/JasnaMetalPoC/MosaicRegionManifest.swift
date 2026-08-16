@@ -22,6 +22,7 @@ struct MosaicRegion: Codable, Equatable, Sendable {
     let maskData: Data?
     let maskKeyframes: [MosaicMaskKeyframe]?
     let subdivisionGroup: Int?
+    let detailBlendFeather: Int?
 
     init(
         startFrame: Int,
@@ -39,7 +40,8 @@ struct MosaicRegion: Codable, Equatable, Sendable {
         maskHeight: Int? = nil,
         maskData: Data? = nil,
         maskKeyframes: [MosaicMaskKeyframe]? = nil,
-        subdivisionGroup: Int? = nil
+        subdivisionGroup: Int? = nil,
+        detailBlendFeather: Int? = nil
     ) {
         self.startFrame = startFrame
         self.endFrame = endFrame
@@ -57,6 +59,7 @@ struct MosaicRegion: Codable, Equatable, Sendable {
         self.maskData = maskData
         self.maskKeyframes = maskKeyframes
         self.subdivisionGroup = subdivisionGroup
+        self.detailBlendFeather = detailBlendFeather
     }
 
     var frameRange: Range<Int> { startFrame..<endFrame }
@@ -113,7 +116,8 @@ struct MosaicRegion: Codable, Equatable, Sendable {
             maskWidth: maskWidth,
             maskHeight: maskHeight,
             maskData: resolvedData,
-            subdivisionGroup: subdivisionGroup
+            subdivisionGroup: subdivisionGroup,
+            detailBlendFeather: detailBlendFeather
         )
     }
 
@@ -133,7 +137,8 @@ struct MosaicRegion: Codable, Equatable, Sendable {
             blendY: y,
             blendWidth: width,
             blendHeight: height,
-            subdivisionGroup: subdivisionGroup
+            subdivisionGroup: subdivisionGroup,
+            detailBlendFeather: detailBlendFeather
         )
     }
 

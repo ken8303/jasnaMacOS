@@ -394,7 +394,8 @@ enum MosaicRegionSubdivision {
             maskHeight: expandedStaticMask == nil ? nil : maskHeight,
             maskData: expandedStaticMask,
             maskKeyframes: expandedKeyframes?.isEmpty == false ? expandedKeyframes : nil,
-            subdivisionGroup: region.subdivisionGroup
+            subdivisionGroup: region.subdivisionGroup,
+            detailBlendFeather: region.detailBlendFeather
         )
     }
 
@@ -537,7 +538,11 @@ enum MosaicRegionSubdivision {
                 blendY: detailBlendTop,
                 blendWidth: detailWidth,
                 blendHeight: detailHeight,
-                subdivisionGroup: subdivisionGroup
+                subdivisionGroup: subdivisionGroup,
+                detailBlendFeather: max(
+                    48,
+                    min(128, min(detailWidth, detailHeight) / 8)
+                )
             )
         }
     }
@@ -591,7 +596,8 @@ enum MosaicRegionSubdivision {
         blendY: Int,
         blendWidth: Int,
         blendHeight: Int,
-        subdivisionGroup: Int
+        subdivisionGroup: Int,
+        detailBlendFeather: Int? = nil
     ) -> MosaicRegion {
         let croppedMask = region.maskData.flatMap {
             resampleMask($0, from: region, x: x, y: y, width: width, height: height)
@@ -622,7 +628,8 @@ enum MosaicRegionSubdivision {
             maskHeight: croppedMask == nil ? nil : region.maskHeight,
             maskData: croppedMask,
             maskKeyframes: croppedKeyframes?.isEmpty == false ? croppedKeyframes : nil,
-            subdivisionGroup: subdivisionGroup
+            subdivisionGroup: subdivisionGroup,
+            detailBlendFeather: detailBlendFeather
         )
     }
 

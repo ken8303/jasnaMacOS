@@ -145,7 +145,13 @@ struct MosaicCropSamplingMap: Sendable {
                         max(top - pixelY, pixelY - bottom)
                     )
                     let alpha: Float
-                    if outside > 0 {
+                    if let detailFeather = region.detailBlendFeather {
+                        alpha = region.featherAlpha(
+                            x: pixelX,
+                            y: pixelY,
+                            feather: detailFeather
+                        )
+                    } else if outside > 0 {
                         alpha = max(0, 0.5 * (1 - Float(outside) / feather))
                     } else {
                         let inside = min(
@@ -428,7 +434,9 @@ struct MosaicRegionFrameAccumulator {
         for pixelY in startY..<endY {
             for pixelX in startX..<endX {
                 let alpha = projection == .fisheye
-                    ? Self.expandedFeatherAlpha(
+                    ? region.detailBlendFeather.map {
+                        region.featherAlpha(x: pixelX, y: pixelY, feather: $0)
+                    } ?? Self.expandedFeatherAlpha(
                         region: region,
                         x: pixelX,
                         y: pixelY,

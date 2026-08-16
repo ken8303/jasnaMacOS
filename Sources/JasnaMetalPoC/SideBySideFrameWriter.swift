@@ -702,7 +702,7 @@ extension SideBySideRestoration {
             return result
         }
 
-        private static func translated(_ region: MosaicRegion, xOffset: Int) -> MosaicRegion {
+        static func translated(_ region: MosaicRegion, xOffset: Int) -> MosaicRegion {
             guard xOffset != 0 else { return region }
             return MosaicRegion(
                 startFrame: region.startFrame,
@@ -722,7 +722,8 @@ extension SideBySideRestoration {
                 maskKeyframes: region.maskKeyframes,
                 subdivisionGroup: region.subdivisionGroup.map {
                     xOffset == 0 ? $0 : $0 + 1_000_000
-                }
+                },
+                detailBlendFeather: region.detailBlendFeather
             )
         }
 

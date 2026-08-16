@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import copy
 import json
 import math
 import os
@@ -22,6 +23,10 @@ def parse_args() -> argparse.Namespace:
         "--backend", choices=("yolo", "rfdetr"), default="yolo"
     )
     parser.add_argument("--sample-stride", type=float, default=0.1)
+    parser.add_argument(
+        "--active-ranges",
+        help="optional comma-separated segment-relative start/end seconds",
+    )
     parser.add_argument(
         "--coarse-stride",
         type=float,
@@ -200,6 +205,50 @@ def refinement_sample_indices(
         first = ((start + dense_frames - 1) // dense_frames) * dense_frames
         samples.extend(range(first, end, dense_frames))
     return samples
+
+
+def active_frame_intervals(spec, source_fps, frame_count):
+    if spec is None:
+        return [(0, frame_count)]
+    intervals = []
+    for item in filter(None, spec.split(",")):
+        try:
+            start_text, end_text = item.split("/")
+            start = max(0, int(math.floor(float(start_text) * source_fps)))
+            end = min(frame_count, int(math.ceil(float(end_text) * source_fps)))
+        except (ValueError, TypeError) as error:
+            raise ValueError(f"invalid active range: {item}") from error
+        if end > start:
+            intervals.append((start, end))
+    return intervals
+
+
+def samples_in_intervals(indices, intervals):
+    return [index for index in indices if any(start <= index < end for start, end in intervals)]
+
+
+def clip_regions_to_intervals(regions, intervals):
+    clipped = []
+    for region in regions:
+        for start, end in intervals:
+            clipped_start = max(int(region["startFrame"]), start)
+            clipped_end = min(int(region["endFrame"]), end)
+            if clipped_end <= clipped_start:
+                continue
+            item = copy.deepcopy(region)
+            item["startFrame"] = clipped_start
+            item["endFrame"] = clipped_end
+            if "maskKeyframes" in item:
+                keyframes = [
+                    keyframe for keyframe in item["maskKeyframes"]
+                    if clipped_start <= int(keyframe["frame"]) < clipped_end
+                ]
+                if keyframes:
+                    item["maskKeyframes"] = keyframes
+                else:
+                    item.pop("maskKeyframes")
+            clipped.append(item)
+    return clipped
 
 
 def track_boxes(boxes):
@@ -591,6 +640,36 @@ def main() -> int:
     if abs(source_fps - 30.0) > 0.05:
         raise SystemExit(f"sparse restoration requires a 30 fps eye video, got {source_fps:.3f}")
     capture.release()
+    try:
+        allowed_intervals = active_frame_intervals(
+            args.active_ranges, source_fps, frame_count
+        )
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
+    if args.active_ranges is not None:
+        print(
+            f"Manual range gate: {len(allowed_intervals)} active interval(s)",
+            flush=True,
+        )
+    if not allowed_intervals:
+        manifest = {
+            "version": 1,
+            "width": width,
+            "height": height,
+            "framesPerSecond": 30.0,
+            "frameCount": frame_count,
+            "regions": [],
+        }
+        args.output_manifest.parent.mkdir(parents=True, exist_ok=True)
+        temporary = args.output_manifest.with_suffix(args.output_manifest.suffix + ".tmp")
+        temporary.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        os.replace(temporary, args.output_manifest)
+        print(
+            f"Manual range gate: clean segment, detector bypassed; saved "
+            f"{args.output_manifest}",
+            flush=True,
+        )
+        return 0
 
     device = choose_device(torch, args.device)
     print(
@@ -757,7 +836,9 @@ def main() -> int:
         )
 
     if not args.adaptive_scan:
-        sample_indices = list(range(0, frame_count, stride_frames))
+        sample_indices = samples_in_intervals(
+            range(0, frame_count, stride_frames), allowed_intervals
+        )
         boxes, scanned_samples, inference_seconds, dense_seconds = scan_samples(
             sample_indices, "Dense", args.confidence
         )
@@ -769,6 +850,7 @@ def main() -> int:
         coarse_indices = coarse_sample_indices(
             frame_count, source_fps, args.coarse_stride
         )
+        coarse_indices = samples_in_intervals(coarse_indices, allowed_intervals)
         coarse_boxes, coarse_sample_count, coarse_inference, coarse_seconds = (
             scan_samples(coarse_indices, "Coarse", args.coarse_confidence)
         )
@@ -782,6 +864,9 @@ def main() -> int:
             args.sample_stride,
             detected_frames,
             args.refine_padding,
+        )
+        refinement_indices = samples_in_intervals(
+            refinement_indices, allowed_intervals
         )
         if refinement_indices:
             (
@@ -876,6 +961,7 @@ def main() -> int:
                         region["maskKeyframes"] = keyframes
                 regions.append(region)
 
+    regions = clip_regions_to_intervals(regions, allowed_intervals)
     unsuppressed_region_count = len(regions)
     regions = suppress_duplicate_regions(regions, overlap=args.region_nms_iou)
     suppressed_region_count = unsuppressed_region_count - len(regions)

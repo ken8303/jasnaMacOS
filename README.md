@@ -496,6 +496,29 @@ wrapper:
   /path/to/input-sbs.mp4 /path/to/restored-full.mp4
 ```
 
+When the mosaic time ranges are already known, use the manual-range wrapper:
+
+```sh
+./script/restore_vr_sparse_ranges.sh \
+  /path/to/input-sbs.mp4 /path/to/restored-full.mp4 \
+  "00:12:00-00:14:00,00:20:30-00:22:00"
+```
+
+Times refer to the original source timeline. RF-DETR and Jasna run only inside
+those intervals. With direct SBS output, completely clean 120-second segments
+are not converted into left/right eye videos at all: their prepared SBS packets
+are copied directly into the final timeline. Only intersecting segments are
+cropped into eye videos, and clean one-second windows inside boundary segments
+are still packet-copy bypassed. Repeating the identical command resumes safely;
+changing the ranges requires a new output filename so cached manifests cannot
+be mixed.
+
+If a script update interrupts a run after compatible manifests or restored
+windows have already been written, set `JASNA_ALLOW_IMPLEMENTATION_RESUME=1`
+for the first restart. The launcher accepts this only when the input, model,
+manual ranges, and all quality settings still match; it then records the new
+implementation identity so later restarts do not need the override.
+
 It does not apply the test harness's 30-second cut. It uses persistent
 120-second source/restoration segments, fisheye sparse regions, direct SBS
 output, and the full-run-validated batch-2 model path by default. The launcher

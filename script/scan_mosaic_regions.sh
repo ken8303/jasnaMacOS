@@ -121,6 +121,9 @@ ADAPTIVE_ARGUMENTS=(
   --coarse-confidence "$DETECT_COARSE_CONFIDENCE"
   --refine-padding "$DETECT_REFINE_PADDING"
 )
+if [[ -n "${JASNA_DETECT_ACTIVE_RANGES+x}" ]]; then
+  ADAPTIVE_ARGUMENTS+=(--active-ranges "$JASNA_DETECT_ACTIVE_RANGES")
+fi
 if [[ "$ADAPTIVE_DETECT" == "1" ]]; then
   ADAPTIVE_ARGUMENTS+=(--adaptive-scan)
 fi
