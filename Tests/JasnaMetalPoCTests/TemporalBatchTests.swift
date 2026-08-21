@@ -81,6 +81,39 @@ import Testing
     }
 }
 
+@available(macOS 27.0, *)
+@Test func batchOptimizedRegionsGroupCompatibleTemporalLengthsStably() {
+    let ranges = [(0, 30), (4, 20), (0, 30), (8, 20), (0, 30)]
+    let regions = ranges.enumerated().map { index, range in
+        MosaicRegion(
+            startFrame: range.0,
+            endFrame: range.1,
+            x: index,
+            y: 0,
+            width: 256,
+            height: 256,
+            confidence: 1
+        )
+    }
+
+    let ordered = SideBySideRestoration.batchOptimizedRegions(
+        regions,
+        windowStartFrame: 0,
+        outputCount: 30,
+        batch2Enabled: true
+    )
+
+    #expect(ordered.map(\.x) == [3, 1, 0, 2, 4])
+    #expect(
+        SideBySideRestoration.batchOptimizedRegions(
+            regions,
+            windowStartFrame: 0,
+            outputCount: 30,
+            batch2Enabled: false
+        ).map(\.x) == [0, 1, 2, 3, 4]
+    )
+}
+
 @Test func temporalPreparationBatchMatchesIndependentRuns() throws {
     guard #available(macOS 27.0, *), MTLCreateSystemDefaultDevice() != nil else { return }
     let runner = try MetalDeformConv()

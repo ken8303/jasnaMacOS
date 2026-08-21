@@ -11,13 +11,15 @@ DOWNLOAD_DIR="$1"
 PART_ZERO="$DOWNLOAD_DIR/jasna-linux-amd-0.10.0.tar.zst.part000"
 PART_ONE="$DOWNLOAD_DIR/jasna-linux-amd-0.10.0.tar.zst.part001"
 MODEL_DIR="$ROOT_DIR/Models/MosaicDetection"
-MODEL_PATH="$MODEL_DIR/rfdetr-vr-v1.pt"
+VR_MODEL_PATH="$MODEL_DIR/rfdetr-vr-v1.pt"
+V6_MODEL_PATH="$MODEL_DIR/rfdetr-v6.pt"
 PYTHON_BIN="${JASNA_RFDETR_PYTHON:-/opt/homebrew/bin/python3.13}"
 VENV_PATH="$ROOT_DIR/.venv-rfdetr"
 
 EXPECTED_PART_ZERO="ea73281ebf73980cc71550a20e888e1c9ab2ba894bdf865b4eef42f671ecfcbd"
 EXPECTED_PART_ONE="19c973c24db7caaa48cf68bd1c33c3fe1db675495fbae70db2dc0d78d4a227c2"
-EXPECTED_MODEL="55543c83911921ef79cd8cae8540bd25e34c7daf488e77f79d233d6926973a2e"
+EXPECTED_VR_MODEL="55543c83911921ef79cd8cae8540bd25e34c7daf488e77f79d233d6926973a2e"
+EXPECTED_V6_MODEL="f10bedc4d105c2721e4259b8680203d51f344f73e55e85710d915619f5731b55"
 
 for path in "$PART_ZERO" "$PART_ONE"; do
   [[ -s "$path" ]] || {
@@ -51,17 +53,28 @@ echo "Verifying the official Jasna v0.10 AMD archive"
 verify_hash "$PART_ZERO" "$EXPECTED_PART_ZERO"
 verify_hash "$PART_ONE" "$EXPECTED_PART_ONE"
 
-if [[ -s "$MODEL_PATH" ]]; then
-  verify_hash "$MODEL_PATH" "$EXPECTED_MODEL"
+mkdir -p "$MODEL_DIR"
+if [[ -s "$VR_MODEL_PATH" ]]; then
+  verify_hash "$VR_MODEL_PATH" "$EXPECTED_VR_MODEL"
   echo "RF-DETR VR model is already extracted"
 else
-  mkdir -p "$MODEL_DIR"
-  echo "Streaming only rfdetr-vr-v1.pt from the split archive"
+  echo "Streaming rfdetr-vr-v1.pt from the split archive"
   /bin/cat "$PART_ZERO" "$PART_ONE" \
     | zstd -dc \
     | /usr/bin/tar -xvf - -C "$MODEL_DIR" --strip-components=2 \
       jasna-linux-amd-0.10.0/model_weights/rfdetr-vr-v1.pt
-  verify_hash "$MODEL_PATH" "$EXPECTED_MODEL"
+  verify_hash "$VR_MODEL_PATH" "$EXPECTED_VR_MODEL"
+fi
+if [[ -s "$V6_MODEL_PATH" ]]; then
+  verify_hash "$V6_MODEL_PATH" "$EXPECTED_V6_MODEL"
+  echo "RF-DETR v6 model is already extracted"
+else
+  echo "Streaming rfdetr-v6.pt from the split archive"
+  /bin/cat "$PART_ZERO" "$PART_ONE" \
+    | zstd -dc \
+    | /usr/bin/tar -xvf - -C "$MODEL_DIR" --strip-components=2 \
+      jasna-linux-amd-0.10.0/model_weights/rfdetr-v6.pt
+  verify_hash "$V6_MODEL_PATH" "$EXPECTED_V6_MODEL"
 fi
 
 if [[ ! -x "$VENV_PATH/bin/python" ]]; then
@@ -72,7 +85,9 @@ fi
 "$VENV_PATH/bin/python" -c \
   'import cv2, rfdetr, torch; print(f"RF-DETR ready: torch {torch.__version__}, MPS {torch.backends.mps.is_available()}")'
 
-echo "Model:       $MODEL_PATH"
+echo "VR model:    $VR_MODEL_PATH"
+echo "Fast model:  $V6_MODEL_PATH"
 echo "Environment: $VENV_PATH"
 echo "RF-DETR is now the default for sparse VR restoration"
+echo "Use JASNA_DETECTOR=rfdetr-v6 to try Jasna's faster general detector"
 echo "Use JASNA_DETECTOR=yolo-v2-fast when faster scanning is preferred"

@@ -1,5 +1,16 @@
 import Foundation
 
+enum MosaicCompositeQuality {
+    static func detailResidualLimit(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> Float {
+        guard let text = environment["JASNA_MOSAIC_DETAIL_RESIDUAL_LIMIT"],
+              let value = Float(text), value.isFinite
+        else { return 0.03 }
+        return min(1, max(0, value))
+    }
+}
+
 struct MosaicMaskKeyframe: Codable, Equatable, Sendable {
     let frame: Int
     let maskData: Data

@@ -149,3 +149,23 @@ import Testing
         )
     }
 }
+
+@available(macOS 27.0, *)
+@Test func inMemoryRegionFrameCacheKeepsFramesAndRegionsIndependent() throws {
+    let cache = try SideBySideRestoration.InMemoryRegionFrameCache(
+        frameCount: 2, regionCount: 2
+    )
+    var first = [Float16](repeating: 0, count: SideBySideRestoration.tileElements)
+    var second = [Float16](repeating: 0, count: SideBySideRestoration.tileElements)
+    first[0] = 1.25
+    first[first.count - 1] = -2.5
+    second[0] = 3.5
+    second[second.count - 1] = 4.75
+
+    try cache.store(first, frame: 0, region: 1)
+    try cache.store(second, frame: 1, region: 0)
+
+    #expect(try cache.values(frame: 0, region: 1) == first)
+    #expect(try cache.values(frame: 1, region: 0) == second)
+    #expect(try cache.values(frame: 0, region: 0).allSatisfy { $0 == 0 })
+}

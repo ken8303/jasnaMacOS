@@ -103,12 +103,13 @@ private let subdivisionConfiguration = MosaicRegionSubdivisionConfiguration(
     #expect(defaults.maximumBlendDimension == 768)
     #expect(defaults.overlap == 96)
     #expect(defaults.splitLimit == 1)
+    #expect(defaults.maximumAxisCrops == 4)
     #expect(defaults.maskGrowthFraction == 0.05)
     #expect(defaults.maskFeatherFraction == 0.025)
     #expect(defaults.blockResidualGrowthFraction == 0.04)
     #expect(defaults.maskTemporalRadius == 1)
     #expect(defaults.detailCropDimension == 576)
-    #expect(defaults.detailCropCount == 1)
+    #expect(defaults.detailCropCount == 2)
     #expect(disabled == .disabled)
 }
 
@@ -287,6 +288,53 @@ private let subdivisionConfiguration = MosaicRegionSubdivisionConfiguration(
     #expect(detail.subdivisionGroup == 7)
     #expect(detail.detailBlendFeather == 72)
     #expect(detail.maskData?.count == 64)
+}
+
+@Test func longMovingBoundaryReceivesTwoDistributedDetailCrops() throws {
+    var mask = [UInt8](repeating: 0, count: 16 * 8)
+    for y in 4...6 {
+        for x in 1...14 { mask[y * 16 + x] = 255 }
+    }
+    let region = MosaicRegion(
+        startFrame: 0,
+        endFrame: 30,
+        x: 0,
+        y: 0,
+        width: 4_096,
+        height: 1_400,
+        confidence: 1,
+        blendX: 64,
+        blendY: 500,
+        blendWidth: 3_968,
+        blendHeight: 800,
+        maskWidth: 16,
+        maskHeight: 8,
+        maskData: Data(mask)
+    )
+    let configuration = MosaicRegionSubdivisionConfiguration(
+        maximumBlendDimension: 768,
+        overlap: 96,
+        splitLimit: 1,
+        maximumAxisCrops: 4,
+        maskGrowthFraction: 0.05,
+        maskFeatherFraction: 0.025,
+        blockResidualGrowthFraction: 0.04,
+        maskTemporalRadius: 1,
+        detailCropDimension: 576,
+        detailCropCount: 2
+    )
+
+    let details = MosaicRegionSubdivision.lowerResidualDetailCrops(
+        from: region,
+        focusReference: region,
+        configuration: configuration,
+        subdivisionGroup: 1
+    )
+
+    #expect(details.count == 2)
+    #expect(details[0].effectiveBlendX < details[1].effectiveBlendX)
+    #expect(details.allSatisfy { $0.effectiveBlendWidth == 576 })
+    #expect(details.allSatisfy { $0.detailBlendFeather == 72 })
 }
 
 @Test func detailCropUsesADeepEdgeFadeWithoutChangingGridChildren() throws {

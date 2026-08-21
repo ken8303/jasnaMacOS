@@ -8,3 +8,6 @@ __pycache__/
 .venv-mosaic/
 .venv-rfdetr/
 .venv-coreai/
+*.jasna-vr*-work/
+*.jasna-vr*.log
+/fast-shared-*.mov

@@ -13,18 +13,30 @@ case "$DETECTOR" in
     PYTHON_PATH="$ROOT_DIR/.venv-mosaic/bin/python"
     MODEL_PATH="$ROOT_DIR/Models/MosaicDetection/lada_vr_mosaic_detection_model_v2_fast.pt"
     DETECTOR_BACKEND="yolo"
+    RFDETR_VARIANT="large"
+    DEFAULT_DETECT_CONFIDENCE="0.15"
+    ;;
+  rfdetr-v6)
+    PYTHON_PATH="$ROOT_DIR/.venv-rfdetr/bin/python"
+    MODEL_PATH="$ROOT_DIR/Models/MosaicDetection/rfdetr-v6.pt"
+    DETECTOR_BACKEND="rfdetr"
+    RFDETR_VARIANT="medium"
+    DEFAULT_DETECT_CONFIDENCE="0.35"
     ;;
   rfdetr-vr-v1)
     PYTHON_PATH="$ROOT_DIR/.venv-rfdetr/bin/python"
     MODEL_PATH="$ROOT_DIR/Models/MosaicDetection/rfdetr-vr-v1.pt"
     DETECTOR_BACKEND="rfdetr"
+    RFDETR_VARIANT="large"
+    DEFAULT_DETECT_CONFIDENCE="0.15"
     ;;
   *)
-    echo "error: JASNA_DETECTOR must be yolo-v2-fast or rfdetr-vr-v1" >&2
+    echo "error: JASNA_DETECTOR must be yolo-v2-fast, rfdetr-v6, or rfdetr-vr-v1" >&2
     exit 1
     ;;
 esac
 DETECT_BATCH_SIZE="${JASNA_DETECT_BATCH_SIZE:-2}"
+DETECT_DEVICE="${JASNA_DETECT_DEVICE:-auto}"
 DETECT_DECODE_MODE="${JASNA_DETECT_DECODE_MODE:-sequential}"
 DETECT_SAMPLE_STRIDE="${JASNA_DETECT_SAMPLE_STRIDE:-0.1}"
 DETECT_COARSE_STRIDE="${JASNA_DETECT_COARSE_STRIDE:-1.0}"
@@ -32,15 +44,21 @@ DETECT_COARSE_CONFIDENCE="${JASNA_DETECT_COARSE_CONFIDENCE:-0.05}"
 DETECT_REFINE_PADDING="${JASNA_DETECT_REFINE_PADDING:-1.0}"
 ADAPTIVE_DETECT="${JASNA_ADAPTIVE_DETECT:-0}"
 REGION_DURATION="${JASNA_REGION_DURATION:-1.0}"
-DETECT_CONFIDENCE="${JASNA_DETECT_CONFIDENCE:-0.15}"
+DETECT_CONFIDENCE="${JASNA_DETECT_CONFIDENCE:-$DEFAULT_DETECT_CONFIDENCE}"
 TEMPORAL_PADDING="${JASNA_TEMPORAL_PADDING:-1.0}"
 REGION_NMS_IOU="${JASNA_REGION_NMS_IOU:-0.45}"
 MASK_EXPANSION="${JASNA_MASK_EXPANSION:-0.10}"
 MASK_SIZE="${JASNA_MASK_SIZE:-128}"
 RFDETR_MAX_DETECTIONS="${JASNA_RFDETR_MAX_DETECTIONS:-64}"
+CROP_EYE="${JASNA_DETECT_EYE:-none}"
 
 [[ "$DETECT_BATCH_SIZE" =~ ^[1-9][0-9]*$ ]] || {
   echo "error: JASNA_DETECT_BATCH_SIZE must be a positive integer" >&2
+  exit 1
+}
+[[ "$DETECT_DEVICE" == "auto" || "$DETECT_DEVICE" == "mps" \
+  || "$DETECT_DEVICE" == "cpu" ]] || {
+  echo "error: JASNA_DETECT_DEVICE must be auto, mps, or cpu" >&2
   exit 1
 }
 [[ "$DETECT_DECODE_MODE" == "sequential" || "$DETECT_DECODE_MODE" == "seek" ]] || {
@@ -103,6 +121,10 @@ done
   echo "error: JASNA_RFDETR_MAX_DETECTIONS must be an integer from 1 through 200" >&2
   exit 1
 }
+[[ "$CROP_EYE" == "none" || "$CROP_EYE" == "left" || "$CROP_EYE" == "right" ]] || {
+  echo "error: JASNA_DETECT_EYE must be none, left, or right" >&2
+  exit 1
+}
 
 [[ -x "$PYTHON_PATH" && -s "$MODEL_PATH" ]] || {
   echo "error: $DETECTOR mosaic detector is not set up" >&2
@@ -130,6 +152,9 @@ fi
 "$PYTHON_PATH" "$ROOT_DIR/tools/scan_mosaic_regions.py" \
   "$1" "$2" --model "$MODEL_PATH" \
   --backend "$DETECTOR_BACKEND" \
+  --rfdetr-variant "$RFDETR_VARIANT" \
+  --crop-eye "$CROP_EYE" \
+  --device "$DETECT_DEVICE" \
   --batch-size "$DETECT_BATCH_SIZE" \
   --max-detections "$RFDETR_MAX_DETECTIONS" \
   --decode-mode "$DETECT_DECODE_MODE" \

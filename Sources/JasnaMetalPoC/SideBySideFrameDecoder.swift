@@ -76,6 +76,36 @@ extension SideBySideRestoration {
         deinit { reader.cancelReading() }
 
         func copyFrame(outputIndex: Int) async throws -> CVPixelBuffer {
+            let source = try await sourceFrame(outputIndex: outputIndex)
+            var copiedFrame: CVPixelBuffer?
+            try source.withUnsafeBuffer {
+                copiedFrame = try Self.copyBGRA($0, dimensions: dimensions, cropX: cropX)
+            }
+            guard let copiedFrame else {
+                throw DeformConvError.commandFailed("decoded frame copy was not created")
+            }
+            return copiedFrame
+        }
+
+        func copyStereoFrames(outputIndex: Int) async throws -> (
+            left: CVPixelBuffer, right: CVPixelBuffer
+        ) {
+            let source = try await sourceFrame(outputIndex: outputIndex)
+            var left: CVPixelBuffer?
+            var right: CVPixelBuffer?
+            try source.withUnsafeBuffer {
+                left = try Self.copyBGRA($0, dimensions: dimensions, cropX: 0)
+                right = try Self.copyBGRA(
+                    $0, dimensions: dimensions, cropX: dimensions.width
+                )
+            }
+            guard let left, let right else {
+                throw DeformConvError.commandFailed("decoded stereo frame copies were not created")
+            }
+            return (left, right)
+        }
+
+        private func sourceFrame(outputIndex: Int) async throws -> CVReadOnlyPixelBuffer {
             let target = CMTime(value: CMTimeValue(outputIndex), timescale: 30)
             while let candidate = next,
                   CMTimeCompare(candidate.presentationTimeStamp, target) < 0 {
@@ -98,14 +128,7 @@ extension SideBySideRestoration {
             guard case .pixelBuffer(let source) = sample.content else {
                 throw DeformConvError.commandFailed("decoded video sample has no pixel buffer")
             }
-            var copiedFrame: CVPixelBuffer?
-            try source.withUnsafeBuffer {
-                copiedFrame = try Self.copyBGRA($0, dimensions: dimensions, cropX: cropX)
-            }
-            guard let copiedFrame else {
-                throw DeformConvError.commandFailed("decoded frame copy was not created")
-            }
-            return copiedFrame
+            return source
         }
 
         private static func closest(

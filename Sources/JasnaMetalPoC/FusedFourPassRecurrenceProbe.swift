@@ -98,8 +98,16 @@ func verifyFusedFourPassRecurrence(
 ) throws -> FusedFourPassRecurrenceResult {
     typealias Support = Metal4GraphSupport
     let traceGraph = ProcessInfo.processInfo.environment["JASNA_GRAPH_TRACE"] == "1"
+    let traceGraphPhases = ProcessInfo.processInfo.environment[
+        "JASNA_GRAPH_PHASE_TELEMETRY"
+    ] == "1"
     func trace(_ message: String) {
         if traceGraph { print("Fused graph: \(message)") }
+    }
+    func elapsedMilliseconds(since start: ContinuousClock.Instant) -> Double {
+        let elapsed = start.duration(to: .now).components
+        return Double(elapsed.seconds) * 1_000
+            + Double(elapsed.attoseconds) / 1_000_000_000_000_000
     }
     let plane = 64 * 64
     let featureCount = batch * 64 * plane
@@ -542,7 +550,10 @@ func verifyFusedFourPassRecurrence(
         trace("execution starting")
         MetalResourceCache.shared.beginMachineLearningExecution()
         defer { MetalResourceCache.shared.endMachineLearningExecution() }
+        let uploadStarted = ContinuousClock.now
         initializeBuffers()
+        let uploadMilliseconds = elapsedMilliseconds(since: uploadStarted)
+        let encodingStarted = ContinuousClock.now
         if commandAllocatorHasCompletedSubmission { commandAllocator.reset() }
         commandBuffer.beginCommandBuffer(allocator: commandAllocator)
         commandBuffer.useResidencySet(residencySet)
@@ -749,6 +760,7 @@ func verifyFusedFourPassRecurrence(
         }
         frameResidual.endEncoding()
         commandBuffer.endCommandBuffer()
+        let encodingMilliseconds = elapsedMilliseconds(since: encodingStarted)
         let semaphore = DispatchSemaphore(value: 0)
         let commitResult = CommitResult()
         let commitOptions = MTL4CommitOptions()
@@ -759,13 +771,16 @@ func verifyFusedFourPassRecurrence(
             )
             semaphore.signal()
         }
+        let waitStarted = ContinuousClock.now
         queue.commit([commandBuffer], options: commitOptions)
         trace("command buffer committed")
         semaphore.wait()
+        let waitMilliseconds = elapsedMilliseconds(since: waitStarted)
         trace("command buffer completed")
         commandAllocatorHasCompletedSubmission = true
         let (milliseconds, error) = commitResult.load()
         if let error { throw error }
+        let readbackStarted = ContinuousClock.now
         if nonFiniteFlagBuffer.contents().load(as: UInt32.self) != 0 {
             throw DeformConvError.nonFiniteOutput(
                 "fused graph produced a non-finite restored-frame value"
@@ -786,6 +801,17 @@ func verifyFusedFourPassRecurrence(
             let pointer = buffer.contents().bindMemory(to: Float16.self, capacity: 2 * plane)
             return Array(UnsafeBufferPointer(start: pointer, count: 2 * plane))
         } : []
+        let readbackMilliseconds = elapsedMilliseconds(since: readbackStarted)
+        if traceGraphPhases {
+            print(
+                "Fused graph host phases: upload "
+                    + "\(String(format: "%.3f", uploadMilliseconds)) ms, encode "
+                    + "\(String(format: "%.3f", encodingMilliseconds)) ms, wait "
+                    + "\(String(format: "%.3f", waitMilliseconds)) ms, readback "
+                    + "\(String(format: "%.3f", readbackMilliseconds)) ms, GPU "
+                    + "\(String(format: "%.3f", milliseconds)) ms"
+            )
+        }
         return (milliseconds, outputs, restored, flows)
     }
 

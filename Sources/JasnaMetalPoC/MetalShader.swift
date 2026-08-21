@@ -1026,6 +1026,8 @@ struct MosaicCompositeParams {
     uint groupX;
     uint groupY;
     uint groupWidth;
+    uint contributesCoverage;
+    float detailResidualLimit;
 };
 
 struct MosaicGroupResolveParams {
@@ -1033,6 +1035,7 @@ struct MosaicGroupResolveParams {
     uint groupY;
     uint groupWidth;
     uint groupHeight;
+    float detailResidualLimit;
 };
 
 inline float mosaic_sample_plane(
@@ -1108,9 +1111,18 @@ kernel void composite_fisheye_mosaic_delta(
         uint rgbChannel = 2u - bgraChannel;
         uint offset = rgbChannel * plane;
         float base = float(bgra[destination + bgraChannel]) / 255.0f;
-        float value = base
-            + mosaic_sample_plane(restored, offset, params.modelSize, modelX, modelY)
-            - mosaic_sample_plane(original, offset, params.modelSize, modelX, modelY);
+        float restoredValue = mosaic_sample_plane(
+            restored, offset, params.modelSize, modelX, modelY
+        );
+        float originalValue = mosaic_sample_plane(
+            original, offset, params.modelSize, modelX, modelY
+        );
+        float detail = clamp(
+            base - originalValue,
+            -params.detailResidualLimit,
+            params.detailResidualLimit
+        );
+        float value = restoredValue + detail;
         float restoredByte = clamp(value, 0.0f, 1.0f) * 255.0f;
         float blended = float(bgra[destination + bgraChannel]) * (1.0f - alpha)
             + restoredByte * alpha;
@@ -1143,16 +1155,32 @@ kernel void composite_fisheye_mosaic_delta_texture(
     uint plane = params.modelSize * params.modelSize;
     for (uint rgbChannel = 0u; rgbChannel < 3u; ++rgbChannel) {
         uint offset = rgbChannel * plane;
-        float value = color[rgbChannel]
-            + mosaic_sample_plane(
-                restored, offset, params.modelSize, compositeSample.x, compositeSample.y
-            )
-            - mosaic_sample_plane(
-                original, offset, params.modelSize, compositeSample.x, compositeSample.y
-            );
+        float restoredValue = mosaic_sample_plane(
+            restored, offset, params.modelSize, compositeSample.x, compositeSample.y
+        );
+        float originalValue = mosaic_sample_plane(
+            original, offset, params.modelSize, compositeSample.x, compositeSample.y
+        );
+        float detail = clamp(
+            color[rgbChannel] - originalValue,
+            -params.detailResidualLimit,
+            params.detailResidualLimit
+        );
+        float value = restoredValue + detail;
         color[rgbChannel] = mix(color[rgbChannel], clamp(value, 0.0f, 1.0f), alpha);
     }
     frame.write(color, position);
+}
+
+kernel void clear_fisheye_mosaic_group(
+    device float4 *accumulator [[buffer(0)]],
+    device float *coverage [[buffer(1)]],
+    device half4 *restoredAccumulator [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    accumulator[gid] = float4(0.0f);
+    coverage[gid] = 0.0f;
+    restoredAccumulator[gid] = half4(half(0.0f));
 }
 
 kernel void accumulate_fisheye_mosaic_delta(
@@ -1162,6 +1190,8 @@ kernel void accumulate_fisheye_mosaic_delta(
     device const float4 *compositeSamples [[buffer(3)]],
     device const uchar *mask [[buffer(4)]],
     constant MosaicCompositeParams &params [[buffer(5)]],
+    device float *coverage [[buffer(6)]],
+    device half4 *restoredAccumulator [[buffer(7)]],
     uint gid [[thread_position_in_grid]]
 ) {
     uint regionPixels = params.regionWidth * params.regionHeight;
@@ -1177,23 +1207,31 @@ kernel void accumulate_fisheye_mosaic_delta(
     if (alpha <= 0.0f) return;
     uint plane = params.modelSize * params.modelSize;
     float3 delta;
+    float3 restoredColor;
     for (uint rgbChannel = 0u; rgbChannel < 3u; ++rgbChannel) {
         uint offset = rgbChannel * plane;
-        delta[rgbChannel] = mosaic_sample_plane(
+        restoredColor[rgbChannel] = mosaic_sample_plane(
             restored, offset, params.modelSize, compositeSample.x, compositeSample.y
-        ) - mosaic_sample_plane(
+        );
+        delta[rgbChannel] = restoredColor[rgbChannel] - mosaic_sample_plane(
             original, offset, params.modelSize, compositeSample.x, compositeSample.y
         );
     }
     uint destination = (pixelY - params.groupY) * params.groupWidth
         + pixelX - params.groupX;
     accumulator[destination] += float4(delta * alpha, alpha);
+    restoredAccumulator[destination] += half4(half3(restoredColor * alpha), half(alpha));
+    if (params.contributesCoverage != 0u) {
+        coverage[destination] += alpha;
+    }
 }
 
 kernel void resolve_fisheye_mosaic_delta_group_texture(
     texture2d<float, access::read_write> frame [[texture(0)]],
     device const float4 *accumulator [[buffer(0)]],
-    constant MosaicGroupResolveParams &params [[buffer(1)]],
+    device const float *coverage [[buffer(1)]],
+    device const half4 *restoredAccumulator [[buffer(2)]],
+    constant MosaicGroupResolveParams &params [[buffer(3)]],
     uint gid [[thread_position_in_grid]]
 ) {
     uint groupPixels = params.groupWidth * params.groupHeight;
@@ -1205,11 +1243,23 @@ kernel void resolve_fisheye_mosaic_delta_group_texture(
         params.groupY + gid / params.groupWidth
     );
     float4 color = frame.read(position);
-    float visibleAlpha = min(accumulated.w, 1.0f);
-    color.rgb = clamp(
-        color.rgb + accumulated.rgb / accumulated.w * visibleAlpha,
-        0.0f,
-        1.0f
+    // Detail crops refine the normalized delta, but must not raise coverage.
+    // Otherwise their rectangular footprint becomes an opacity step even when
+    // the crop itself is feathered correctly.
+    float visibleAlpha = min(coverage[gid], 1.0f);
+    float3 averageDelta = accumulated.rgb / accumulated.w;
+    float3 averageRestored = float3(restoredAccumulator[gid].rgb)
+        / max(float(restoredAccumulator[gid].w), 0.0001f);
+    float3 averageOriginal = averageRestored - averageDelta;
+    float3 detail = clamp(
+        color.rgb - averageOriginal,
+        -params.detailResidualLimit,
+        params.detailResidualLimit
+    );
+    color.rgb = mix(
+        color.rgb,
+        clamp(averageRestored + detail, 0.0f, 1.0f),
+        visibleAlpha
     );
     frame.write(color, position);
 }

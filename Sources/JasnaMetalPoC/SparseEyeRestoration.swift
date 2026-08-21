@@ -154,9 +154,17 @@ extension SideBySideRestoration {
                 let subdivision = MosaicRegionSubdivision.expand(
                     detectedRegions, configuration: subdivisionConfiguration
                 )
-                let activeRegions = fullDetectedRegionBlendEnabled
+                let unsortedActiveRegions = fullDetectedRegionBlendEnabled
                     ? subdivision.regions.map { $0.usingFullDetectedRegionBlend() }
                     : subdivision.regions
+                let activeRegions = batchOptimizedRegions(
+                    unsortedActiveRegions,
+                    windowStartFrame: windowStart,
+                    outputCount: outputCount,
+                    batch2Enabled: ProcessInfo.processInfo.environment[
+                        "JASNA_BATCH2_MODELS_DIR"
+                    ] != nil
+                )
                 report(
                     "Window \(currentWindowIndex + 1)/\(windowFrameCounts.count): decoding "
                         + "\(outputCount) frames; mosaic regions \(detectedRegions.count), "
@@ -218,6 +226,7 @@ extension SideBySideRestoration {
                 let compositeStarted = ContinuousClock.now
                 try await writer.appendRegionCachedFrames(
                     cacheURLs: window.cacheURLs,
+                    inMemoryCache: window.inMemoryRegionCache,
                     attachments: attachments,
                     startFrame: segmentOutputFrame,
                     progressStartFrame: windowStart,
@@ -299,15 +308,23 @@ extension SideBySideRestoration {
                 "direct SBS left/right source segments do not match"
             )
         }
+        let leftManifest = try MosaicRegionManifest.load(from: leftManifestURL)
+        let rightManifest = try MosaicRegionManifest.load(from: rightManifestURL)
+        let sharedSBSInput = leftInputURL.resolvingSymlinksInPath().standardizedFileURL
+            == rightInputURL.resolvingSymlinksInPath().standardizedFileURL
+            && leftInfo.dimensions.width == leftManifest.width * 2
+            && leftInfo.dimensions.height == leftManifest.height
+            && rightManifest.width == leftManifest.width
+            && rightManifest.height == leftManifest.height
+        let eyeWidth = sharedSBSInput
+            ? leftInfo.dimensions.width / 2 : leftInfo.dimensions.width
         let eyePlan = try SideBySideVideoPlan(
-            width: leftInfo.dimensions.width,
+            width: eyeWidth,
             height: leftInfo.dimensions.height,
             sourceFramesPerSecond: leftInfo.nominalFramesPerSecond,
             durationSeconds: leftInfo.durationSeconds,
             eyeLayout: .singleEye
         )
-        let leftManifest = try MosaicRegionManifest.load(from: leftManifestURL)
-        let rightManifest = try MosaicRegionManifest.load(from: rightManifestURL)
         try leftManifest.validate(for: eyePlan)
         try rightManifest.validate(for: eyePlan)
         let subdivisionConfiguration = MosaicRegionSubdivisionConfiguration.fromEnvironment(
@@ -337,7 +354,7 @@ extension SideBySideRestoration {
         )
         let rangeFrameCount = rangeEndFrame - rangeStartFrame
         let stereoPlan = try SideBySideVideoPlan(
-            width: leftInfo.dimensions.width * 2,
+            width: eyeWidth * 2,
             height: leftInfo.dimensions.height,
             sourceFramesPerSecond: leftInfo.nominalFramesPerSecond,
             durationSeconds: Double(rangeFrameCount)
@@ -358,13 +375,19 @@ extension SideBySideRestoration {
         try FileManager.default.createDirectory(
             at: outputURL.deletingLastPathComponent(), withIntermediateDirectories: true
         )
-        let leftDecoder = try await FrameDecoder(
+        let sharedDecoder = sharedSBSInput ? try await FrameDecoder(
+            inputURL: leftInputURL,
+            plan: eyePlan,
+            sourceDimensions: leftInfo.dimensions,
+            startOutputIndex: rangeStartFrame
+        ) : nil
+        let leftDecoder = sharedSBSInput ? nil : try await FrameDecoder(
             inputURL: leftInputURL,
             plan: eyePlan,
             sourceDimensions: leftInfo.dimensions,
             startOutputIndex: rangeStartFrame
         )
-        let rightDecoder = try await FrameDecoder(
+        let rightDecoder = sharedSBSInput ? nil : try await FrameDecoder(
             inputURL: rightInputURL,
             plan: eyePlan,
             sourceDimensions: rightInfo.dimensions,
@@ -379,6 +402,9 @@ extension SideBySideRestoration {
                 + "\(stereoPlan.dimensions.height), \(rangeFrameCount) frames, windows "
                 + "\(windowRange.lowerBound + 1)-\(windowRange.upperBound)/\(windowCount)"
         )
+        if sharedSBSInput {
+            report("Direct SBS source: one shared 8K decode with in-memory eye crops")
+        }
         reportSubdivisionConfiguration(subdivisionConfiguration)
         for windowIndex in windowRange {
             let windowStart = windowIndex * SideBySideVideoPlan.temporalWindowFrames
@@ -395,12 +421,27 @@ extension SideBySideRestoration {
             let rightSubdivision = MosaicRegionSubdivision.expand(
                 rightDetectedRegions, configuration: subdivisionConfiguration
             )
-            let leftRegions = fullDetectedRegionBlendEnabled
+            let unsortedLeftRegions = fullDetectedRegionBlendEnabled
                 ? leftSubdivision.regions.map { $0.usingFullDetectedRegionBlend() }
                 : leftSubdivision.regions
-            let rightRegions = fullDetectedRegionBlendEnabled
+            let unsortedRightRegions = fullDetectedRegionBlendEnabled
                 ? rightSubdivision.regions.map { $0.usingFullDetectedRegionBlend() }
                 : rightSubdivision.regions
+            let batch2Enabled = ProcessInfo.processInfo.environment[
+                "JASNA_BATCH2_MODELS_DIR"
+            ] != nil
+            let leftRegions = batchOptimizedRegions(
+                unsortedLeftRegions,
+                windowStartFrame: windowStart,
+                outputCount: outputCount,
+                batch2Enabled: batch2Enabled
+            )
+            let rightRegions = batchOptimizedRegions(
+                unsortedRightRegions,
+                windowStartFrame: windowStart,
+                outputCount: outputCount,
+                batch2Enabled: batch2Enabled
+            )
             report(
                 "Direct SBS window \(windowIndex + 1)/\(windowCount): "
                     + "decoding \(outputCount) frames; left/right regions "
@@ -422,12 +463,25 @@ extension SideBySideRestoration {
             leftFrames.reserveCapacity(outputCount)
             rightFrames.reserveCapacity(outputCount)
             for localFrame in 0..<outputCount {
-                leftFrames.append(
-                    try await leftDecoder.copyFrame(outputIndex: windowStart + localFrame)
-                )
-                rightFrames.append(
-                    try await rightDecoder.copyFrame(outputIndex: windowStart + localFrame)
-                )
+                if let sharedDecoder {
+                    let pair = try await sharedDecoder.copyStereoFrames(
+                        outputIndex: windowStart + localFrame
+                    )
+                    leftFrames.append(pair.left)
+                    rightFrames.append(pair.right)
+                } else {
+                    guard let leftDecoder, let rightDecoder else {
+                        throw DeformConvError.commandFailed(
+                            "direct SBS eye decoders were not initialized"
+                        )
+                    }
+                    leftFrames.append(
+                        try await leftDecoder.copyFrame(outputIndex: windowStart + localFrame)
+                    )
+                    rightFrames.append(
+                        try await rightDecoder.copyFrame(outputIndex: windowStart + localFrame)
+                    )
+                }
             }
             let leftOutputFrames = leftFrames
             let rightOutputFrames = rightFrames
@@ -499,6 +553,8 @@ extension SideBySideRestoration {
             try await writer.appendStereoRegionCachedFrames(
                 leftCacheURLs: leftWindow.cacheURLs,
                 rightCacheURLs: rightWindow.cacheURLs,
+                leftInMemoryCache: leftWindow.inMemoryRegionCache,
+                rightInMemoryCache: rightWindow.inMemoryRegionCache,
                 leftBaseFrames: leftOutputFrames,
                 rightBaseFrames: rightOutputFrames,
                 leftRegions: leftRegions,

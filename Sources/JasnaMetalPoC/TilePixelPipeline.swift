@@ -431,6 +431,7 @@ struct MosaicRegionFrameAccumulator {
         let endY = projection == .fisheye
             ? region.y + region.height
             : region.effectiveBlendY + region.effectiveBlendHeight
+        let detailResidualLimit = MosaicCompositeQuality.detailResidualLimit()
         for pixelY in startY..<endY {
             for pixelX in startX..<endX {
                 let alpha = projection == .fisheye
@@ -462,7 +463,11 @@ struct MosaicRegionFrameAccumulator {
                     let original = Self.bilinearPlane(
                         originalPlanarRGB, offset: offset, x: model.x, y: model.y
                     )
-                    return base + value - original
+                    let detail = min(
+                        detailResidualLimit,
+                        max(-detailResidualLimit, base - original)
+                    )
+                    return value + detail
                 }
                 let red = restored(0, base: baseRed)
                 let green = restored(plane, base: baseGreen)

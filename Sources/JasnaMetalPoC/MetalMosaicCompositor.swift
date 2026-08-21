@@ -34,6 +34,8 @@ private struct MetalMosaicCompositeParams {
     var groupX: UInt32
     var groupY: UInt32
     var groupWidth: UInt32
+    var contributesCoverage: UInt32
+    var detailResidualLimit: Float
 }
 
 private struct MetalMosaicGroupResolveParams {
@@ -41,6 +43,7 @@ private struct MetalMosaicGroupResolveParams {
     var groupY: UInt32
     var groupWidth: UInt32
     var groupHeight: UInt32
+    var detailResidualLimit: Float
 }
 
 @available(macOS 27.0, *)
@@ -56,15 +59,18 @@ final class MetalMosaicCompositor: @unchecked Sendable {
         let blendY: Int
         let blendWidth: Int
         let blendHeight: Int
+        let detailBlendFeather: Int?
     }
 
     private let device: MTLDevice
     private let queue: MTLCommandQueue
     private let pipeline: MTLComputePipelineState
     private let texturePipeline: MTLComputePipelineState
+    private let groupClearPipeline: MTLComputePipelineState
     private let groupAccumulatePipeline: MTLComputePipelineState
     private let groupResolvePipeline: MTLComputePipelineState
     private let textureCache: CVMetalTextureCache
+    private let detailResidualLimit: Float
     let prefersTextureSurfaces: Bool
     private let textureCacheLock = NSLock()
     private let sampleBufferLock = NSLock()
@@ -72,6 +78,7 @@ final class MetalMosaicCompositor: @unchecked Sendable {
 
     init(device: MTLDevice) throws {
         self.device = device
+        detailResidualLimit = MosaicCompositeQuality.detailResidualLimit()
         prefersTextureSurfaces = ProcessInfo.processInfo.environment[
             "JASNA_METAL_TEXTURE_COMPOSITOR"
         ] != "0"
@@ -81,6 +88,9 @@ final class MetalMosaicCompositor: @unchecked Sendable {
         guard let function = library.makeFunction(name: "composite_fisheye_mosaic_delta"),
               let textureFunction = library.makeFunction(
                   name: "composite_fisheye_mosaic_delta_texture"
+              ),
+              let groupClearFunction = library.makeFunction(
+                  name: "clear_fisheye_mosaic_group"
               ),
               let groupAccumulateFunction = library.makeFunction(
                   name: "accumulate_fisheye_mosaic_delta"
@@ -95,6 +105,9 @@ final class MetalMosaicCompositor: @unchecked Sendable {
         )
         texturePipeline = try MetalResourceCache.shared.computePipeline(
             device: device, function: textureFunction
+        )
+        groupClearPipeline = try MetalResourceCache.shared.computePipeline(
+            device: device, function: groupClearFunction
         )
         groupAccumulatePipeline = try MetalResourceCache.shared.computePipeline(
             device: device, function: groupAccumulateFunction
@@ -337,7 +350,9 @@ final class MetalMosaicCompositor: @unchecked Sendable {
                 maskHeight: UInt32(input.region.maskHeight ?? 1),
                 groupX: 0,
                 groupY: 0,
-                groupWidth: 0
+                groupWidth: 0,
+                contributesCoverage: 1,
+                detailResidualLimit: detailResidualLimit
             )
             encoder.setBuffer(frameBuffer, offset: 0, index: 0)
             encoder.setBuffer(restoredBuffer, offset: 0, index: 1)
@@ -495,7 +510,9 @@ final class MetalMosaicCompositor: @unchecked Sendable {
                 maskHeight: UInt32(input.region.maskHeight ?? 1),
                 groupX: 0,
                 groupY: 0,
-                groupWidth: 0
+                groupWidth: 0,
+                contributesCoverage: 1,
+                detailResidualLimit: detailResidualLimit
             )
             encoder.setBuffer(restoredBuffer, offset: 0, index: 0)
             encoder.setBuffer(originalBuffer, offset: 0, index: 1)
@@ -525,12 +542,29 @@ final class MetalMosaicCompositor: @unchecked Sendable {
             let groupHeight = groupBottom - groupY
             let accumulatorLength = groupWidth * groupHeight * MemoryLayout<SIMD4<Float>>.stride
             guard let accumulator = device.makeBuffer(
-                length: accumulatorLength, options: .storageModeShared
+                length: accumulatorLength, options: .storageModePrivate
+            ), let coverage = device.makeBuffer(
+                length: groupWidth * groupHeight * MemoryLayout<Float>.stride,
+                options: .storageModePrivate
+            ), let restoredAccumulator = device.makeBuffer(
+                length: groupWidth * groupHeight * MemoryLayout<SIMD4<Float16>>.stride,
+                options: .storageModePrivate
             ) else { throw DeformConvError.metalUnavailable }
-            accumulator.contents().initializeMemory(
-                as: UInt8.self, repeating: 0, count: accumulatorLength
+            heldBuffers += [accumulator, coverage, restoredAccumulator]
+            let groupPixels = groupWidth * groupHeight
+            encoder.setComputePipelineState(groupClearPipeline)
+            encoder.setBuffer(accumulator, offset: 0, index: 0)
+            encoder.setBuffer(coverage, offset: 0, index: 1)
+            encoder.setBuffer(restoredAccumulator, offset: 0, index: 2)
+            let clearThreads = min(
+                groupClearPipeline.maxTotalThreadsPerThreadgroup, 256
             )
-            heldBuffers.append(accumulator)
+            encoder.dispatchThreads(
+                MTLSize(width: groupPixels, height: 1, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: clearThreads, height: 1, depth: 1)
+            )
+            encoder.memoryBarrier(scope: .buffers)
+            let hasPrimaryCrop = group.contains { $0.region.detailBlendFeather == nil }
             encoder.setComputePipelineState(groupAccumulatePipeline)
             for input in group {
                 guard input.restored.count == modelElements,
@@ -569,7 +603,10 @@ final class MetalMosaicCompositor: @unchecked Sendable {
                     maskHeight: UInt32(input.region.maskHeight ?? 1),
                     groupX: UInt32(groupX),
                     groupY: UInt32(groupY),
-                    groupWidth: UInt32(groupWidth)
+                    groupWidth: UInt32(groupWidth),
+                    contributesCoverage: input.region.detailBlendFeather == nil
+                        || !hasPrimaryCrop ? 1 : 0,
+                    detailResidualLimit: detailResidualLimit
                 )
                 encoder.setBuffer(accumulator, offset: 0, index: 0)
                 encoder.setBuffer(restoredBuffer, offset: 0, index: 1)
@@ -579,6 +616,8 @@ final class MetalMosaicCompositor: @unchecked Sendable {
                 encoder.setBytes(
                     &params, length: MemoryLayout<MetalMosaicCompositeParams>.stride, index: 5
                 )
+                encoder.setBuffer(coverage, offset: 0, index: 6)
+                encoder.setBuffer(restoredAccumulator, offset: 0, index: 7)
                 let count = input.region.width * input.region.height
                 let threads = min(groupAccumulatePipeline.maxTotalThreadsPerThreadgroup, 256)
                 encoder.dispatchThreads(
@@ -591,19 +630,22 @@ final class MetalMosaicCompositor: @unchecked Sendable {
                 groupX: UInt32(groupX),
                 groupY: UInt32(groupY),
                 groupWidth: UInt32(groupWidth),
-                groupHeight: UInt32(groupHeight)
+                groupHeight: UInt32(groupHeight),
+                detailResidualLimit: detailResidualLimit
             )
             encoder.setComputePipelineState(groupResolvePipeline)
             encoder.setTexture(destination.texture, index: 0)
             encoder.setBuffer(accumulator, offset: 0, index: 0)
+            encoder.setBuffer(coverage, offset: 0, index: 1)
+            encoder.setBuffer(restoredAccumulator, offset: 0, index: 2)
             encoder.setBytes(
                 &resolveParams,
                 length: MemoryLayout<MetalMosaicGroupResolveParams>.stride,
-                index: 1
+                index: 3
             )
             let threads = min(groupResolvePipeline.maxTotalThreadsPerThreadgroup, 256)
             encoder.dispatchThreads(
-                MTLSize(width: groupWidth * groupHeight, height: 1, depth: 1),
+                MTLSize(width: groupPixels, height: 1, depth: 1),
                 threadsPerThreadgroup: MTLSize(width: threads, height: 1, depth: 1)
             )
             encoder.memoryBarrier(scope: .textures)
@@ -664,6 +706,7 @@ final class MetalMosaicCompositor: @unchecked Sendable {
             blendY: input.region.effectiveBlendY,
             blendWidth: input.region.effectiveBlendWidth,
             blendHeight: input.region.effectiveBlendHeight,
+            detailBlendFeather: input.region.detailBlendFeather
         )
         sampleBufferLock.lock()
         defer { sampleBufferLock.unlock() }

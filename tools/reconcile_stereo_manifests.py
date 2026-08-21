@@ -97,8 +97,15 @@ def shifted_region(region, dx, dy, width, height, start_frame, end_frame):
 
 def reconcile_manifests(left, right):
     header = ("width", "height", "frameCount", "framesPerSecond")
-    if any(left.get(key) != right.get(key) for key in header):
-        raise ValueError("left/right manifest headers do not match")
+    mismatches = [
+        f"{key} {left.get(key)!r} != {right.get(key)!r}"
+        for key in header
+        if left.get(key) != right.get(key)
+    ]
+    if mismatches:
+        raise ValueError(
+            "left/right manifest headers do not match: " + ", ".join(mismatches)
+        )
     width = int(left["width"])
     height = int(left["height"])
     frame_count = int(left["frameCount"])

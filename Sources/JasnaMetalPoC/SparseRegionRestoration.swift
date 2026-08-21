@@ -49,6 +49,47 @@ extension SideBySideRestoration {
         let frames: [[Float16]]
         let gpuMilliseconds: Double
         let wallMilliseconds: Double
+        let inputPackingMilliseconds: Double
+        let graphExecutionMilliseconds: Double
+        let outputSplittingMilliseconds: Double
+
+        init(
+            prepared: PreparedRegionRestoration,
+            frames: [[Float16]],
+            gpuMilliseconds: Double,
+            wallMilliseconds: Double,
+            inputPackingMilliseconds: Double = 0,
+            graphExecutionMilliseconds: Double? = nil,
+            outputSplittingMilliseconds: Double = 0
+        ) {
+            self.prepared = prepared
+            self.frames = frames
+            self.gpuMilliseconds = gpuMilliseconds
+            self.wallMilliseconds = wallMilliseconds
+            self.inputPackingMilliseconds = inputPackingMilliseconds
+            self.graphExecutionMilliseconds = graphExecutionMilliseconds ?? wallMilliseconds
+            self.outputSplittingMilliseconds = outputSplittingMilliseconds
+        }
+    }
+
+    static func batchOptimizedRegions(
+        _ regions: [MosaicRegion],
+        windowStartFrame: Int,
+        outputCount: Int,
+        batch2Enabled: Bool
+    ) -> [MosaicRegion] {
+        guard batch2Enabled, regions.count > 2 else { return regions }
+        return regions.enumerated().sorted { left, right in
+            func modelFrameCount(_ region: MosaicRegion) -> Int {
+                let localStart = max(0, region.startFrame - windowStartFrame)
+                let localEnd = min(outputCount, region.endFrame - windowStartFrame)
+                return max(3, localEnd - localStart)
+            }
+            let leftFrames = modelFrameCount(left.element)
+            let rightFrames = modelFrameCount(right.element)
+            if leftFrames != rightFrames { return leftFrames < rightFrames }
+            return left.offset < right.offset
+        }.map(\.element)
     }
 
     final class RegionRestorationBatch: @unchecked Sendable {
@@ -154,10 +195,21 @@ extension SideBySideRestoration {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
         }
         do {
+            let configuredMemoryLimitMiB = Int(
+                ProcessInfo.processInfo.environment["JASNA_IN_MEMORY_CACHE_LIMIT_MB"] ?? ""
+            ) ?? 512
+            let memoryLimitBytes = max(0, configuredMemoryLimitMiB) * 1_048_576
+            let useInMemoryCache = resumed == nil
+                && ProcessInfo.processInfo.environment["JASNA_IN_MEMORY_CROP_CACHE"] != "0"
+                && cacheBytes <= memoryLimitBytes
+            let inMemoryCache = useInMemoryCache
+                ? try InMemoryRegionFrameCache(
+                    frameCount: outputCount, regionCount: regions.count
+                ) : nil
             let urls = resumed?.urls ?? (0..<outputCount).map {
                 directory.appendingPathComponent("frame-\($0).fp16")
             }
-            var handles = try urls.map { url -> FileHandle in
+            var handles = try useInMemoryCache ? [] : urls.map { url -> FileHandle in
                 if resumed == nil {
                     guard FileManager.default.createFile(atPath: url.path, contents: nil) else {
                         throw DeformConvError.commandFailed("failed creating crop cache: \(url.path)")
@@ -176,6 +228,9 @@ extension SideBySideRestoration {
             var gpuMilliseconds: Double = 0
             var extractionMilliseconds: Double = 0
             var graphWallMilliseconds: Double = 0
+            var inputPackingMilliseconds: Double = 0
+            var graphExecutionMilliseconds: Double = 0
+            var outputSplittingMilliseconds: Double = 0
             var cacheWriteMilliseconds: Double = 0
             var restoredModelFrames = 0
             let configuredCheckpointInterval = Int(
@@ -202,7 +257,8 @@ extension SideBySideRestoration {
                 "Window \(windowIndex + 1)/\(windowCount): restoring "
                     + "\(regions.count) tight mosaic crops; cache "
                     + "\(String(format: "%.2f", Double(cacheBytes) / 1_073_741_824)) GiB; "
-                    + "model batch \(regionBatchSize)"
+                    + "model batch \(regionBatchSize); handoff "
+                    + (useInMemoryCache ? "bounded memory" : "restartable disk")
             )
             var nextRegion = completedRegions
             while nextRegion < regions.count {
@@ -295,10 +351,16 @@ extension SideBySideRestoration {
                                     prepared.activeFrameCount - 1
                                 )
                             ]
-                            try values.withUnsafeBytes { bytes in
-                                try handles[frame].write(contentsOf: Data(bytes))
+                            if let inMemoryCache {
+                                try inMemoryCache.store(
+                                    values, frame: frame, region: prepared.regionIndex
+                                )
+                            } else {
+                                try values.withUnsafeBytes { bytes in
+                                    try handles[frame].write(contentsOf: Data(bytes))
+                                }
                             }
-                        } else {
+                        } else if inMemoryCache == nil {
                             try handles[frame].seek(
                                 toOffset: UInt64((prepared.regionIndex + 1) * tileBytes)
                             )
@@ -306,11 +368,14 @@ extension SideBySideRestoration {
                     }
                     gpuMilliseconds += restored.gpuMilliseconds
                     graphWallMilliseconds += restored.wallMilliseconds
+                    inputPackingMilliseconds += restored.inputPackingMilliseconds
+                    graphExecutionMilliseconds += restored.graphExecutionMilliseconds
+                    outputSplittingMilliseconds += restored.outputSplittingMilliseconds
                     restoredModelFrames += prepared.activeFrameCount
                     let completedCount = prepared.regionIndex + 1
                     let shouldCheckpoint = completedCount == regions.count
                         || completedCount.isMultiple(of: checkpointInterval)
-                    if shouldCheckpoint {
+                    if shouldCheckpoint, inMemoryCache == nil {
                         let completedBytes = UInt64(completedCount * tileBytes)
                         for handle in handles {
                             try handle.truncate(atOffset: completedBytes)
@@ -339,13 +404,20 @@ extension SideBySideRestoration {
                     + "\(String(format: "%.3f", gpuMilliseconds)) ms, cache writes "
                     + "\(String(format: "%.3f", cacheWriteMilliseconds)) ms"
             )
+            report(
+                "Window \(windowIndex + 1)/\(windowCount): graph host phases: input packing "
+                    + "\(String(format: "%.3f", inputPackingMilliseconds)) ms, execution "
+                    + "\(String(format: "%.3f", graphExecutionMilliseconds)) ms, output split "
+                    + "\(String(format: "%.3f", outputSplittingMilliseconds)) ms"
+            )
             for handle in handles { try handle.close() }
             handles.removeAll()
             return WindowResult(
                 cacheDirectory: directory,
                 cacheURLs: urls,
                 gpuMilliseconds: gpuMilliseconds,
-                cacheBytes: cacheBytes
+                cacheBytes: cacheBytes,
+                inMemoryRegionCache: inMemoryCache
             )
         } catch {
             if configuredWorkPath == nil {
@@ -444,7 +516,7 @@ extension SideBySideRestoration {
                   item.inputFrames.allSatisfy({ $0.count == tileElements })
               })
         else { throw DeformConvError.invalidShape }
-        let started = ContinuousClock.now
+        let packingStarted = ContinuousClock.now
         let batchedFrames = try work[0].inputFrames.indices.map { frame in
             let values = work.flatMap { $0.inputFrames[frame] }
             guard values.count == 2 * tileElements else {
@@ -452,6 +524,8 @@ extension SideBySideRestoration {
             }
             return values
         }
+        let packingMilliseconds = elapsedMilliseconds(since: packingStarted)
+        let graphStarted = ContinuousClock.now
         let restored = try restoreTileFrames(
             device: device,
             modelsURL: modelsURL,
@@ -460,20 +534,38 @@ extension SideBySideRestoration {
             maximumFramesPerChunk: batchedFrames.count,
             batch: 2
         )
-        let wallMilliseconds = elapsedMilliseconds(since: started)
-        return try splitBatchedRegionFrames(
+        let graphMilliseconds = elapsedMilliseconds(since: graphStarted)
+        let splittingStarted = ContinuousClock.now
+        let split = try splitBatchedRegionFrames(
             restored.frames,
             work: work,
             gpuMilliseconds: restored.gpuMilliseconds,
-            wallMilliseconds: wallMilliseconds
+            wallMilliseconds: packingMilliseconds + graphMilliseconds,
+            inputPackingMilliseconds: packingMilliseconds,
+            graphExecutionMilliseconds: graphMilliseconds
         )
+        let splittingMilliseconds = elapsedMilliseconds(since: splittingStarted)
+        let perItemSplittingMilliseconds = splittingMilliseconds / Double(split.count)
+        return split.map { item in
+            CompletedRegionRestoration(
+                prepared: item.prepared,
+                frames: item.frames,
+                gpuMilliseconds: item.gpuMilliseconds,
+                wallMilliseconds: item.wallMilliseconds + perItemSplittingMilliseconds,
+                inputPackingMilliseconds: item.inputPackingMilliseconds,
+                graphExecutionMilliseconds: item.graphExecutionMilliseconds,
+                outputSplittingMilliseconds: perItemSplittingMilliseconds
+            )
+        }
     }
 
     static func splitBatchedRegionFrames(
         _ frames: [[Float16]],
         work: [PreparedRegionRestoration],
         gpuMilliseconds: Double,
-        wallMilliseconds: Double
+        wallMilliseconds: Double,
+        inputPackingMilliseconds: Double = 0,
+        graphExecutionMilliseconds: Double? = nil
     ) throws -> [CompletedRegionRestoration] {
         guard work.count == 2,
               frames.count == work[0].inputFrames.count,
@@ -490,7 +582,10 @@ extension SideBySideRestoration {
                 prepared: work[sample],
                 frames: frames.map { Array($0[start..<end]) },
                 gpuMilliseconds: gpuMilliseconds / Double(work.count),
-                wallMilliseconds: wallMilliseconds / Double(work.count)
+                wallMilliseconds: wallMilliseconds / Double(work.count),
+                inputPackingMilliseconds: inputPackingMilliseconds / Double(work.count),
+                graphExecutionMilliseconds: (graphExecutionMilliseconds ?? wallMilliseconds)
+                    / Double(work.count)
             )
         }
     }

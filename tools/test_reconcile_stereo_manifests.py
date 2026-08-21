@@ -33,6 +33,17 @@ def manifest(regions):
 
 
 class StereoManifestReconciliationTests(unittest.TestCase):
+    def test_reports_the_mismatched_header_values(self):
+        left = manifest([])
+        right = manifest([])
+        right["frameCount"] = 9919
+
+        with self.assertRaisesRegex(
+            ValueError,
+            r"frameCount 90 != 9919",
+        ):
+            reconcile_manifests(left, right)
+
     def test_estimates_right_eye_disparity_from_nearby_tracks(self):
         left = [region(30, 60, 1000, 2000), region(60, 90, 1200, 2200)]
         right = [region(30, 60, 920, 1995), region(60, 90, 1120, 2195)]

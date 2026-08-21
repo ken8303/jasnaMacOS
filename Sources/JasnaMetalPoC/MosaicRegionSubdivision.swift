@@ -35,7 +35,7 @@ struct MosaicRegionSubdivisionConfiguration: Equatable, Sendable {
             overlap: max(0, Int(environment["JASNA_LARGE_REGION_OVERLAP"] ?? "") ?? 96),
             splitLimit: max(0, Int(environment["JASNA_LARGE_REGION_SPLIT_LIMIT"] ?? "") ?? 1),
             maximumAxisCrops: min(
-                4, max(2, Int(environment["JASNA_LARGE_REGION_MAX_AXIS_CROPS"] ?? "") ?? 3)
+                4, max(2, Int(environment["JASNA_LARGE_REGION_MAX_AXIS_CROPS"] ?? "") ?? 4)
             ),
             maskGrowthFraction: boundedFraction(
                 environment["JASNA_LARGE_REGION_MASK_GROWTH"], default: 0.05
@@ -62,7 +62,7 @@ struct MosaicRegionSubdivisionConfiguration: Equatable, Sendable {
             ),
             detailCropCount: min(
                 2,
-                max(0, Int(environment["JASNA_LARGE_REGION_DETAIL_CROPS"] ?? "") ?? 1)
+                max(0, Int(environment["JASNA_LARGE_REGION_DETAIL_CROPS"] ?? "") ?? 2)
             )
         )
     }
@@ -503,8 +503,14 @@ enum MosaicRegionSubdivision {
         let detailHeight = min(configuration.detailCropDimension, region.effectiveBlendHeight)
         guard detailWidth > 0, detailHeight > 0 else { return [] }
 
-        let count = configuration.detailCropCount
         let focusWidth = max(1, bounds.right - bounds.left)
+        // One focused crop remains enough for compact regions. Long moving VR
+        // boundaries need a second sample point; otherwise most of the strip is
+        // still reconstructed only by the coarse subdivision grid.
+        let count = min(
+            configuration.detailCropCount,
+            focusWidth > 3 * detailWidth ? 2 : 1
+        )
         let extractionRight = region.x + region.width
         let extractionBottom = region.y + region.height
         return (0..<count).map { detailIndex in

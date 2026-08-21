@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import base64
 import copy
+import gc
 import json
 import math
 import os
@@ -22,7 +23,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--backend", choices=("yolo", "rfdetr"), default="yolo"
     )
+    parser.add_argument(
+        "--rfdetr-variant",
+        choices=("medium", "large"),
+        default="large",
+        help="RF-DETR architecture matching the selected checkpoint",
+    )
     parser.add_argument("--sample-stride", type=float, default=0.1)
+    parser.add_argument(
+        "--crop-eye",
+        choices=("none", "left", "right"),
+        default="none",
+        help="scan one half of a side-by-side source without an intermediate eye video",
+    )
     parser.add_argument(
         "--active-ranges",
         help="optional comma-separated segment-relative start/end seconds",
@@ -77,7 +90,7 @@ def parse_args() -> argparse.Namespace:
         default=128,
         help="square segmentation-mask resolution; power of two from 32 through 256",
     )
-    parser.add_argument("--device", default="auto")
+    parser.add_argument("--device", choices=("auto", "mps", "cpu"), default="auto")
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument(
         "--max-detections",
@@ -337,6 +350,80 @@ def blend_iou(left, right):
     return intersection / union if union > 0 else 0.0
 
 
+def decoded_mask_payload(region, payload):
+    width = region.get("maskWidth")
+    height = region.get("maskHeight")
+    if not width or not height or not payload:
+        return None
+    try:
+        data = base64.b64decode(payload, validate=True)
+    except (ValueError, TypeError):
+        return None
+    if len(data) != width * height:
+        return None
+    return width, height, data
+
+
+def decoded_region_mask(region):
+    return decoded_mask_payload(region, region.get("maskData"))
+
+
+def mask_support_coverage(small, small_mask, large, large_mask, threshold=128):
+    small_width, small_height, small_data = small_mask
+    large_width, large_height, large_data = large_mask
+    active = 0
+    covered = 0
+    sample_step = max(1, min(small_width, small_height) // 32)
+    sample_offset = sample_step // 2
+    for mask_y in range(sample_offset, small_height, sample_step):
+        for mask_x in range(sample_offset, small_width, sample_step):
+            if small_data[mask_y * small_width + mask_x] < threshold:
+                continue
+            active += 1
+            pixel_x = small["x"] + mask_x * max(small["width"] - 1, 0) / max(
+                small_width - 1, 1
+            )
+            pixel_y = small["y"] + mask_y * max(small["height"] - 1, 0) / max(
+                small_height - 1, 1
+            )
+            large_x = round(
+                (pixel_x - large["x"])
+                * max(large_width - 1, 0)
+                / max(large["width"] - 1, 1)
+            )
+            large_y = round(
+                (pixel_y - large["y"])
+                * max(large_height - 1, 0)
+                / max(large["height"] - 1, 1)
+            )
+            if (
+                0 <= large_x < large_width
+                and 0 <= large_y < large_height
+                and large_data[large_y * large_width + large_x] >= threshold
+            ):
+                covered += 1
+    return covered / active if active else None
+
+
+def nested_mask_coverage(small, large, threshold=128):
+    """Measure how much of a small mask is covered by a containing mask.
+
+    ``None`` means rectangle-only legacy suppression remains appropriate. An
+    unmasked outer region blends its complete rectangle, while an unmasked
+    inner region cannot safely be discarded in favour of a masked outer one.
+    """
+    small_mask = decoded_region_mask(small)
+    large_mask = decoded_region_mask(large)
+    if large_mask is None:
+        return None
+    if small_mask is None:
+        return 0.0
+    aggregate_coverage = mask_support_coverage(
+        small, small_mask, large, large_mask, threshold
+    )
+    return aggregate_coverage or 0.0
+
+
 def suppress_nested_regions(regions, coverage=0.8, area_ratio=1.5):
     """Drop duplicate inner crops that would overwrite a larger restoration.
 
@@ -362,6 +449,9 @@ def suppress_nested_regions(regions, coverage=0.8, area_ratio=1.5):
                 and large_area >= area_ratio * small_area
                 and intersection_fraction_of_smaller(small, large) >= coverage
             ):
+                mask_coverage = nested_mask_coverage(small, large)
+                if mask_coverage is not None and mask_coverage < coverage:
+                    continue
                 nested = True
                 break
         if not nested:
@@ -391,12 +481,18 @@ def suppress_duplicate_regions(regions, overlap=0.45):
     )
     kept = []
     for original_index, candidate in ranked:
-        duplicate = any(
-            winner["startFrame"] <= candidate["startFrame"]
-            and winner["endFrame"] >= candidate["endFrame"]
-            and blend_iou(candidate, winner) >= overlap
-            for _, winner in kept
-        )
+        duplicate = False
+        for _, winner in kept:
+            if not (
+                winner["startFrame"] <= candidate["startFrame"]
+                and winner["endFrame"] >= candidate["endFrame"]
+                and blend_iou(candidate, winner) >= overlap
+            ):
+                continue
+            mask_coverage = nested_mask_coverage(candidate, winner)
+            if mask_coverage is None or mask_coverage >= 0.8:
+                duplicate = True
+                break
         if not duplicate:
             kept.append((original_index, candidate))
     return [region for _, region in sorted(kept)]
@@ -531,6 +627,56 @@ def mask_keyframe_box_groups(cluster, start_frame, end_frame, stride_frames):
     return sorted(groups.items())
 
 
+def interpolated_polygon_box(boxes, frame_index):
+    """Move the nearest real polygon onto an interpolated tracked box."""
+    polygon_boxes = [box for box in boxes if has_box_polygons(box)]
+    if not polygon_boxes:
+        return None
+    target = interpolated_box(polygon_boxes, frame_index)
+    source = min(
+        polygon_boxes,
+        key=lambda box: abs(float(box[5]) - frame_index),
+    )
+    source_width = max(float(source[2]) - float(source[0]), 1.0)
+    source_height = max(float(source[3]) - float(source[1]), 1.0)
+    target_width = max(float(target[2]) - float(target[0]), 1.0)
+    target_height = max(float(target[3]) - float(target[1]), 1.0)
+    transformed = []
+    for polygon in box_polygon_groups(source):
+        transformed.append([
+            [
+                float(target[0])
+                + (float(point[0]) - float(source[0])) * target_width / source_width,
+                float(target[1])
+                + (float(point[1]) - float(source[1])) * target_height / source_height,
+            ]
+            for point in polygon
+        ])
+    payload = transformed[0] if len(transformed) == 1 else transformed
+    return tuple(target) + (payload,)
+
+
+def dense_mask_keyframe_box_groups(cluster, start_frame, end_frame, stride_frames):
+    """Create a polygon mask at every output frame along the tracked motion."""
+    sparse_groups = mask_keyframe_box_groups(
+        cluster, start_frame, end_frame, stride_frames
+    )
+    if not sparse_groups:
+        return []
+    exact_by_frame = dict(sparse_groups)
+    polygon_boxes = [box for _, boxes in sparse_groups for box in boxes]
+    groups = []
+    for frame in range(start_frame, end_frame):
+        exact = exact_by_frame.get(frame)
+        if exact:
+            groups.append((frame, exact))
+            continue
+        interpolated = interpolated_polygon_box(polygon_boxes, frame)
+        if interpolated is not None:
+            groups.append((frame, [interpolated]))
+    return groups
+
+
 def segmentation_mask_keyframes(
     cluster,
     rectangle,
@@ -543,7 +689,7 @@ def segmentation_mask_keyframes(
     expansion_fraction,
 ):
     keyframes = []
-    for frame, boxes in mask_keyframe_box_groups(
+    for frame, boxes in dense_mask_keyframe_box_groups(
         cluster, start_frame, end_frame, stride_frames
     ):
         mask = segmentation_alpha_mask(
@@ -631,12 +777,15 @@ def main() -> int:
     capture = cv2.VideoCapture(str(args.input_video))
     if not capture.isOpened():
         raise SystemExit(f"unable to decode video: {args.input_video}")
-    width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+    source_width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
     source_fps = float(capture.get(cv2.CAP_PROP_FPS))
     frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
-    if width <= 0 or height <= 0 or source_fps <= 0 or frame_count <= 0:
+    if source_width <= 0 or height <= 0 or source_fps <= 0 or frame_count <= 0:
         raise SystemExit("video metadata is incomplete")
+    if args.crop_eye != "none" and source_width % 2 != 0:
+        raise SystemExit("side-by-side eye cropping requires an even source width")
+    width = source_width // 2 if args.crop_eye != "none" else source_width
     if abs(source_fps - 30.0) > 0.05:
         raise SystemExit(f"sparse restoration requires a 30 fps eye video, got {source_fps:.3f}")
     capture.release()
@@ -672,9 +821,12 @@ def main() -> int:
         return 0
 
     device = choose_device(torch, args.device)
+    detector_description = args.backend
+    if args.backend == "rfdetr":
+        detector_description += f"/{args.rfdetr_variant}"
     print(
         f"Scanning {width}x{height}, {frame_count} frames at {source_fps:.3f} fps "
-        f"on {device}; {args.backend} detector, {args.decode_mode} decode, "
+        f"on {device}; {detector_description} detector, {args.decode_mode} decode, "
         f"batch {args.batch_size}",
         flush=True,
     )
@@ -684,7 +836,10 @@ def main() -> int:
         model = YOLO(str(args.model), task="segment")
     else:
         model = RFDetrMPSDetector(
-            args.model, device=device, max_select=args.max_detections
+            args.model,
+            device=device,
+            variant=args.rfdetr_variant,
+            max_select=args.max_detections,
         )
     stride_frames = max(1, int(round(args.sample_stride * source_fps)))
     region_frames = max(stride_frames, int(round(args.region_duration * source_fps)))
@@ -707,12 +862,19 @@ def main() -> int:
             if device != "mps":
                 raise
             print("MPS detector failed; retrying the scan on CPU", file=sys.stderr, flush=True)
+            model = None
+            gc.collect()
+            torch.mps.empty_cache()
             device = "cpu"
             if args.backend == "rfdetr":
                 model = RFDetrMPSDetector(
-                    args.model, device=device, max_select=args.max_detections
+                    args.model,
+                    device=device,
+                    variant=args.rfdetr_variant,
+                    max_select=args.max_detections,
                 )
                 return model.predict(frames, score_threshold=confidence)
+            model = YOLO(str(args.model), task="segment")
             source = frames if len(frames) > 1 else frames[0]
             return model.predict(
                 source,
@@ -783,6 +945,10 @@ def main() -> int:
         batch_indices = []
 
         def append_sample(frame, frame_index):
+            if args.crop_eye == "left":
+                frame = frame[:, :width]
+            elif args.crop_eye == "right":
+                frame = frame[:, source_width - width:]
             batch_frames.append(frame)
             batch_indices.append(frame_index)
             if len(batch_frames) >= args.batch_size:

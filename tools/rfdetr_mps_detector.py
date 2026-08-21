@@ -28,7 +28,8 @@ class RFDetrMPSDetector:
         weights_path: Path,
         *,
         device: str,
-        resolution: int = 768,
+        variant: str = "large",
+        resolution: int | None = None,
         max_select: int = 64,
     ) -> None:
         import rfdetr
@@ -36,7 +37,14 @@ class RFDetrMPSDetector:
 
         self._torch = torch
         self.device = torch.device(device)
-        self.resolution = int(resolution)
+        variants = {
+            "medium": (rfdetr.RFDETRSegMedium, 432),
+            "large": (rfdetr.RFDETRSegLarge, 768),
+        }
+        if variant not in variants:
+            raise ValueError(f"unsupported RF-DETR variant: {variant}")
+        wrapper_type, default_resolution = variants[variant]
+        self.resolution = int(resolution or default_resolution)
         self.max_select = int(max_select)
         if self.resolution <= 0 or self.max_select <= 0:
             raise ValueError("resolution and max_select must be positive")
@@ -44,7 +52,7 @@ class RFDetrMPSDetector:
         checkpoint = torch.load(weights_path, map_location="cpu", weights_only=False)
         state = checkpoint["model"]
         num_classes = int(state["class_embed.weight"].shape[0]) - 1
-        wrapper = rfdetr.RFDETRSegLarge(
+        wrapper = wrapper_type(
             num_classes=num_classes,
             resolution=self.resolution,
             pretrain_weights=str(weights_path),

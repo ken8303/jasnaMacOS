@@ -74,6 +74,9 @@ jasna_model_fingerprint() {
   local detector="$2"
   local detector_model
   case "$detector" in
+    rfdetr-v6)
+      detector_model="$root_dir/Models/MosaicDetection/rfdetr-v6.pt"
+      ;;
     rfdetr-vr-v1)
       detector_model="$root_dir/Models/MosaicDetection/rfdetr-vr-v1.pt"
       ;;

@@ -20,6 +20,7 @@ extension SideBySideRestoration {
         private final class RegionFrameCompositeBatch: @unchecked Sendable {
             private let localFrames: [Int]
             private let cacheURLs: [URL]
+            private let inMemoryCache: InMemoryRegionFrameCache?
             private let baseFrames: [CVPixelBuffer]
             private let outputBuffers: [CVPixelBuffer]
             private let dimensions: VideoDimensions
@@ -35,6 +36,7 @@ extension SideBySideRestoration {
             init(
                 localFrames: [Int],
                 cacheURLs: [URL],
+                inMemoryCache: InMemoryRegionFrameCache?,
                 baseFrames: [CVPixelBuffer],
                 outputBuffers: [CVPixelBuffer],
                 dimensions: VideoDimensions,
@@ -46,6 +48,7 @@ extension SideBySideRestoration {
             ) {
                 self.localFrames = localFrames
                 self.cacheURLs = cacheURLs
+                self.inMemoryCache = inMemoryCache
                 self.baseFrames = baseFrames
                 self.outputBuffers = outputBuffers
                 self.dimensions = dimensions
@@ -62,25 +65,34 @@ extension SideBySideRestoration {
                 do {
                     let started = Date()
                     let localFrame = localFrames[index]
-                    let cache = try FileHandle(forReadingFrom: cacheURLs[index])
-                    defer { try? cache.close() }
+                    let cache = try inMemoryCache == nil
+                        ? FileHandle(forReadingFrom: cacheURLs[index]) : nil
+                    defer { try? cache?.close() }
                     var compositeInputs = [MetalMosaicCompositeInput]()
                     compositeInputs.reserveCapacity(regions.count)
                     for (regionIndex, region) in regions.enumerated() {
                         let absoluteFrame = progressStartFrame + localFrame
                         guard region.frameRange.contains(absoluteFrame) else {
-                            try cache.seek(toOffset: UInt64((regionIndex + 1) * tileBytes))
+                            try cache?.seek(toOffset: UInt64((regionIndex + 1) * tileBytes))
                             continue
                         }
-                        guard let data = try cache.read(upToCount: tileBytes),
-                              data.count == tileBytes
-                        else {
-                            throw DeformConvError.commandFailed(
-                                "restored mosaic-crop cache is truncated"
+                        let values: [Float16]
+                        if let inMemoryCache {
+                            values = try inMemoryCache.values(
+                                frame: localFrame, region: regionIndex
                             )
+                        } else {
+                            guard let data = try cache?.read(upToCount: tileBytes),
+                                  data.count == tileBytes
+                            else {
+                                throw DeformConvError.commandFailed(
+                                    "restored mosaic-crop cache is truncated"
+                                )
+                            }
+                            var decoded = [Float16](repeating: 0, count: tileElements)
+                            _ = decoded.withUnsafeMutableBytes { data.copyBytes(to: $0) }
+                            values = decoded
                         }
-                        var values = [Float16](repeating: 0, count: tileElements)
-                        _ = values.withUnsafeMutableBytes { data.copyBytes(to: $0) }
                         let original = projection == .fisheye
                             ? try samplingMaps[regionIndex].extractPlanarRGB(
                                 from: baseFrames[index]
@@ -404,6 +416,7 @@ extension SideBySideRestoration {
 
         func appendRegionCachedFrames(
             cacheURLs: [URL],
+            inMemoryCache: InMemoryRegionFrameCache? = nil,
             attachments: [CFDictionary?],
             startFrame: Int,
             progressStartFrame: Int,
@@ -465,6 +478,7 @@ extension SideBySideRestoration {
                 let batch = RegionFrameCompositeBatch(
                     localFrames: localFrames,
                     cacheURLs: localFrames.map { cacheURLs[$0] },
+                    inMemoryCache: inMemoryCache,
                     baseFrames: localFrames.map { baseFrames[$0] },
                     outputBuffers: outputBuffers,
                     dimensions: plan.dimensions,
@@ -502,6 +516,8 @@ extension SideBySideRestoration {
         func appendStereoRegionCachedFrames(
             leftCacheURLs: [URL],
             rightCacheURLs: [URL],
+            leftInMemoryCache: InMemoryRegionFrameCache? = nil,
+            rightInMemoryCache: InMemoryRegionFrameCache? = nil,
             leftBaseFrames: [CVPixelBuffer],
             rightBaseFrames: [CVPixelBuffer],
             leftRegions: [MosaicRegion],
@@ -543,6 +559,8 @@ extension SideBySideRestoration {
                 let absoluteFrame = absoluteStartFrame + localFrame
                 let leftInputs = try Self.readCompositeInputs(
                     cacheURL: leftCacheURLs[localFrame],
+                    inMemoryCache: leftInMemoryCache,
+                    cacheFrame: localFrame,
                     baseFrame: leftBaseFrames[localFrame],
                     regions: leftRegions,
                     samplingMaps: leftSamplingMaps,
@@ -551,6 +569,8 @@ extension SideBySideRestoration {
                 )
                 let rightInputs = try Self.readCompositeInputs(
                     cacheURL: rightCacheURLs[localFrame],
+                    inMemoryCache: rightInMemoryCache,
+                    cacheFrame: localFrame,
                     baseFrame: rightBaseFrames[localFrame],
                     regions: rightRegions,
                     samplingMaps: rightSamplingMaps,
@@ -666,28 +686,38 @@ extension SideBySideRestoration {
 
         private static func readCompositeInputs(
             cacheURL: URL,
+            inMemoryCache: InMemoryRegionFrameCache?,
+            cacheFrame: Int,
             baseFrame: CVPixelBuffer,
             regions: [MosaicRegion],
             samplingMaps: [MosaicCropSamplingMap],
             absoluteFrame: Int,
             xOffset: Int
         ) throws -> [MetalMosaicCompositeInput] {
-            let cache = try FileHandle(forReadingFrom: cacheURL)
-            defer { try? cache.close() }
+            let cache = try inMemoryCache == nil ? FileHandle(forReadingFrom: cacheURL) : nil
+            defer { try? cache?.close() }
             var result = [MetalMosaicCompositeInput]()
             result.reserveCapacity(regions.count)
             for (index, region) in regions.enumerated() {
                 guard region.frameRange.contains(absoluteFrame) else {
-                    try cache.seek(toOffset: UInt64((index + 1) * tileBytes))
+                    try cache?.seek(toOffset: UInt64((index + 1) * tileBytes))
                     continue
                 }
-                guard let data = try cache.read(upToCount: tileBytes), data.count == tileBytes else {
-                    throw DeformConvError.commandFailed(
-                        "direct SBS mosaic-crop cache is truncated"
-                    )
+                let restored: [Float16]
+                if let inMemoryCache {
+                    restored = try inMemoryCache.values(frame: cacheFrame, region: index)
+                } else {
+                    guard let data = try cache?.read(upToCount: tileBytes),
+                          data.count == tileBytes
+                    else {
+                        throw DeformConvError.commandFailed(
+                            "direct SBS mosaic-crop cache is truncated"
+                        )
+                    }
+                    var decoded = [Float16](repeating: 0, count: tileElements)
+                    _ = decoded.withUnsafeMutableBytes { data.copyBytes(to: $0) }
+                    restored = decoded
                 }
-                var restored = [Float16](repeating: 0, count: tileElements)
-                _ = restored.withUnsafeMutableBytes { data.copyBytes(to: $0) }
                 let original = try samplingMaps[index].extractPlanarRGB(from: baseFrame)
                 result.append(MetalMosaicCompositeInput(
                     region: translated(

@@ -2,11 +2,68 @@ import Foundation
 
 @available(macOS 27.0, *)
 extension SideBySideRestoration {
+    final class InMemoryRegionFrameCache: @unchecked Sendable {
+        let frameCount: Int
+        let regionCount: Int
+        private let frames: [NSMutableData]
+
+        init(frameCount: Int, regionCount: Int) throws {
+            guard frameCount > 0, regionCount >= 0 else {
+                throw DeformConvError.invalidShape
+            }
+            self.frameCount = frameCount
+            self.regionCount = regionCount
+            frames = (0..<frameCount).map { _ in
+                NSMutableData(length: regionCount * tileBytes)!
+            }
+        }
+
+        func store(_ values: [Float16], frame: Int, region: Int) throws {
+            guard frames.indices.contains(frame), region >= 0, region < regionCount,
+                  values.count == tileElements
+            else { throw DeformConvError.invalidShape }
+            values.withUnsafeBytes { source in
+                frames[frame].mutableBytes
+                    .advanced(by: region * tileBytes)
+                    .copyMemory(from: source.baseAddress!, byteCount: tileBytes)
+            }
+        }
+
+        func values(frame: Int, region: Int) throws -> [Float16] {
+            guard frames.indices.contains(frame), region >= 0, region < regionCount else {
+                throw DeformConvError.invalidShape
+            }
+            var result = [Float16](repeating: 0, count: tileElements)
+            result.withUnsafeMutableBytes { destination in
+                destination.baseAddress!.copyMemory(
+                    from: frames[frame].bytes.advanced(by: region * tileBytes),
+                    byteCount: tileBytes
+                )
+            }
+            return result
+        }
+    }
+
     struct WindowResult {
         let cacheDirectory: URL
         let cacheURLs: [URL]
         let gpuMilliseconds: Double
         let cacheBytes: Int
+        let inMemoryRegionCache: InMemoryRegionFrameCache?
+
+        init(
+            cacheDirectory: URL,
+            cacheURLs: [URL],
+            gpuMilliseconds: Double,
+            cacheBytes: Int,
+            inMemoryRegionCache: InMemoryRegionFrameCache? = nil
+        ) {
+            self.cacheDirectory = cacheDirectory
+            self.cacheURLs = cacheURLs
+            self.gpuMilliseconds = gpuMilliseconds
+            self.cacheBytes = cacheBytes
+            self.inMemoryRegionCache = inMemoryRegionCache
+        }
     }
 
     struct ResumableWindowCache {

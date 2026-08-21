@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """Focused tests for sparse mosaic region post-processing."""
 
+import base64
 import unittest
 
 from scan_mosaic_regions import (
     active_frame_intervals,
     box_polygon_groups,
+    choose_device,
     coarse_sample_indices,
     detector_coverage_metrics,
+    dense_mask_keyframe_box_groups,
     has_box_polygons,
     mask_expansion_radius,
     mask_keyframe_box_groups,
@@ -17,6 +20,32 @@ from scan_mosaic_regions import (
     suppress_duplicate_regions,
     suppress_nested_regions,
 )
+
+
+class DeviceSelectionTests(unittest.TestCase):
+    class FakeMPS:
+        def __init__(self, available):
+            self.available = available
+
+        def is_available(self):
+            return self.available
+
+    class FakeBackends:
+        def __init__(self, available):
+            self.mps = DeviceSelectionTests.FakeMPS(available)
+
+    class FakeTorch:
+        def __init__(self, available):
+            self.backends = DeviceSelectionTests.FakeBackends(available)
+
+    def test_auto_prefers_mps_when_available(self):
+        self.assertEqual(choose_device(self.FakeTorch(True), "auto"), "mps")
+
+    def test_auto_uses_cpu_without_mps(self):
+        self.assertEqual(choose_device(self.FakeTorch(False), "auto"), "cpu")
+
+    def test_explicit_cpu_overrides_available_mps(self):
+        self.assertEqual(choose_device(self.FakeTorch(True), "cpu"), "cpu")
 
 
 class AdaptiveScanScheduleTests(unittest.TestCase):
@@ -134,6 +163,30 @@ class MaskKeyframeTests(unittest.TestCase):
 
         self.assertEqual(groups, [(20, cluster)])
 
+    def test_dense_masks_translate_polygon_between_detector_samples(self):
+        left_polygon = [[10.0, 20.0], [30.0, 20.0], [20.0, 40.0]]
+        right_polygon = [[40.0, 20.0], [60.0, 20.0], [50.0, 40.0]]
+        cluster = [
+            (10, 20, 30, 40, 0.8, 0, left_polygon),
+            (40, 20, 60, 40, 0.8, 3, right_polygon),
+        ]
+
+        groups = dense_mask_keyframe_box_groups(cluster, 0, 4, 3)
+
+        self.assertEqual([frame for frame, _ in groups], [0, 1, 2, 3])
+        middle = box_polygon_groups(groups[1][1][0])[0]
+        self.assertAlmostEqual(middle[0][0], 20.0)
+        self.assertAlmostEqual(middle[1][0], 40.0)
+
+    def test_dense_masks_hold_nearest_polygon_through_padding(self):
+        polygon = [[10.0, 20.0], [30.0, 20.0], [20.0, 40.0]]
+        cluster = [(10, 20, 30, 40, 0.8, 5, polygon)]
+
+        groups = dense_mask_keyframe_box_groups(cluster, 8, 11, 3)
+
+        self.assertEqual([frame for frame, _ in groups], [8, 9, 10])
+        self.assertTrue(all(has_box_polygons(boxes[0]) for _, boxes in groups))
+
 
 class MaskSourceBoxesTests(unittest.TestCase):
     def test_uses_nearest_polygon_for_padded_segment(self):
@@ -171,6 +224,18 @@ def region(x, y, width, height, start=0, end=30, confidence=0.9):
     }
 
 
+def with_mask(item, values, width=2, height=2):
+    result = dict(item)
+    result.update(
+        {
+            "maskWidth": width,
+            "maskHeight": height,
+            "maskData": base64.b64encode(bytes(values)).decode("ascii"),
+        }
+    )
+    return result
+
+
 class SuppressNestedRegionsTests(unittest.TestCase):
     def test_removes_inner_crop_that_would_overwrite_large_crop(self):
         large = region(100, 100, 1_300, 1_300)
@@ -178,11 +243,46 @@ class SuppressNestedRegionsTests(unittest.TestCase):
 
         self.assertEqual(suppress_nested_regions([large, inner]), [large])
 
+    def test_removes_inner_crop_when_large_mask_covers_its_mask(self):
+        large = with_mask(region(0, 0, 1_000, 1_000), [255] * 16, 4, 4)
+        inner = with_mask(region(400, 400, 200, 200), [255] * 4)
+
+        self.assertEqual(suppress_nested_regions([large, inner]), [large])
+
+    def test_preserves_inner_subject_outside_large_segmentation_mask(self):
+        large = with_mask(
+            region(0, 0, 1_000, 1_000),
+            [255, 0, 0, 0, 255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            4,
+            4,
+        )
+        inner = with_mask(region(700, 700, 200, 200), [255] * 4)
+
+        self.assertEqual(suppress_nested_regions([large, inner]), [large, inner])
+
+    def test_preserves_unmasked_inner_subject_inside_masked_large_crop(self):
+        large = with_mask(region(0, 0, 1_000, 1_000), [255, 0, 0, 0])
+        inner = region(400, 400, 200, 200)
+
+        self.assertEqual(suppress_nested_regions([large, inner]), [large, inner])
+
     def test_removes_strongly_overlapping_track_for_same_active_time(self):
         winner = region(100, 100, 1_300, 1_300, confidence=0.95)
         duplicate = region(220, 180, 1_300, 1_300, confidence=0.60)
 
         self.assertEqual(suppress_duplicate_regions([duplicate, winner]), [winner])
+
+    def test_preserves_overlapping_track_with_distinct_mask_support(self):
+        first = with_mask(
+            region(100, 100, 1_300, 1_300, confidence=0.95),
+            [255, 0, 255, 0],
+        )
+        second = with_mask(
+            region(100, 100, 1_300, 1_300, confidence=0.60),
+            [0, 255, 0, 255],
+        )
+
+        self.assertEqual(suppress_duplicate_regions([second, first]), [second, first])
 
     def test_preserves_overlapping_track_outside_winner_time_range(self):
         first = region(100, 100, 1_300, 1_300, start=0, end=15, confidence=0.95)
