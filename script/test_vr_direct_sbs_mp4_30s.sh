@@ -23,17 +23,21 @@ case "$2" in
 esac
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VALIDATED_MODELS="${JASNA_MODELS_DIR:-$ROOT_DIR/Models/MetalMLFineTuneMac1000}"
-VALIDATED_BATCH2_MODELS="${JASNA_BATCH2_MODELS_DIR:-${VALIDATED_MODELS%/}Batch2}"
+BASELINE_MODELS="$ROOT_DIR/Models/MetalML"
+BASELINE_BATCH2_MODELS="$ROOT_DIR/Models/MetalMLBatch2"
 
-[[ -d "$VALIDATED_MODELS/feature_extract.mtlpackage" ]] || {
-  echo "error: validated restoration models are unavailable: $VALIDATED_MODELS" >&2
+[[ -d "$BASELINE_MODELS/feature_extract.mtlpackage" ]] || {
+  echo "error: baseline restoration models are unavailable: $BASELINE_MODELS" >&2
   exit 1
 }
-[[ -d "$VALIDATED_BATCH2_MODELS/feature_extract.mtlpackage" ]] || {
-  echo "error: matching batch-2 restoration models are unavailable: $VALIDATED_BATCH2_MODELS" >&2
+[[ -d "$BASELINE_BATCH2_MODELS/feature_extract.mtlpackage" ]] || {
+  echo "error: baseline batch-2 restoration models are unavailable: $BASELINE_BATCH2_MODELS" >&2
   exit 1
 }
+if [[ -n "${JASNA_MODELS_DIR:-}" && "$JASNA_MODELS_DIR" != "$BASELINE_MODELS" ]]; then
+  echo "WARNING: ignoring JASNA_MODELS_DIR for baseline runtime test: $JASNA_MODELS_DIR" >&2
+  echo "Use script/test_vr_finetuned_30s.sh or script/test_vr_restore_ab.sh for candidate weights" >&2
+fi
 
 # One SBS MP4 is decoded once. Detector and restoration crop both eyes in
 # memory; the left/right job paths are only links and metadata namespaces.
@@ -46,9 +50,9 @@ export JASNA_STEREO_SAMPLE_MODE=paired
 export JASNA_DETECTOR=rfdetr-vr-v1
 export JASNA_DETECT_SAMPLE_STRIDE=0.1
 export JASNA_ADAPTIVE_DETECT=0
-export JASNA_MODELS_DIR="$VALIDATED_MODELS"
+export JASNA_MODELS_DIR="$BASELINE_MODELS"
 export JASNA_MODEL_BATCH=2
-export JASNA_BATCH2_MODELS_DIR="$VALIDATED_BATCH2_MODELS"
+export JASNA_BATCH2_MODELS_DIR="$BASELINE_BATCH2_MODELS"
 export JASNA_METAL_WINDOWS_PER_PROCESS="${JASNA_METAL_WINDOWS_PER_PROCESS:-2}"
 export JASNA_IN_MEMORY_CROP_CACHE=1
 export JASNA_IN_MEMORY_CACHE_LIMIT_MB=512
@@ -57,6 +61,7 @@ export JASNA_TEMPORAL_WARMUP_FRAMES=5
 export JASNA_LOG_PEAK_MEMORY=1
 
 echo "Jasna direct-SBS MP4 30-second test"
+echo "Model track: baseline (fine-tuned candidates are test-only)"
 echo "Source/output: MP4; paired RF-DETR: 10 Hz"
 echo "Physical eye videos: disabled; eye crops and area restoration: in memory"
 echo "Models: $JASNA_MODELS_DIR; batch 2: $JASNA_BATCH2_MODELS_DIR"

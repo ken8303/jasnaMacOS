@@ -739,13 +739,15 @@ When the mosaic time ranges are already known, use the manual-range wrapper:
 ```
 
 For rollout, use the preset wrapper instead of assembling environment flags.
-It fixes the visually approved beta-5 profile: the `MetalMLFineTuneMac1000`
-restoration packages, RF-DETR, batch 2 when its matching generated package set
-is present, full mask-hole recovery, five temporal warm-up frames, two Metal
-windows per process, direct/shared SBS output, a bounded 512 MiB crop handoff,
-stereo reconciliation, peak-memory telemetry, and adaptive detection disabled.
-It falls back to batch 1 when those generated packages are unavailable. Its
-optional third argument supplies known mosaic ranges:
+It fixes the validated runtime profile: the baseline `MetalML` restoration
+packages, RF-DETR, batch 2 when `MetalMLBatch2` is present, full mask-hole
+recovery, five temporal warm-up frames, two Metal windows per process,
+direct/shared SBS output, a bounded 512 MiB crop handoff, stereo reconciliation,
+peak-memory telemetry, and adaptive detection disabled. It deliberately ignores
+a pre-existing `JASNA_MODELS_DIR`, keeping fine-tuned weights out of runtime
+sign-off; use the dedicated fine-tuned or restoration-only A/B wrappers for
+candidate models. It falls back to batch 1 when the baseline batch-2 packages
+are unavailable. Its optional third argument supplies known mosaic ranges:
 
 ```sh
 ./script/restore_vr_rollout.sh \
@@ -1515,6 +1517,13 @@ selected batch-2 model directory are included in restoration cache identity, so
 a baseline or differently batched cache cannot be reused for the candidate
 accidentally. Set `JASNA_FINETUNED_MODELS_DIR` to compare a different converted
 candidate, such as `Models/MetalMLFineTuneMac750`.
+
+Fine-tuned packages remain an experimental quality track even after their
+synthetic training gate passes. They are not selected by
+`restore_vr_rollout.sh` or `test_vr_direct_sbs_mp4_30s.sh`. Promotion requires a
+fixed-manifest baseline/candidate A/B, objective quality measurements, and visual
+acceptance on moving-mosaic fixtures; runtime validation is signed off
+separately with the baseline packages.
 
 Once one 30-second test has prepared the SBS source and RF-DETR manifests, use
 the restoration-only harness for subsequent model or crop-geometry A/B runs:

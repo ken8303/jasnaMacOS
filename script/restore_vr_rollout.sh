@@ -10,30 +10,38 @@ usage() {
 [[ $# -ge 2 && $# -le 3 ]] || usage
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VALIDATED_MODELS="${JASNA_MODELS_DIR:-$ROOT_DIR/Models/MetalMLFineTuneMac1000}"
-VALIDATED_BATCH2_MODELS="${JASNA_BATCH2_MODELS_DIR:-${VALIDATED_MODELS%/}Batch2}"
+BASELINE_MODELS="$ROOT_DIR/Models/MetalML"
+BASELINE_BATCH2_MODELS="$ROOT_DIR/Models/MetalMLBatch2"
 
-[[ -d "$VALIDATED_MODELS/feature_extract.mtlpackage" ]] || {
-  echo "error: validated fine-tuned Metal packages are unavailable: $VALIDATED_MODELS" >&2
+[[ -d "$BASELINE_MODELS/feature_extract.mtlpackage" ]] || {
+  echo "error: rollout baseline Metal packages are unavailable: $BASELINE_MODELS" >&2
   exit 1
 }
+if [[ -n "${JASNA_MODELS_DIR:-}" && "$JASNA_MODELS_DIR" != "$BASELINE_MODELS" ]]; then
+  echo "WARNING: ignoring JASNA_MODELS_DIR for baseline rollout: $JASNA_MODELS_DIR" >&2
+  echo "Use script/test_vr_finetuned_30s.sh or script/test_vr_restore_ab.sh for candidate weights" >&2
+fi
 
-# Validated macOS 27 / Xcode 27 beta 5 rollout profile. Expert experiments can
+# Validated macOS 27 rollout profile. Expert experiments can
 # still call restore_vr_sparse_sbs.sh directly with different settings.
-export JASNA_MODELS_DIR="$VALIDATED_MODELS"
+export JASNA_MODELS_DIR="$BASELINE_MODELS"
 export JASNA_METAL_WINDOWS_PER_PROCESS="${JASNA_METAL_WINDOWS_PER_PROCESS:-2}"
-# Prefer the matching fine-tuned batch-2 set after its pixel-identical 8K gate.
-# A checkout without generated batch-2 packages remains usable through batch 1.
+# Prefer the validated baseline batch-2 set. A checkout without generated
+# batch-2 packages remains usable through batch 1.
 if [[ "${JASNA_MODEL_BATCH:-auto}" == "auto" ]]; then
-  if [[ -d "$VALIDATED_BATCH2_MODELS/feature_extract.mtlpackage" ]]; then
+  if [[ -d "$BASELINE_BATCH2_MODELS/feature_extract.mtlpackage" ]]; then
     export JASNA_MODEL_BATCH=2
-    export JASNA_BATCH2_MODELS_DIR="$VALIDATED_BATCH2_MODELS"
+    export JASNA_BATCH2_MODELS_DIR="$BASELINE_BATCH2_MODELS"
   else
     export JASNA_MODEL_BATCH=1
     unset JASNA_BATCH2_MODELS_DIR
   fi
 elif [[ "$JASNA_MODEL_BATCH" == "2" ]]; then
-  export JASNA_BATCH2_MODELS_DIR="$VALIDATED_BATCH2_MODELS"
+  [[ -d "$BASELINE_BATCH2_MODELS/feature_extract.mtlpackage" ]] || {
+    echo "error: rollout baseline batch-2 packages are unavailable: $BASELINE_BATCH2_MODELS" >&2
+    exit 1
+  }
+  export JASNA_BATCH2_MODELS_DIR="$BASELINE_BATCH2_MODELS"
 elif [[ "$JASNA_MODEL_BATCH" == "1" ]]; then
   unset JASNA_BATCH2_MODELS_DIR
 else
@@ -54,6 +62,7 @@ export JASNA_MOSAIC_MASK_RECOVERY_ALL_REGIONS="${JASNA_MOSAIC_MASK_RECOVERY_ALL_
 export JASNA_TEMPORAL_WARMUP_FRAMES="${JASNA_TEMPORAL_WARMUP_FRAMES:-5}"
 
 echo "Jasna macOS 27 rollout profile"
+echo "Model track: baseline (fine-tuned candidates are test-only)"
 echo "Models: $JASNA_MODELS_DIR"
 echo "Detector: $JASNA_DETECTOR on $JASNA_DETECT_DEVICE; model batch: $JASNA_MODEL_BATCH"
 echo "Metal windows/process: $JASNA_METAL_WINDOWS_PER_PROCESS"
