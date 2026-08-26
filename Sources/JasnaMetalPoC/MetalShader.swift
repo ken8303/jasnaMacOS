@@ -1026,8 +1026,9 @@ struct MosaicCompositeParams {
     uint groupX;
     uint groupY;
     uint groupWidth;
-    uint contributesCoverage;
+    uint coverageMode;
     float detailResidualLimit;
+    float maskRecoveryDeltaThreshold;
 };
 
 struct MosaicGroupResolveParams {
@@ -1098,31 +1099,43 @@ kernel void composite_fisheye_mosaic_delta(
     uint pixelY = params.regionY + gid / params.regionWidth;
 
     float4 compositeSample = compositeSamples[gid];
-    float alpha = compositeSample.z * mosaic_sample_mask(
+    float maskAlpha = mosaic_sample_mask(
         mask, params, gid % params.regionWidth, gid / params.regionWidth
     );
-    if (alpha <= 0.0f) return;
     float modelX = compositeSample.x;
     float modelY = compositeSample.y;
 
     uint plane = params.modelSize * params.modelSize;
+    float3 restoredColor;
+    float3 originalColor;
+    for (uint rgbChannel = 0u; rgbChannel < 3u; ++rgbChannel) {
+        uint offset = rgbChannel * plane;
+        restoredColor[rgbChannel] = mosaic_sample_plane(
+            restored, offset, params.modelSize, modelX, modelY
+        );
+        originalColor[rgbChannel] = mosaic_sample_plane(
+            original, offset, params.modelSize, modelX, modelY
+        );
+    }
+    if (params.coverageMode == 3u) {
+        float3 delta = restoredColor - originalColor;
+        float deltaStrength = max(abs(delta.x), max(abs(delta.y), abs(delta.z)));
+        float threshold = params.maskRecoveryDeltaThreshold;
+        float recoveredMask = smoothstep(threshold, threshold * 2.5f, deltaStrength);
+        maskAlpha = max(maskAlpha, recoveredMask);
+    }
+    float alpha = compositeSample.z * maskAlpha;
+    if (alpha <= 0.0f) return;
     uint destination = 4u * (pixelY * params.frameWidth + pixelX);
     for (uint bgraChannel = 0u; bgraChannel < 3u; ++bgraChannel) {
         uint rgbChannel = 2u - bgraChannel;
-        uint offset = rgbChannel * plane;
         float base = float(bgra[destination + bgraChannel]) / 255.0f;
-        float restoredValue = mosaic_sample_plane(
-            restored, offset, params.modelSize, modelX, modelY
-        );
-        float originalValue = mosaic_sample_plane(
-            original, offset, params.modelSize, modelX, modelY
-        );
         float detail = clamp(
-            base - originalValue,
+            base - originalColor[rgbChannel],
             -params.detailResidualLimit,
             params.detailResidualLimit
         );
-        float value = restoredValue + detail;
+        float value = restoredColor[rgbChannel] + detail;
         float restoredByte = clamp(value, 0.0f, 1.0f) * 255.0f;
         float blended = float(bgra[destination + bgraChannel]) * (1.0f - alpha)
             + restoredByte * alpha;
@@ -1146,27 +1159,39 @@ kernel void composite_fisheye_mosaic_delta_texture(
         params.regionY + gid / params.regionWidth
     );
     float4 compositeSample = compositeSamples[gid];
-    float alpha = compositeSample.z * mosaic_sample_mask(
+    float maskAlpha = mosaic_sample_mask(
         mask, params, gid % params.regionWidth, gid / params.regionWidth
     );
-    if (alpha <= 0.0f) return;
 
     float4 color = frame.read(position);
     uint plane = params.modelSize * params.modelSize;
+    float3 restoredColor;
+    float3 originalColor;
     for (uint rgbChannel = 0u; rgbChannel < 3u; ++rgbChannel) {
         uint offset = rgbChannel * plane;
-        float restoredValue = mosaic_sample_plane(
+        restoredColor[rgbChannel] = mosaic_sample_plane(
             restored, offset, params.modelSize, compositeSample.x, compositeSample.y
         );
-        float originalValue = mosaic_sample_plane(
+        originalColor[rgbChannel] = mosaic_sample_plane(
             original, offset, params.modelSize, compositeSample.x, compositeSample.y
         );
+    }
+    if (params.coverageMode == 3u) {
+        float3 delta = restoredColor - originalColor;
+        float deltaStrength = max(abs(delta.x), max(abs(delta.y), abs(delta.z)));
+        float threshold = params.maskRecoveryDeltaThreshold;
+        float recoveredMask = smoothstep(threshold, threshold * 2.5f, deltaStrength);
+        maskAlpha = max(maskAlpha, recoveredMask);
+    }
+    float alpha = compositeSample.z * maskAlpha;
+    if (alpha <= 0.0f) return;
+    for (uint rgbChannel = 0u; rgbChannel < 3u; ++rgbChannel) {
         float detail = clamp(
-            color[rgbChannel] - originalValue,
+            color[rgbChannel] - originalColor[rgbChannel],
             -params.detailResidualLimit,
             params.detailResidualLimit
         );
-        float value = restoredValue + detail;
+        float value = restoredColor[rgbChannel] + detail;
         color[rgbChannel] = mix(color[rgbChannel], clamp(value, 0.0f, 1.0f), alpha);
     }
     frame.write(color, position);
@@ -1201,10 +1226,9 @@ kernel void accumulate_fisheye_mosaic_delta(
     uint pixelX = params.regionX + localX;
     uint pixelY = params.regionY + localY;
     float4 compositeSample = compositeSamples[gid];
-    float alpha = compositeSample.z * mosaic_sample_mask(
-        mask, params, localX, localY
-    );
-    if (alpha <= 0.0f) return;
+    float maskAlpha = mosaic_sample_mask(mask, params, localX, localY);
+    float alpha = compositeSample.z * (params.coverageMode == 2u ? 1.0f : maskAlpha);
+    if (alpha <= 0.0f && params.coverageMode != 3u) return;
     uint plane = params.modelSize * params.modelSize;
     float3 delta;
     float3 restoredColor;
@@ -1217,12 +1241,24 @@ kernel void accumulate_fisheye_mosaic_delta(
             original, offset, params.modelSize, compositeSample.x, compositeSample.y
         );
     }
+    if (params.coverageMode == 3u) {
+        float deltaStrength = max(abs(delta.x), max(abs(delta.y), abs(delta.z)));
+        float threshold = params.maskRecoveryDeltaThreshold;
+        float recoveredMask = smoothstep(threshold, threshold * 2.5f, deltaStrength);
+        alpha = compositeSample.z * max(maskAlpha, recoveredMask);
+    }
+    if (alpha <= 0.0f) return;
     uint destination = (pixelY - params.groupY) * params.groupWidth
         + pixelX - params.groupX;
     accumulator[destination] += float4(delta * alpha, alpha);
     restoredAccumulator[destination] += half4(half3(restoredColor * alpha), half(alpha));
-    if (params.contributesCoverage != 0u) {
+    if (params.coverageMode == 1u || params.coverageMode == 3u) {
         coverage[destination] += alpha;
+    } else if (params.coverageMode == 2u) {
+        // A high-detail crop may fill a hole left by the moving primary mask,
+        // but must not stack opacity and reveal its rectangular footprint.
+        // Its own deep spatial feather bounds this contribution.
+        coverage[destination] = max(coverage[destination], alpha);
     }
 }
 
@@ -1243,9 +1279,8 @@ kernel void resolve_fisheye_mosaic_delta_group_texture(
         params.groupY + gid / params.groupWidth
     );
     float4 color = frame.read(position);
-    // Detail crops refine the normalized delta, but must not raise coverage.
-    // Otherwise their rectangular footprint becomes an opacity step even when
-    // the crop itself is feathered correctly.
+    // Detail crops refine the normalized delta and may fill primary-mask holes
+    // using maximum (rather than additive) feathered coverage.
     float visibleAlpha = min(coverage[gid], 1.0f);
     float3 averageDelta = accumulated.rgb / accumulated.w;
     float3 averageRestored = float3(restoredAccumulator[gid].rgb)

@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+[[ $# -ge 3 && $# -le 4 ]] || {
+  echo "usage: $0 JASNA_SOURCE AUDITED_DATASET OUTPUT_DIRECTORY [TARGET_STEPS]" >&2
+  echo "resume with: JASNA_FINETUNE_RESUME=/path/to/checkpoint.pth $0 ..." >&2
+  exit 2
+}
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export JASNA_FINETUNE_CORRUPTION_PROFILE="${JASNA_FINETUNE_CORRUPTION_PROFILE:-lada-vr-v4}"
+export JASNA_FINETUNE_FRAMES="${JASNA_FINETUNE_FRAMES:-8}"
+export JASNA_FINETUNE_LEARNING_RATE="${JASNA_FINETUNE_LEARNING_RATE:-0.000005}"
+export JASNA_FINETUNE_TEMPORAL_WEIGHT="${JASNA_FINETUNE_TEMPORAL_WEIGHT:-0.15}"
+export JASNA_FINETUNE_BACKGROUND_WEIGHT="${JASNA_FINETUNE_BACKGROUND_WEIGHT:-0.03}"
+export JASNA_FINETUNE_GRADIENT_WEIGHT="${JASNA_FINETUNE_GRADIENT_WEIGHT:-0.25}"
+export JASNA_FINETUNE_EMA_DECAY="${JASNA_FINETUNE_EMA_DECAY:-0.995}"
+export JASNA_FINETUNE_VALIDATE_EVERY="${JASNA_FINETUNE_VALIDATE_EVERY:-25}"
+export JASNA_FINETUNE_SAVE_EVERY="${JASNA_FINETUNE_SAVE_EVERY:-50}"
+if [[ -n "${JASNA_FINETUNE_RESUME:-}" ]]; then
+  export JASNA_FINETUNE_RESET_BASELINE="${JASNA_FINETUNE_RESET_BASELINE:-1}"
+fi
+
+echo "Recovery-focused lada-vr-v4 recipe"
+echo "Larger moving blocks, stronger codec degradation, and masked gradient loss"
+exec "$ROOT_DIR/script/run_finetune_basicvsrpp.sh" "$@"

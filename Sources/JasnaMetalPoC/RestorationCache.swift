@@ -170,10 +170,11 @@ extension SideBySideRestoration {
     static func sparseRegionCacheVariant(
         regions: [MosaicRegion],
         projection: VRMosaicProjection = .raw,
-        restorationIdentity: String = ""
+        restorationIdentity: String = "",
+        temporalWarmupFrames: Int = 0
     ) -> String {
         var hash: UInt64 = 14_695_981_039_346_656_037
-        for byte in "\(projection.rawValue):\(restorationIdentity)".utf8 {
+        for byte in "\(projection.rawValue):\(restorationIdentity):warmup=\(temporalWarmupFrames)".utf8 {
             hash ^= UInt64(byte)
             hash &*= 1_099_511_628_211
         }
@@ -201,11 +202,12 @@ extension SideBySideRestoration {
     static func restorationCacheIdentity(
         sourceURLs: [URL],
         modelsURL: URL,
-        weightsURL: URL
+        weightsURL: URL,
+        additionalModelURLs: [URL] = []
     ) -> String {
         var hash: UInt64 = 14_695_981_039_346_656_037
         let fileManager = FileManager.default
-        let roots = sourceURLs + [modelsURL, weightsURL]
+        let roots = sourceURLs + [modelsURL, weightsURL] + additionalModelURLs
         var entries = [URL]()
         for root in roots {
             entries.append(root.standardizedFileURL)
@@ -233,6 +235,15 @@ extension SideBySideRestoration {
             }
         }
         return String(format: "%016llx", hash)
+    }
+
+    static func configuredAdditionalModelURLs(
+        environment: [String: String]
+    ) -> [URL] {
+        guard let path = environment["JASNA_BATCH2_MODELS_DIR"], !path.isEmpty else {
+            return []
+        }
+        return [URL(fileURLWithPath: path, isDirectory: true)]
     }
 
     static func recoverableTileCount(

@@ -34,8 +34,11 @@ private struct MetalMosaicCompositeParams {
     var groupX: UInt32
     var groupY: UInt32
     var groupWidth: UInt32
-    var contributesCoverage: UInt32
+    /// 0: no coverage, 1: additive masked coverage, 2: feathered detail maximum,
+    /// 3: additive coverage with model-delta mask-hole recovery.
+    var coverageMode: UInt32
     var detailResidualLimit: Float
+    var maskRecoveryDeltaThreshold: Float
 }
 
 private struct MetalMosaicGroupResolveParams {
@@ -71,14 +74,22 @@ final class MetalMosaicCompositor: @unchecked Sendable {
     private let groupResolvePipeline: MTLComputePipelineState
     private let textureCache: CVMetalTextureCache
     private let detailResidualLimit: Float
+    private let maskRecoveryDeltaThreshold: Float
+    private let ordinaryMaskRecoveryEnabled: Bool
     let prefersTextureSurfaces: Bool
     private let textureCacheLock = NSLock()
     private let sampleBufferLock = NSLock()
     private var sampleBuffers = [SampleBufferKey: MTLBuffer]()
 
-    init(device: MTLDevice) throws {
+    init(
+        device: MTLDevice,
+        ordinaryMaskRecoveryEnabled override: Bool? = nil
+    ) throws {
         self.device = device
         detailResidualLimit = MosaicCompositeQuality.detailResidualLimit()
+        maskRecoveryDeltaThreshold = MosaicCompositeQuality.maskRecoveryDeltaThreshold()
+        ordinaryMaskRecoveryEnabled = override
+            ?? MosaicCompositeQuality.ordinaryMaskRecoveryEnabled()
         prefersTextureSurfaces = ProcessInfo.processInfo.environment[
             "JASNA_METAL_TEXTURE_COMPOSITOR"
         ] != "0"
@@ -351,8 +362,9 @@ final class MetalMosaicCompositor: @unchecked Sendable {
                 groupX: 0,
                 groupY: 0,
                 groupWidth: 0,
-                contributesCoverage: 1,
-                detailResidualLimit: detailResidualLimit
+                coverageMode: ordinaryMaskRecoveryEnabled ? 3 : 1,
+                detailResidualLimit: detailResidualLimit,
+                maskRecoveryDeltaThreshold: maskRecoveryDeltaThreshold
             )
             encoder.setBuffer(frameBuffer, offset: 0, index: 0)
             encoder.setBuffer(restoredBuffer, offset: 0, index: 1)
@@ -511,8 +523,9 @@ final class MetalMosaicCompositor: @unchecked Sendable {
                 groupX: 0,
                 groupY: 0,
                 groupWidth: 0,
-                contributesCoverage: 1,
-                detailResidualLimit: detailResidualLimit
+                coverageMode: ordinaryMaskRecoveryEnabled ? 3 : 1,
+                detailResidualLimit: detailResidualLimit,
+                maskRecoveryDeltaThreshold: maskRecoveryDeltaThreshold
             )
             encoder.setBuffer(restoredBuffer, offset: 0, index: 0)
             encoder.setBuffer(originalBuffer, offset: 0, index: 1)
@@ -604,9 +617,10 @@ final class MetalMosaicCompositor: @unchecked Sendable {
                     groupX: UInt32(groupX),
                     groupY: UInt32(groupY),
                     groupWidth: UInt32(groupWidth),
-                    contributesCoverage: input.region.detailBlendFeather == nil
-                        || !hasPrimaryCrop ? 1 : 0,
-                    detailResidualLimit: detailResidualLimit
+                    coverageMode: input.region.detailBlendFeather == nil
+                        ? 3 : (!hasPrimaryCrop ? 1 : 2),
+                    detailResidualLimit: detailResidualLimit,
+                    maskRecoveryDeltaThreshold: maskRecoveryDeltaThreshold
                 )
                 encoder.setBuffer(accumulator, offset: 0, index: 0)
                 encoder.setBuffer(restoredBuffer, offset: 0, index: 1)

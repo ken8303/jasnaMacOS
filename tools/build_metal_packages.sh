@@ -47,6 +47,10 @@ for package in "$COREML_DIR"/*.mlpackage; do
   "$BUILDER" -ml "$package" -o "$METAL_DIR/$name.mtlpackage" --mtargetos macos26.0
 done
 
+if [[ -f "$COREML_DIR/model-family.txt" ]]; then
+  cp "$COREML_DIR/model-family.txt" "$METAL_DIR/model-family.txt"
+fi
+
 if [[ "$found" -eq 0 ]]; then
   echo "No .mlpackage files found in $COREML_DIR" >&2
   exit 1

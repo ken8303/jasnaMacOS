@@ -49,8 +49,19 @@ extension SideBySideRestoration {
         let subdivisionConfiguration = MosaicRegionSubdivisionConfiguration.fromEnvironment(
             ProcessInfo.processInfo.environment
         )
+        let temporalCropConfiguration = MosaicTemporalCropConfiguration.fromEnvironment(
+            ProcessInfo.processInfo.environment
+        )
+        let temporalWarmupConfiguration = TemporalWarmupConfiguration.fromEnvironment(
+            ProcessInfo.processInfo.environment
+        )
         let restorationIdentity = restorationCacheIdentity(
-            sourceURLs: [inputURL], modelsURL: modelsURL, weightsURL: weightsURL
+            sourceURLs: [inputURL],
+            modelsURL: modelsURL,
+            weightsURL: weightsURL,
+            additionalModelURLs: configuredAdditionalModelURLs(
+                environment: ProcessInfo.processInfo.environment
+            )
         )
         let windowFrameCounts = stride(
             from: 0,
@@ -68,12 +79,9 @@ extension SideBySideRestoration {
                 + "VR projection \(projection.rawValue)"
         )
         reportSubdivisionConfiguration(subdivisionConfiguration)
-        let decoder = try await FrameDecoder(
-            inputURL: inputURL,
-            plan: plan,
-            sourceDimensions: inputInfo.dimensions,
-            cropX: 0
-        )
+        reportTemporalCropConfiguration(temporalCropConfiguration)
+        reportTemporalWarmupConfiguration(temporalWarmupConfiguration)
+        var decoder: FrameDecoder?
         let encoderWindowsPerSegment = min(
             windowFrameCounts.count,
             max(
@@ -91,6 +99,8 @@ extension SideBySideRestoration {
         var completedWindows = 0
         var restoredRegionWindows = 0
         var skippedTileWindows = 0
+        var previousFrames = [CVPixelBuffer]()
+        var previousFramesEnd = 0
         var windowIndex = 0
         while windowIndex < windowFrameCounts.count {
             let outputURL = windowsDirectoryURL.appendingPathComponent(
@@ -143,16 +153,45 @@ extension SideBySideRestoration {
                 )
             }
 
+            if decoder == nil {
+                let outputStartFrame = windowIndex * SideBySideVideoPlan.temporalWindowFrames
+                let decoderStartFrame = max(
+                    0, outputStartFrame - temporalWarmupConfiguration.frames
+                )
+                decoder = try await FrameDecoder(
+                    inputURL: inputURL,
+                    plan: plan,
+                    sourceDimensions: inputInfo.dimensions,
+                    cropX: 0,
+                    startOutputIndex: decoderStartFrame
+                )
+                report(
+                    "Single-eye decoder seek: frame \(decoderStartFrame) for first "
+                        + "unfinished window \(windowIndex + 1)"
+                )
+            }
+            guard let activeDecoder = decoder else {
+                throw DeformConvError.commandFailed("single-eye decoder failed to initialize")
+            }
+
             let writer = try RestoredFrameWriter(device: device, outputURL: outputURL, plan: plan)
             var segmentCacheDirectories = [URL]()
             var segmentOutputFrame = 0
             for currentWindowIndex in windowIndex..<segmentEnd {
                 let outputCount = windowFrameCounts[currentWindowIndex]
                 let windowStart = currentWindowIndex * SideBySideVideoPlan.temporalWindowFrames
+                let schedule = TemporalWindowSchedule(
+                    outputStartFrame: windowStart,
+                    outputFrameCount: outputCount,
+                    requestedWarmupFrames: temporalWarmupConfiguration.frames
+                )
                 let frameRange = windowStart..<(windowStart + outputCount)
                 let detectedRegions = manifest.regions(intersecting: frameRange)
+                let temporalCrops = MosaicRegionSubdivision.tightenMovingRegions(
+                    detectedRegions, configuration: temporalCropConfiguration
+                )
                 let subdivision = MosaicRegionSubdivision.expand(
-                    detectedRegions, configuration: subdivisionConfiguration
+                    temporalCrops.regions, configuration: subdivisionConfiguration
                 )
                 let unsortedActiveRegions = fullDetectedRegionBlendEnabled
                     ? subdivision.regions.map { $0.usingFullDetectedRegionBlend() }
@@ -163,12 +202,22 @@ extension SideBySideRestoration {
                     outputCount: outputCount,
                     batch2Enabled: ProcessInfo.processInfo.environment[
                         "JASNA_BATCH2_MODELS_DIR"
-                    ] != nil
+                    ] != nil,
+                    temporalWarmupFrames: schedule.warmupFrameCount
                 )
                 report(
                     "Window \(currentWindowIndex + 1)/\(windowFrameCounts.count): decoding "
                         + "\(outputCount) frames; mosaic regions \(detectedRegions.count), "
                         + "model crops \(activeRegions.count)"
+                )
+                reportModelCropReuseSummary(
+                    modelCropReuseSummary(
+                        regions: activeRegions,
+                        windowStartFrame: windowStart,
+                        outputCount: outputCount,
+                        temporalWarmupFrames: schedule.warmupFrameCount
+                    ),
+                    windowIndex: currentWindowIndex
                 )
                 if subdivision.splitRegionCount > 0 {
                     report(
@@ -177,17 +226,42 @@ extension SideBySideRestoration {
                             + "added \(subdivision.addedModelCropCount) overlapping crop(s)"
                     )
                 }
+                if temporalCrops.movingRegionCount > 0 {
+                    report(
+                        "Window \(currentWindowIndex + 1)/\(windowFrameCounts.count): "
+                            + "motion-tightened \(temporalCrops.movingRegionCount) region(s), "
+                            + "added \(temporalCrops.addedTemporalCropCount) temporal crop(s)"
+                    )
+                }
+                var warmupFrames = [CVPixelBuffer]()
+                warmupFrames.reserveCapacity(schedule.warmupFrameCount)
+                if schedule.warmupFrameCount > 0,
+                   previousFramesEnd == windowStart,
+                   previousFrames.count >= schedule.warmupFrameCount
+                {
+                    warmupFrames.append(
+                        contentsOf: previousFrames.suffix(schedule.warmupFrameCount)
+                    )
+                } else if schedule.warmupFrameCount > 0 {
+                    for absoluteFrame in schedule.decodedStartFrame..<windowStart {
+                        warmupFrames.append(
+                            try await activeDecoder.copyFrame(outputIndex: absoluteFrame)
+                        )
+                    }
+                }
                 var baseFrames = [CVPixelBuffer]()
                 baseFrames.reserveCapacity(outputCount)
                 for localFrame in 0..<outputCount {
                     baseFrames.append(
-                        try await decoder.copyFrame(outputIndex: windowStart + localFrame)
+                        try await activeDecoder.copyFrame(outputIndex: windowStart + localFrame)
                     )
                 }
                 let attachments = baseFrames.map {
                     CVBufferCopyAttachments($0, .shouldPropagate)
                 }
-                var modelFrames = baseFrames
+                previousFrames = Array(baseFrames.suffix(temporalWarmupConfiguration.frames))
+                previousFramesEnd = windowStart + outputCount
+                var modelFrames = warmupFrames + baseFrames
                 while modelFrames.count < 3 {
                     guard let last = modelFrames.last else {
                         throw DeformConvError.invalidShape
@@ -197,7 +271,8 @@ extension SideBySideRestoration {
                 let cacheVariant = sparseRegionCacheVariant(
                     regions: activeRegions,
                     projection: projection,
-                    restorationIdentity: restorationIdentity
+                    restorationIdentity: restorationIdentity,
+                    temporalWarmupFrames: schedule.warmupFrameCount
                 )
                 let samplingMaps = activeRegions.map {
                     MosaicCropSamplingMap(
@@ -212,6 +287,7 @@ extension SideBySideRestoration {
                     plan: plan,
                     regions: activeRegions,
                     decodedFrames: modelFrames,
+                    decodedStartFrame: schedule.decodedStartFrame,
                     outputCount: outputCount,
                     windowIndex: currentWindowIndex,
                     windowCount: windowFrameCounts.count,
@@ -330,10 +406,19 @@ extension SideBySideRestoration {
         let subdivisionConfiguration = MosaicRegionSubdivisionConfiguration.fromEnvironment(
             ProcessInfo.processInfo.environment
         )
+        let temporalCropConfiguration = MosaicTemporalCropConfiguration.fromEnvironment(
+            ProcessInfo.processInfo.environment
+        )
+        let temporalWarmupConfiguration = TemporalWarmupConfiguration.fromEnvironment(
+            ProcessInfo.processInfo.environment
+        )
         let restorationIdentity = restorationCacheIdentity(
             sourceURLs: [leftInputURL, rightInputURL],
             modelsURL: modelsURL,
-            weightsURL: weightsURL
+            weightsURL: weightsURL,
+            additionalModelURLs: configuredAdditionalModelURLs(
+                environment: ProcessInfo.processInfo.environment
+            )
         )
         guard leftManifest.frameCount == rightManifest.frameCount else {
             throw DeformConvError.commandFailed(
@@ -379,19 +464,19 @@ extension SideBySideRestoration {
             inputURL: leftInputURL,
             plan: eyePlan,
             sourceDimensions: leftInfo.dimensions,
-            startOutputIndex: rangeStartFrame
+            startOutputIndex: max(0, rangeStartFrame - temporalWarmupConfiguration.frames)
         ) : nil
         let leftDecoder = sharedSBSInput ? nil : try await FrameDecoder(
             inputURL: leftInputURL,
             plan: eyePlan,
             sourceDimensions: leftInfo.dimensions,
-            startOutputIndex: rangeStartFrame
+            startOutputIndex: max(0, rangeStartFrame - temporalWarmupConfiguration.frames)
         )
         let rightDecoder = sharedSBSInput ? nil : try await FrameDecoder(
             inputURL: rightInputURL,
             plan: eyePlan,
             sourceDimensions: rightInfo.dimensions,
-            startOutputIndex: rangeStartFrame
+            startOutputIndex: max(0, rangeStartFrame - temporalWarmupConfiguration.frames)
         )
         let writer = try RestoredFrameWriter(
             device: device, outputURL: outputURL, plan: stereoPlan
@@ -406,20 +491,36 @@ extension SideBySideRestoration {
             report("Direct SBS source: one shared 8K decode with in-memory eye crops")
         }
         reportSubdivisionConfiguration(subdivisionConfiguration)
+        reportTemporalCropConfiguration(temporalCropConfiguration)
+        reportTemporalWarmupConfiguration(temporalWarmupConfiguration)
+        var previousLeftFrames = [CVPixelBuffer]()
+        var previousRightFrames = [CVPixelBuffer]()
+        var previousFramesEnd = rangeStartFrame
         for windowIndex in windowRange {
             let windowStart = windowIndex * SideBySideVideoPlan.temporalWindowFrames
             let outputCount = min(
                 SideBySideVideoPlan.temporalWindowFrames,
                 leftManifest.frameCount - windowStart
             )
+            let schedule = TemporalWindowSchedule(
+                outputStartFrame: windowStart,
+                outputFrameCount: outputCount,
+                requestedWarmupFrames: temporalWarmupConfiguration.frames
+            )
             let frameRange = windowStart..<(windowStart + outputCount)
             let leftDetectedRegions = leftManifest.regions(intersecting: frameRange)
             let rightDetectedRegions = rightManifest.regions(intersecting: frameRange)
+            let leftTemporalCrops = MosaicRegionSubdivision.tightenMovingRegions(
+                leftDetectedRegions, configuration: temporalCropConfiguration
+            )
+            let rightTemporalCrops = MosaicRegionSubdivision.tightenMovingRegions(
+                rightDetectedRegions, configuration: temporalCropConfiguration
+            )
             let leftSubdivision = MosaicRegionSubdivision.expand(
-                leftDetectedRegions, configuration: subdivisionConfiguration
+                leftTemporalCrops.regions, configuration: subdivisionConfiguration
             )
             let rightSubdivision = MosaicRegionSubdivision.expand(
-                rightDetectedRegions, configuration: subdivisionConfiguration
+                rightTemporalCrops.regions, configuration: subdivisionConfiguration
             )
             let unsortedLeftRegions = fullDetectedRegionBlendEnabled
                 ? leftSubdivision.regions.map { $0.usingFullDetectedRegionBlend() }
@@ -434,19 +535,41 @@ extension SideBySideRestoration {
                 unsortedLeftRegions,
                 windowStartFrame: windowStart,
                 outputCount: outputCount,
-                batch2Enabled: batch2Enabled
+                batch2Enabled: batch2Enabled,
+                temporalWarmupFrames: schedule.warmupFrameCount
             )
             let rightRegions = batchOptimizedRegions(
                 unsortedRightRegions,
                 windowStartFrame: windowStart,
                 outputCount: outputCount,
-                batch2Enabled: batch2Enabled
+                batch2Enabled: batch2Enabled,
+                temporalWarmupFrames: schedule.warmupFrameCount
             )
             report(
                 "Direct SBS window \(windowIndex + 1)/\(windowCount): "
                     + "decoding \(outputCount) frames; left/right regions "
                     + "\(leftDetectedRegions.count)/\(rightDetectedRegions.count), "
                     + "model crops \(leftRegions.count)/\(rightRegions.count)"
+            )
+            reportModelCropReuseSummary(
+                modelCropReuseSummary(
+                    regions: leftRegions,
+                    windowStartFrame: windowStart,
+                    outputCount: outputCount,
+                    temporalWarmupFrames: schedule.warmupFrameCount
+                ),
+                windowIndex: windowIndex,
+                eye: "left"
+            )
+            reportModelCropReuseSummary(
+                modelCropReuseSummary(
+                    regions: rightRegions,
+                    windowStartFrame: windowStart,
+                    outputCount: outputCount,
+                    temporalWarmupFrames: schedule.warmupFrameCount
+                ),
+                windowIndex: windowIndex,
+                eye: "right"
             )
             if leftSubdivision.splitRegionCount + rightSubdivision.splitRegionCount > 0 {
                 report(
@@ -458,33 +581,92 @@ extension SideBySideRestoration {
                         + "\(rightSubdivision.addedModelCropCount)"
                 )
             }
-            var leftFrames = [CVPixelBuffer]()
-            var rightFrames = [CVPixelBuffer]()
-            leftFrames.reserveCapacity(outputCount)
-            rightFrames.reserveCapacity(outputCount)
+            if leftTemporalCrops.movingRegionCount + rightTemporalCrops.movingRegionCount > 0 {
+                report(
+                    "Direct SBS window \(windowIndex + 1)/\(windowCount): motion-tightened "
+                        + "left/right regions \(leftTemporalCrops.movingRegionCount)/"
+                        + "\(rightTemporalCrops.movingRegionCount), added temporal crops "
+                        + "\(leftTemporalCrops.addedTemporalCropCount)/"
+                        + "\(rightTemporalCrops.addedTemporalCropCount)"
+                )
+            }
+            var leftWarmupFrames = [CVPixelBuffer]()
+            var rightWarmupFrames = [CVPixelBuffer]()
+            leftWarmupFrames.reserveCapacity(schedule.warmupFrameCount)
+            rightWarmupFrames.reserveCapacity(schedule.warmupFrameCount)
+            let decodeStarted = ContinuousClock.now
+            if schedule.warmupFrameCount > 0,
+               previousFramesEnd == windowStart,
+               previousLeftFrames.count >= schedule.warmupFrameCount,
+               previousRightFrames.count >= schedule.warmupFrameCount
+            {
+                leftWarmupFrames.append(
+                    contentsOf: previousLeftFrames.suffix(schedule.warmupFrameCount)
+                )
+                rightWarmupFrames.append(
+                    contentsOf: previousRightFrames.suffix(schedule.warmupFrameCount)
+                )
+            } else if schedule.warmupFrameCount > 0 {
+                for absoluteFrame in schedule.decodedStartFrame..<windowStart {
+                    if let sharedDecoder {
+                        let pair = try await sharedDecoder.copyStereoFrames(
+                            outputIndex: absoluteFrame
+                        )
+                        leftWarmupFrames.append(pair.left)
+                        rightWarmupFrames.append(pair.right)
+                    } else {
+                        guard let leftDecoder, let rightDecoder else {
+                            throw DeformConvError.commandFailed(
+                                "direct SBS eye decoders were not initialized"
+                            )
+                        }
+                        leftWarmupFrames.append(
+                            try await leftDecoder.copyFrame(outputIndex: absoluteFrame)
+                        )
+                        rightWarmupFrames.append(
+                            try await rightDecoder.copyFrame(outputIndex: absoluteFrame)
+                        )
+                    }
+                }
+            }
+            var leftOutputFrames = [CVPixelBuffer]()
+            var rightOutputFrames = [CVPixelBuffer]()
+            leftOutputFrames.reserveCapacity(outputCount)
+            rightOutputFrames.reserveCapacity(outputCount)
             for localFrame in 0..<outputCount {
                 if let sharedDecoder {
                     let pair = try await sharedDecoder.copyStereoFrames(
                         outputIndex: windowStart + localFrame
                     )
-                    leftFrames.append(pair.left)
-                    rightFrames.append(pair.right)
+                    leftOutputFrames.append(pair.left)
+                    rightOutputFrames.append(pair.right)
                 } else {
                     guard let leftDecoder, let rightDecoder else {
                         throw DeformConvError.commandFailed(
                             "direct SBS eye decoders were not initialized"
                         )
                     }
-                    leftFrames.append(
+                    leftOutputFrames.append(
                         try await leftDecoder.copyFrame(outputIndex: windowStart + localFrame)
                     )
-                    rightFrames.append(
+                    rightOutputFrames.append(
                         try await rightDecoder.copyFrame(outputIndex: windowStart + localFrame)
                     )
                 }
             }
-            let leftOutputFrames = leftFrames
-            let rightOutputFrames = rightFrames
+            report(
+                "Direct SBS window \(windowIndex + 1)/\(windowCount): decode/split "
+                    + "\(String(format: "%.3f", elapsedMilliseconds(since: decodeStarted))) ms"
+            )
+            previousLeftFrames = Array(
+                leftOutputFrames.suffix(temporalWarmupConfiguration.frames)
+            )
+            previousRightFrames = Array(
+                rightOutputFrames.suffix(temporalWarmupConfiguration.frames)
+            )
+            previousFramesEnd = windowStart + outputCount
+            var leftFrames = leftWarmupFrames + leftOutputFrames
+            var rightFrames = rightWarmupFrames + rightOutputFrames
             while leftFrames.count < 3 {
                 guard let last = leftFrames.last else { throw DeformConvError.invalidShape }
                 leftFrames.append(last)
@@ -514,6 +696,7 @@ extension SideBySideRestoration {
                 plan: eyePlan,
                 regions: leftRegions,
                 decodedFrames: leftFrames,
+                decodedStartFrame: schedule.decodedStartFrame,
                 outputCount: outputCount,
                 windowIndex: windowIndex,
                 windowCount: windowCount,
@@ -522,7 +705,8 @@ extension SideBySideRestoration {
                 cacheVariant: sparseRegionCacheVariant(
                     regions: leftRegions,
                     projection: projection,
-                    restorationIdentity: restorationIdentity
+                    restorationIdentity: restorationIdentity,
+                    temporalWarmupFrames: schedule.warmupFrameCount
                 ),
                 projection: projection,
                 samplingMaps: leftSamplingMaps,
@@ -533,6 +717,7 @@ extension SideBySideRestoration {
                 plan: eyePlan,
                 regions: rightRegions,
                 decodedFrames: rightFrames,
+                decodedStartFrame: schedule.decodedStartFrame,
                 outputCount: outputCount,
                 windowIndex: windowIndex,
                 windowCount: windowCount,
@@ -541,7 +726,8 @@ extension SideBySideRestoration {
                 cacheVariant: sparseRegionCacheVariant(
                     regions: rightRegions,
                     projection: projection,
-                    restorationIdentity: restorationIdentity
+                    restorationIdentity: restorationIdentity,
+                    temporalWarmupFrames: schedule.warmupFrameCount
                 ),
                 projection: projection,
                 samplingMaps: rightSamplingMaps,

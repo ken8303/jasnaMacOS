@@ -18,6 +18,8 @@ enum JasnaCommand: String, CaseIterable, Sendable {
     case metalMLProbe = "--metal-ml-probe"
     case metalMLBenchmark = "--metal-ml-benchmark"
     case metalMLInterop = "--metal-ml-interop"
+    case coreMLComparison = "--core-ml-comparison"
+    case coreMLSPyNet = "--core-ml-spynet"
     case coreAIFeatureExtract = "--core-ai-feature-extract"
     case propagationSmoke = "--propagation-smoke"
     case propagationSuite = "--propagation-suite"

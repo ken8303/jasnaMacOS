@@ -44,6 +44,26 @@ private func fillPixelBuffer(_ pixelBuffer: CVPixelBuffer, color: (UInt8, UInt8,
     ]) == 1)
 }
 
+@Test func mosaicMaskRecoveryThresholdIsBoundedAndConfigurable() {
+    #expect(MosaicCompositeQuality.maskRecoveryDeltaThreshold(environment: [:]) == 0.025)
+    #expect(MosaicCompositeQuality.maskRecoveryDeltaThreshold(environment: [
+        "JASNA_MOSAIC_MASK_RECOVERY_THRESHOLD": "0"
+    ]) == 0.001)
+    #expect(MosaicCompositeQuality.maskRecoveryDeltaThreshold(environment: [
+        "JASNA_MOSAIC_MASK_RECOVERY_THRESHOLD": "2"
+    ]) == 1)
+}
+
+@Test func ordinaryMaskRecoveryIsExplicitlyOptIn() {
+    #expect(!MosaicCompositeQuality.ordinaryMaskRecoveryEnabled(environment: [:]))
+    #expect(MosaicCompositeQuality.ordinaryMaskRecoveryEnabled(environment: [
+        "JASNA_MOSAIC_MASK_RECOVERY_ALL_REGIONS": "1"
+    ]))
+    #expect(!MosaicCompositeQuality.ordinaryMaskRecoveryEnabled(environment: [
+        "JASNA_MOSAIC_MASK_RECOVERY_ALL_REGIONS": "true"
+    ]))
+}
+
 @Test func fisheyeDetailCropFadesInFromItsRectangularEdge() {
     let region = MosaicRegion(
         startFrame: 0,
@@ -221,6 +241,184 @@ private func fillPixelBuffer(_ pixelBuffer: CVPixelBuffer, color: (UInt8, UInt8,
     let detailBlue = try blue(atX: 5, y: 16, in: withDetail)
     #expect(primaryBlue > 0)
     #expect(abs(Int(primaryBlue) - Int(detailBlue)) <= 1)
+}
+
+@available(macOS 27.0, *)
+@Test func groupedDetailCropFillsAFeatheredPrimaryMaskHole() throws {
+    let width = 32
+    let height = 32
+    let base = try makeMetalPixelBuffer(width: width, height: height)
+    let output = try makeMetalPixelBuffer(width: width, height: height)
+    try fillPixelBuffer(base, color: (0, 0, 0, 255))
+    try fillPixelBuffer(output, color: (0, 0, 0, 255))
+
+    let primary = MosaicRegion(
+        startFrame: 0, endFrame: 1, x: 0, y: 0,
+        width: width, height: height, confidence: 1,
+        blendX: 4, blendY: 4, blendWidth: 24, blendHeight: 24,
+        maskWidth: 2, maskHeight: 2,
+        maskData: Data(repeating: 0, count: 4),
+        subdivisionGroup: 2
+    )
+    let detail = MosaicRegion(
+        startFrame: 0, endFrame: 1, x: 0, y: 0,
+        width: width, height: height, confidence: 1,
+        blendX: 4, blendY: 4, blendWidth: 24, blendHeight: 24,
+        maskWidth: 2, maskHeight: 2,
+        maskData: Data(repeating: 0, count: 4),
+        subdivisionGroup: 2,
+        detailBlendFeather: 8
+    )
+    let modelSize = SideBySideVideoPlan.modelTileSize
+    let restored = [Float16](repeating: 0.5, count: 3 * modelSize * modelSize)
+    let original = [Float16](repeating: 0, count: restored.count)
+    func input(_ region: MosaicRegion) -> MetalMosaicCompositeInput {
+        let map = MosaicCropSamplingMap(
+            region: region,
+            eyeWidth: width,
+            eyeHeight: height,
+            projection: .fisheye
+        )
+        return MetalMosaicCompositeInput(
+            region: region,
+            restored: restored,
+            original: original,
+            samples: map.compositeSamples
+        )
+    }
+
+    let compositor = try MetalMosaicCompositor(
+        device: try #require(MTLCreateSystemDefaultDevice())
+    )
+    try compositor.composite(
+        basePixelBuffer: base,
+        outputPixelBuffer: output,
+        dimensions: VideoDimensions(width: width, height: height),
+        inputs: [input(primary), input(detail)]
+    )
+
+    CVPixelBufferLockBaseAddress(output, .readOnly)
+    defer { CVPixelBufferUnlockBaseAddress(output, .readOnly) }
+    let bytes = try #require(CVPixelBufferGetBaseAddress(output))
+        .assumingMemoryBound(to: UInt8.self)
+    let rowBytes = CVPixelBufferGetBytesPerRow(output)
+    let center = bytes[16 * rowBytes + 16 * 4]
+    let edge = bytes[1 * rowBytes + 1 * 4]
+    #expect(center > 100)
+    #expect(edge < center / 2)
+}
+
+@available(macOS 27.0, *)
+@Test func groupedPrimaryCropRecoversStrongModelDeltaOutsideItsMask() throws {
+    let width = 32
+    let height = 32
+    let base = try makeMetalPixelBuffer(width: width, height: height)
+    let output = try makeMetalPixelBuffer(width: width, height: height)
+    try fillPixelBuffer(base, color: (0, 0, 0, 255))
+    try fillPixelBuffer(output, color: (0, 0, 0, 255))
+    let region = MosaicRegion(
+        startFrame: 0, endFrame: 1, x: 0, y: 0,
+        width: width, height: height, confidence: 1,
+        blendX: 4, blendY: 4, blendWidth: 24, blendHeight: 24,
+        maskWidth: 2, maskHeight: 2,
+        maskData: Data(repeating: 0, count: 4),
+        subdivisionGroup: 4
+    )
+    let modelSize = SideBySideVideoPlan.modelTileSize
+    let restored = [Float16](repeating: 0.5, count: 3 * modelSize * modelSize)
+    let original = [Float16](repeating: 0, count: restored.count)
+    let map = MosaicCropSamplingMap(
+        region: region,
+        eyeWidth: width,
+        eyeHeight: height,
+        projection: .fisheye
+    )
+    let compositor = try MetalMosaicCompositor(
+        device: try #require(MTLCreateSystemDefaultDevice())
+    )
+    try compositor.composite(
+        basePixelBuffer: base,
+        outputPixelBuffer: output,
+        dimensions: VideoDimensions(width: width, height: height),
+        inputs: [MetalMosaicCompositeInput(
+            region: region,
+            restored: restored,
+            original: original,
+            samples: map.compositeSamples
+        )]
+    )
+
+    CVPixelBufferLockBaseAddress(output, .readOnly)
+    defer { CVPixelBufferUnlockBaseAddress(output, .readOnly) }
+    let bytes = try #require(CVPixelBufferGetBaseAddress(output))
+        .assumingMemoryBound(to: UInt8.self)
+    let rowBytes = CVPixelBufferGetBytesPerRow(output)
+    let center = bytes[16 * rowBytes + 16 * 4]
+    let edge = bytes[1 * rowBytes + 1 * 4]
+    #expect(center > 100)
+    #expect(edge < center / 2)
+}
+
+@available(macOS 27.0, *)
+@Test func ordinaryCropCanRecoverStrongModelDeltaOutsideItsMask() throws {
+    let width = 32
+    let height = 32
+    let base = try makeMetalPixelBuffer(width: width, height: height)
+    let masked = try makeMetalPixelBuffer(width: width, height: height)
+    let recovered = try makeMetalPixelBuffer(width: width, height: height)
+    try fillPixelBuffer(base, color: (0, 0, 0, 255))
+    try fillPixelBuffer(masked, color: (0, 0, 0, 255))
+    try fillPixelBuffer(recovered, color: (0, 0, 0, 255))
+    let region = MosaicRegion(
+        startFrame: 0, endFrame: 1, x: 0, y: 0,
+        width: width, height: height, confidence: 1,
+        blendX: 4, blendY: 4, blendWidth: 24, blendHeight: 24,
+        maskWidth: 2, maskHeight: 2,
+        maskData: Data(repeating: 0, count: 4)
+    )
+    let modelSize = SideBySideVideoPlan.modelTileSize
+    let restoredValues = [Float16](repeating: 0.5, count: 3 * modelSize * modelSize)
+    let originalValues = [Float16](repeating: 0, count: restoredValues.count)
+    let map = MosaicCropSamplingMap(
+        region: region,
+        eyeWidth: width,
+        eyeHeight: height,
+        projection: .fisheye
+    )
+    let input = MetalMosaicCompositeInput(
+        region: region,
+        restored: restoredValues,
+        original: originalValues,
+        samples: map.compositeSamples
+    )
+    let device = try #require(MTLCreateSystemDefaultDevice())
+    try MetalMosaicCompositor(
+        device: device, ordinaryMaskRecoveryEnabled: false
+    ).composite(
+        basePixelBuffer: base,
+        outputPixelBuffer: masked,
+        dimensions: VideoDimensions(width: width, height: height),
+        inputs: [input]
+    )
+    try MetalMosaicCompositor(
+        device: device, ordinaryMaskRecoveryEnabled: true
+    ).composite(
+        basePixelBuffer: base,
+        outputPixelBuffer: recovered,
+        dimensions: VideoDimensions(width: width, height: height),
+        inputs: [input]
+    )
+
+    func blue(_ pixelBuffer: CVPixelBuffer, x: Int, y: Int) throws -> UInt8 {
+        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+        let bytes = try #require(CVPixelBufferGetBaseAddress(pixelBuffer))
+            .assumingMemoryBound(to: UInt8.self)
+        return bytes[y * CVPixelBufferGetBytesPerRow(pixelBuffer) + x * 4]
+    }
+    #expect(try blue(masked, x: 16, y: 16) == 0)
+    #expect(try blue(recovered, x: 16, y: 16) > 100)
+    #expect(try blue(recovered, x: 1, y: 1) < 64)
 }
 
 @available(macOS 27.0, *)

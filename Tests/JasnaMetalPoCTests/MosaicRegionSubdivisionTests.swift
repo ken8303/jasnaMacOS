@@ -109,8 +109,115 @@ private let subdivisionConfiguration = MosaicRegionSubdivisionConfiguration(
     #expect(defaults.blockResidualGrowthFraction == 0.04)
     #expect(defaults.maskTemporalRadius == 1)
     #expect(defaults.detailCropDimension == 576)
-    #expect(defaults.detailCropCount == 2)
+    #expect(defaults.detailCropCount == 1)
     #expect(disabled == .disabled)
+}
+
+@Test func temporalCropConfigurationIsOptInAndBounded() {
+    #expect(MosaicTemporalCropConfiguration.fromEnvironment([:]) == .disabled)
+    let configured = MosaicTemporalCropConfiguration.fromEnvironment([
+        "JASNA_TEMPORAL_CROP_FRAMES": "10",
+        "JASNA_TEMPORAL_CROP_PADDING": "96",
+        "JASNA_TEMPORAL_CROP_MIN_DIMENSION": "900",
+        "JASNA_TEMPORAL_CROP_MOTION": "0.12",
+    ])
+
+    #expect(configured.chunkFrames == 10)
+    #expect(configured.padding == 96)
+    #expect(configured.minimumDimension == 900)
+    #expect(configured.minimumMotionFraction == 0.12)
+}
+
+@Test func movingTemporalMaskProducesTighterFrameRanges() throws {
+    let maskWidth = 12
+    let maskHeight = 4
+    let keyframes = (0..<30).map { frame in
+        var mask = [UInt8](repeating: 0, count: maskWidth * maskHeight)
+        let x = 1 + frame * 9 / 29
+        mask[1 * maskWidth + x] = 255
+        mask[2 * maskWidth + x] = 255
+        return MosaicMaskKeyframe(frame: frame, maskData: Data(mask))
+    }
+    let region = MosaicRegion(
+        startFrame: 0,
+        endFrame: 30,
+        x: 0,
+        y: 0,
+        width: 1_200,
+        height: 400,
+        confidence: 1,
+        blendX: 0,
+        blendY: 0,
+        blendWidth: 1_200,
+        blendHeight: 400,
+        maskWidth: maskWidth,
+        maskHeight: maskHeight,
+        maskData: keyframes[0].maskData,
+        maskKeyframes: keyframes
+    )
+    let result = MosaicRegionSubdivision.tightenMovingRegions(
+        [region],
+        configuration: MosaicTemporalCropConfiguration(
+            chunkFrames: 10,
+            padding: 50,
+            minimumDimension: 1_024,
+            minimumMotionFraction: 0.08
+        )
+    )
+
+    #expect(result.movingRegionCount == 1)
+    #expect(result.addedTemporalCropCount == 2)
+    #expect(result.regions.map(\.frameRange) == [0..<10, 10..<20, 20..<30])
+    #expect(result.regions.allSatisfy { $0.width < region.width })
+    #expect(result.regions.allSatisfy { $0.maskKeyframes?.count == 10 })
+    #expect(result.regions.allSatisfy { $0.maskData?.count == maskWidth * maskHeight })
+    let manifest = MosaicRegionManifest(
+        version: 1,
+        width: 1_200,
+        height: 400,
+        framesPerSecond: 30,
+        frameCount: 30,
+        regions: result.regions
+    )
+    try manifest.validate()
+}
+
+@Test func stationaryTemporalMaskKeepsOneFullSequence() {
+    let maskWidth = 12
+    let maskHeight = 4
+    var mask = [UInt8](repeating: 0, count: maskWidth * maskHeight)
+    mask[1 * maskWidth + 6] = 255
+    mask[2 * maskWidth + 6] = 255
+    let keyframes = (0..<30).map {
+        MosaicMaskKeyframe(frame: $0, maskData: Data(mask))
+    }
+    let region = MosaicRegion(
+        startFrame: 0, endFrame: 30, x: 0, y: 0,
+        width: 1_200, height: 400, confidence: 1,
+        maskWidth: maskWidth, maskHeight: maskHeight,
+        maskData: Data(mask), maskKeyframes: keyframes
+    )
+    let result = MosaicRegionSubdivision.tightenMovingRegions(
+        [region],
+        configuration: MosaicTemporalCropConfiguration(
+            chunkFrames: 10,
+            padding: 50,
+            minimumDimension: 1_024,
+            minimumMotionFraction: 0.08
+        )
+    )
+
+    #expect(result.regions == [region])
+    #expect(result.movingRegionCount == 0)
+    #expect(result.addedTemporalCropCount == 0)
+}
+
+@Test func temporalCropRangesMergeAShortTail() {
+    #expect(
+        MosaicRegionSubdivision.temporalCropRanges(
+            startFrame: 0, endFrame: 22, chunkFrames: 10
+        ) == [0..<10, 10..<22]
+    )
 }
 
 @Test func blockResidualGrowthReachesSquareMaskCorners() throws {

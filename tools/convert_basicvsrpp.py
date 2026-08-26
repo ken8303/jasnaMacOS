@@ -9,6 +9,7 @@ storage on the Metal command timeline.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import sys
 from pathlib import Path
 
@@ -177,6 +178,11 @@ def main() -> None:
     model = load_model(None, str(args.weights), torch.device("cpu"), False)
     generator = model.generator_ema if model.generator_ema is not None else model.generator
     args.output.mkdir(parents=True, exist_ok=True)
+    weights_hash = hashlib.sha256(args.weights.read_bytes()).hexdigest()
+    (args.output / "model-family.txt").write_text(
+        f"jasna-model-family-v1\nweights-sha256={weights_hash}\n",
+        encoding="utf-8",
+    )
     selected = set(args.only)
     minimum_deployment_target = {
         "ios18": ct.target.iOS18,

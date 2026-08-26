@@ -9,6 +9,8 @@ struct MetalMLPipelineInfo {
 struct MetalMLBenchmarkResult {
     let medianMilliseconds: Double
     let minimumMilliseconds: Double
+    let wallMedianMilliseconds: Double
+    let wallMinimumMilliseconds: Double
     let iterations: Int
 }
 
@@ -270,7 +272,8 @@ func benchmarkMetalMLPackage(
           let queue = device.makeMTL4CommandQueue()
     else { throw DeformConvError.metalUnavailable }
 
-    func execute() throws -> Double {
+    func execute() throws -> (gpu: Double, wall: Double) {
+        let wallStart = DispatchTime.now().uptimeNanoseconds
         guard let allocator = device.makeCommandAllocator(),
               let commandBuffer = device.makeCommandBuffer()
         else { throw DeformConvError.metalUnavailable }
@@ -298,19 +301,28 @@ func benchmarkMetalMLPackage(
         semaphore.wait()
         let (milliseconds, error) = result.load()
         if let error { throw error }
-        return milliseconds
+        let wallMilliseconds = Double(
+            DispatchTime.now().uptimeNanoseconds - wallStart
+        ) / 1_000_000
+        return (milliseconds, wallMilliseconds)
     }
 
     _ = try execute()
     _ = try execute()
     var samples = [Double]()
+    var wallSamples = [Double]()
     for _ in 0..<max(iterations, 1) {
-        samples.append(try execute())
+        let sample = try execute()
+        samples.append(sample.gpu)
+        wallSamples.append(sample.wall)
     }
     samples.sort()
+    wallSamples.sort()
     return MetalMLBenchmarkResult(
         medianMilliseconds: samples[samples.count / 2],
         minimumMilliseconds: samples[0],
+        wallMedianMilliseconds: wallSamples[wallSamples.count / 2],
+        wallMinimumMilliseconds: wallSamples[0],
         iterations: samples.count
     )
 }

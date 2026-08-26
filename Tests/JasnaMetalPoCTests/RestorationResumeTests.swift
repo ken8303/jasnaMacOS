@@ -3,6 +3,45 @@ import Testing
 @testable import JasnaMetalPoC
 
 @available(macOS 27.0, *)
+@Test func restorationIdentityIncludesSupplementalBatchModels() throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+        "jasna-model-identity-test-\(UUID().uuidString)", isDirectory: true
+    )
+    let source = directory.appendingPathComponent("source.mov")
+    let models = directory.appendingPathComponent("models", isDirectory: true)
+    let weights = directory.appendingPathComponent("weights", isDirectory: true)
+    let batch2A = directory.appendingPathComponent("batch2-a", isDirectory: true)
+    let batch2B = directory.appendingPathComponent("batch2-b", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    for url in [models, weights, batch2A, batch2B] {
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: false)
+    }
+    try Data("source".utf8).write(to: source)
+    try Data("batch-a".utf8).write(to: batch2A.appendingPathComponent("model.bin"))
+    try Data("batch-b".utf8).write(to: batch2B.appendingPathComponent("model.bin"))
+
+    let identityA = SideBySideRestoration.restorationCacheIdentity(
+        sourceURLs: [source], modelsURL: models, weightsURL: weights,
+        additionalModelURLs: [batch2A]
+    )
+    let identityB = SideBySideRestoration.restorationCacheIdentity(
+        sourceURLs: [source], modelsURL: models, weightsURL: weights,
+        additionalModelURLs: [batch2B]
+    )
+
+    #expect(identityA != identityB)
+    #expect(
+        SideBySideRestoration.configuredAdditionalModelURLs(environment: [:]).isEmpty
+    )
+    #expect(
+        SideBySideRestoration.configuredAdditionalModelURLs(
+            environment: ["JASNA_BATCH2_MODELS_DIR": batch2A.path]
+        ).first?.standardizedFileURL == batch2A.standardizedFileURL
+    )
+}
+
+@available(macOS 27.0, *)
 @Test func restorationResumeUsesOnlyTilesCompleteInEveryFrame() throws {
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
         "jasna-resume-test-\(UUID().uuidString)", isDirectory: true

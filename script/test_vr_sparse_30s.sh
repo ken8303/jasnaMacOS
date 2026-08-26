@@ -10,6 +10,8 @@ usage() {
   echo "          JASNA_METAL_WINDOWS_PER_PROCESS=2 (validated; set 1 minimum memory or 4 experimental fast)" >&2
   echo "          JASNA_GPU_TIMEOUT_RETRIES=2 (fresh-process checkpoint retries)" >&2
   echo "          JASNA_DETECT_DEVICE=auto (MPS with automatic CPU fallback; or force cpu)" >&2
+  echo "          JASNA_STEREO_DETECT=1 (one RF-DETR load/decode for both SBS eyes)" >&2
+  echo "          JASNA_STEREO_SAMPLE_MODE=paired (experimental: alternating)" >&2
   echo "          JASNA_EYE_BITRATE=20000000 JASNA_VR_BITRATE=40000000" >&2
   echo "          JASNA_DIRECT_SBS_OUTPUT=1 (set 0 for lower-memory eye-by-eye output)" >&2
   echo "          JASNA_EYE_JOB_PROCESS_ISOLATION=1 (fresh process per 30-120 second 4K eye job)" >&2
@@ -19,7 +21,9 @@ usage() {
   echo "          JASNA_LARGE_REGION_MAX_BLEND=768 JASNA_LARGE_REGION_OVERLAP=96" >&2
   echo "          JASNA_LARGE_REGION_MASK_GROWTH=0.05 JASNA_LARGE_REGION_MASK_FEATHER=0.025" >&2
   echo "          JASNA_LARGE_REGION_BLOCK_GROWTH=0.04 JASNA_LARGE_REGION_MASK_TEMPORAL_RADIUS=1" >&2
-  echo "          JASNA_LARGE_REGION_DETAIL_CROPS=2 JASNA_LARGE_REGION_DETAIL_DIMENSION=576" >&2
+  echo "          JASNA_LARGE_REGION_DETAIL_CROPS=1 JASNA_LARGE_REGION_DETAIL_DIMENSION=576" >&2
+  echo "          JASNA_MOSAIC_MASK_RECOVERY_ALL_REGIONS=0 (experimental: 1)" >&2
+  echo "          JASNA_TEMPORAL_WARMUP_FRAMES=5 (set 0 to disable)" >&2
   exit 2
 }
 
@@ -35,8 +39,11 @@ EYE_BITRATE="${JASNA_EYE_BITRATE:-20000000}"
 VR_BITRATE="${JASNA_VR_BITRATE:-40000000}"
 FAST_ENCODE="${JASNA_FAST_ENCODE:-1}"
 FAST_SOURCE_COPY="${JASNA_FAST_SOURCE_COPY:-auto}"
+WORK_CONTAINER="${JASNA_WORK_CONTAINER:-mov}"
 DIRECT_SBS_OUTPUT="${JASNA_DIRECT_SBS_OUTPUT:-1}"
 SHARED_SBS_SOURCE="${JASNA_SHARED_SBS_SOURCE:-$DIRECT_SBS_OUTPUT}"
+STEREO_DETECT="${JASNA_STEREO_DETECT:-1}"
+STEREO_SAMPLE_MODE="${JASNA_STEREO_SAMPLE_MODE:-paired}"
 EYE_JOB_PROCESS_ISOLATION="${JASNA_EYE_JOB_PROCESS_ISOLATION:-1}"
 EYE_PAIR_SEGMENTS="${JASNA_EYE_PAIR_SEGMENTS:-0}"
 METAL_WINDOWS_PER_PROCESS="${JASNA_METAL_WINDOWS_PER_PROCESS:-2}"
@@ -52,6 +59,7 @@ fi
 DETECT_CONFIDENCE="${JASNA_DETECT_CONFIDENCE:-$DEFAULT_DETECT_CONFIDENCE}"
 IN_MEMORY_CROP_CACHE="${JASNA_IN_MEMORY_CROP_CACHE:-1}"
 IN_MEMORY_CACHE_LIMIT_MB="${JASNA_IN_MEMORY_CACHE_LIMIT_MB:-512}"
+TEMPORAL_WARMUP_FRAMES="${JASNA_TEMPORAL_WARMUP_FRAMES:-5}"
 MOSAIC_RANGES="${JASNA_MOSAIC_RANGES:-}"
 ALLOW_IMPLEMENTATION_RESUME="${JASNA_ALLOW_IMPLEMENTATION_RESUME:-0}"
 RUN_WALL_STARTED_SECONDS=$SECONDS
@@ -112,6 +120,10 @@ fi
   echo "error: JASNA_FAST_SOURCE_COPY must be auto, 0, or 1" >&2
   exit 1
 }
+[[ "$WORK_CONTAINER" == "mov" || "$WORK_CONTAINER" == "mp4" ]] || {
+  echo "error: JASNA_WORK_CONTAINER must be mov or mp4" >&2
+  exit 1
+}
 [[ "$DIRECT_SBS_OUTPUT" == "0" || "$DIRECT_SBS_OUTPUT" == "1" ]] || {
   echo "error: JASNA_DIRECT_SBS_OUTPUT must be 0 or 1" >&2
   exit 1
@@ -137,10 +149,16 @@ fi
   echo "error: JASNA_DETECT_DEVICE must be auto, mps, or cpu" >&2
   exit 1
 }
+[[ "$TEMPORAL_WARMUP_FRAMES" =~ ^[0-9]+$ ]] \
+  && (( TEMPORAL_WARMUP_FRAMES <= 5 )) || {
+    echo "error: JASNA_TEMPORAL_WARMUP_FRAMES must be an integer from 0 to 5" >&2
+    exit 1
+  }
 export JASNA_DETECT_DEVICE="$DETECT_DEVICE"
 export JASNA_SHARED_SBS_SOURCE="$SHARED_SBS_SOURCE"
 export JASNA_IN_MEMORY_CROP_CACHE="$IN_MEMORY_CROP_CACHE"
 export JASNA_IN_MEMORY_CACHE_LIMIT_MB="$IN_MEMORY_CACHE_LIMIT_MB"
+export JASNA_TEMPORAL_WARMUP_FRAMES="$TEMPORAL_WARMUP_FRAMES"
 [[ "$EYE_JOB_PROCESS_ISOLATION" == "0" || "$EYE_JOB_PROCESS_ISOLATION" == "1" ]] || {
   echo "error: JASNA_EYE_JOB_PROCESS_ISOLATION must be 0 or 1" >&2
   exit 1
@@ -157,6 +175,18 @@ fi
   echo "error: JASNA_ALLOW_IMPLEMENTATION_RESUME must be 0 or 1" >&2
   exit 1
 }
+[[ "$STEREO_DETECT" == "0" || "$STEREO_DETECT" == "1" ]] || {
+  echo "error: JASNA_STEREO_DETECT must be 0 or 1" >&2
+  exit 1
+}
+[[ "$STEREO_SAMPLE_MODE" == "paired" || "$STEREO_SAMPLE_MODE" == "alternating" ]] || {
+  echo "error: JASNA_STEREO_SAMPLE_MODE must be paired or alternating" >&2
+  exit 1
+}
+if [[ "$STEREO_SAMPLE_MODE" == "alternating" && "$STEREO_DETECT" != "1" ]]; then
+  echo "error: alternating stereo sampling requires JASNA_STEREO_DETECT=1" >&2
+  exit 1
+fi
 [[ "$METAL_WINDOWS_PER_PROCESS" =~ ^[0-9]+$ ]] \
   && (( METAL_WINDOWS_PER_PROCESS >= 1 && METAL_WINDOWS_PER_PROCESS <= 30 )) || {
     echo "error: JASNA_METAL_WINDOWS_PER_PROCESS must be an integer from 1 to 30" >&2
@@ -204,8 +234,8 @@ OUTPUT_STEM="${OUTPUT_NAME%.*}"
 WORK_DIR="$OUTPUT_DIR/${OUTPUT_STEM}.${ARTIFACT_TAG}-work"
 SOURCE_DIR="$WORK_DIR/source"
 RUN_CONFIG_PATH="$WORK_DIR/run-config.txt"
-TEST_INPUT="$SOURCE_DIR/test-sbs-30fps.mov"
-TEST_INPUT_TEMP="$SOURCE_DIR/.test-sbs-30fps-writing.mov"
+TEST_INPUT="$SOURCE_DIR/test-sbs-30fps.$WORK_CONTAINER"
+TEST_INPUT_TEMP="$SOURCE_DIR/.test-sbs-30fps-writing.$WORK_CONTAINER"
 TEST_INPUT_DONE="$SOURCE_DIR/test-sbs-30fps.done"
 LEFT_OUTPUT="$WORK_DIR/left-restored.mov"
 RIGHT_OUTPUT="$WORK_DIR/right-restored.mov"
@@ -279,8 +309,11 @@ eye_bitrate=$EYE_BITRATE
 vr_bitrate=$VR_BITRATE
 fast_encode=$FAST_ENCODE
 fast_source_copy=$FAST_SOURCE_COPY
+work_container=$WORK_CONTAINER
 direct_sbs_output=$DIRECT_SBS_OUTPUT
 shared_sbs_source=$SHARED_SBS_SOURCE
+stereo_detect=$STEREO_DETECT
+stereo_sample_mode=$STEREO_SAMPLE_MODE
 in_memory_crop_cache=$IN_MEMORY_CROP_CACHE
 in_memory_cache_limit_mb=$IN_MEMORY_CACHE_LIMIT_MB
 eye_job_process_isolation=$EYE_JOB_PROCESS_ISOLATION
@@ -316,9 +349,16 @@ large_region_mask_growth=${JASNA_LARGE_REGION_MASK_GROWTH:-0.05}
 large_region_mask_feather=${JASNA_LARGE_REGION_MASK_FEATHER:-0.025}
 large_region_block_growth=${JASNA_LARGE_REGION_BLOCK_GROWTH:-0.04}
 large_region_mask_temporal_radius=${JASNA_LARGE_REGION_MASK_TEMPORAL_RADIUS:-1}
-large_region_detail_crops=${JASNA_LARGE_REGION_DETAIL_CROPS:-2}
+large_region_detail_crops=${JASNA_LARGE_REGION_DETAIL_CROPS:-1}
 large_region_detail_dimension=${JASNA_LARGE_REGION_DETAIL_DIMENSION:-576}
+temporal_crop_frames=${JASNA_TEMPORAL_CROP_FRAMES:-0}
+temporal_crop_padding=${JASNA_TEMPORAL_CROP_PADDING:-128}
+temporal_crop_min_dimension=${JASNA_TEMPORAL_CROP_MIN_DIMENSION:-1024}
+temporal_crop_motion=${JASNA_TEMPORAL_CROP_MOTION:-0.08}
 mosaic_detail_residual_limit=${JASNA_MOSAIC_DETAIL_RESIDUAL_LIMIT:-0.03}
+mosaic_mask_recovery_threshold=${JASNA_MOSAIC_MASK_RECOVERY_THRESHOLD:-0.025}
+mosaic_mask_recovery_all_regions=${JASNA_MOSAIC_MASK_RECOVERY_ALL_REGIONS:-0}
+temporal_warmup_frames=$TEMPORAL_WARMUP_FRAMES
 projection=fisheye
 detector=$DETECTOR"
 RUN_CONFIG="$RUN_CONFIG
@@ -407,6 +447,8 @@ echo "Projection:  fisheye"
 echo "Fast encode: $FAST_ENCODE"
 echo "Direct SBS:  $DIRECT_SBS_OUTPUT"
 echo "Shared SBS source: $SHARED_SBS_SOURCE"
+echo "Stereo detector sampling: $STEREO_SAMPLE_MODE"
+echo "SBS working container: $WORK_CONTAINER"
 echo "Crop handoff: $([[ "$IN_MEMORY_CROP_CACHE" == "1" ]] && echo memory-up-to-${IN_MEMORY_CACHE_LIMIT_MB}MiB || echo disk)"
 if [[ "$DIRECT_SBS_OUTPUT" == "0" ]]; then
   echo "Eye workers:  $([[ "$EYE_JOB_PROCESS_ISOLATION" == "1" ]] && echo isolated-${TEST_SEGMENT_SECONDS}s || echo retained-graph)"
@@ -485,10 +527,12 @@ fi
 
 if [[ ! -f "$TEST_INPUT_DONE" ]]; then
   if [[ -e "$TEST_INPUT_TEMP" ]]; then
-    mv "$TEST_INPUT_TEMP" "$SOURCE_DIR/test-sbs.interrupted-$(date '+%Y%m%d-%H%M%S').mov"
+    mv "$TEST_INPUT_TEMP" \
+      "$SOURCE_DIR/test-sbs.interrupted-$(date '+%Y%m%d-%H%M%S').$WORK_CONTAINER"
   fi
   if [[ -e "$TEST_INPUT" ]]; then
-    mv "$TEST_INPUT" "$SOURCE_DIR/test-sbs.previous-$(date '+%Y%m%d-%H%M%S').mov"
+    mv "$TEST_INPUT" \
+      "$SOURCE_DIR/test-sbs.previous-$(date '+%Y%m%d-%H%M%S').$WORK_CONTAINER"
   fi
 
   if [[ "$USE_FAST_SOURCE_COPY" == "1" ]]; then
@@ -1011,6 +1055,45 @@ if [[ "$DIRECT_SBS_OUTPUT" == "1" \
     echo "Shared stereo source preparation complete"
   fi
 fi
+
+if [[ "$STEREO_DETECT" == "1" && "$SHARED_SBS_SOURCE" == "1" \
+  && ( "$DETECTOR" == "rfdetr-vr-v1" || "$DETECTOR" == "rfdetr-v6" ) ]]; then
+  LEFT_DETECT_DIR="$LEFT_EYE_WORK_DIR/restored-sparse-crop-v22-stable-balanced-fisheye-$DETECTOR"
+  RIGHT_DETECT_DIR="$RIGHT_EYE_WORK_DIR/restored-sparse-crop-v22-stable-balanced-fisheye-$DETECTOR"
+  mkdir -p "$LEFT_DETECT_DIR" "$RIGHT_DETECT_DIR"
+  echo "Preparing paired eye manifests with one shared RF-DETR model and SBS decode"
+  for LEFT_SOURCE_SEGMENT in "$LEFT_SOURCE_DIR"/left-*.mov; do
+    [[ -e "$LEFT_SOURCE_SEGMENT" ]] || continue
+    SEGMENT_STEM="$(basename "$LEFT_SOURCE_SEGMENT" .mov)"
+    SEGMENT_INDEX="$((10#${SEGMENT_STEM##*-}))"
+    RIGHT_SOURCE_SEGMENT="$RIGHT_SOURCE_DIR/$(printf 'right-%05d.mov' "$SEGMENT_INDEX")"
+    [[ -e "$RIGHT_SOURCE_SEGMENT" ]] || {
+      echo "error: missing right-eye source segment for $SEGMENT_STEM" >&2
+      exit 1
+    }
+    LEFT_STEREO_MANIFEST="$LEFT_DETECT_DIR/$(printf 'left-%05d-mosaic-regions.json' "$SEGMENT_INDEX")"
+    RIGHT_STEREO_MANIFEST="$RIGHT_DETECT_DIR/$(printf 'right-%05d-mosaic-regions.json' "$SEGMENT_INDEX")"
+    if [[ -s "$LEFT_STEREO_MANIFEST" && -s "$RIGHT_STEREO_MANIFEST" ]]; then
+      echo "Reusing paired mosaic-region manifests for segment $(printf '%05d' "$SEGMENT_INDEX")"
+      continue
+    fi
+    if [[ -n "$MOSAIC_RANGES" ]]; then
+      SEGMENT_DURATION="$(video_duration "$LEFT_SOURCE_SEGMENT")"
+      SEGMENT_OFFSET=$((SEGMENT_INDEX * TEST_SEGMENT_SECONDS))
+      SEGMENT_ACTIVE_RANGES="$(
+        /usr/bin/python3 "$ROOT_DIR/tools/mosaic_time_ranges.py" segment \
+          "$MOSAIC_RANGES_RELATIVE" "$SEGMENT_OFFSET" "$SEGMENT_DURATION"
+      )"
+      JASNA_DETECT_ACTIVE_RANGES="$SEGMENT_ACTIVE_RANGES" \
+        "$ROOT_DIR/script/scan_mosaic_regions.sh" \
+          "$LEFT_SOURCE_SEGMENT" "$LEFT_STEREO_MANIFEST" "$RIGHT_STEREO_MANIFEST"
+    else
+      "$ROOT_DIR/script/scan_mosaic_regions.sh" \
+        "$LEFT_SOURCE_SEGMENT" "$LEFT_STEREO_MANIFEST" "$RIGHT_STEREO_MANIFEST"
+    fi
+  done
+fi
+
 JASNA_SPARSE_BATCH_MODE=prepare \
 JASNA_SPARSE_BATCH_FILE="$SHARED_BATCH_PATH" \
 JASNA_SEGMENT_SECONDS="$TEST_SEGMENT_SECONDS" \

@@ -198,6 +198,7 @@ detect_batch_size=$DETECT_BATCH_SIZE
 detect_decode_mode=$DETECT_DECODE_MODE
 adaptive_detect=${JASNA_ADAPTIVE_DETECT:-0}
 detect_sample_stride=${JASNA_DETECT_SAMPLE_STRIDE:-0.1}
+stereo_sample_mode=${JASNA_STEREO_SAMPLE_MODE:-paired}
 detect_coarse_stride=${JASNA_DETECT_COARSE_STRIDE:-1.0}
 detect_coarse_confidence=${JASNA_DETECT_COARSE_CONFIDENCE:-0.05}
 detect_refine_padding=${JASNA_DETECT_REFINE_PADDING:-1.0}
@@ -218,7 +219,7 @@ large_region_mask_growth=${JASNA_LARGE_REGION_MASK_GROWTH:-0.05}
 large_region_mask_feather=${JASNA_LARGE_REGION_MASK_FEATHER:-0.025}
 large_region_block_growth=${JASNA_LARGE_REGION_BLOCK_GROWTH:-0.04}
 large_region_mask_temporal_radius=${JASNA_LARGE_REGION_MASK_TEMPORAL_RADIUS:-1}
-large_region_detail_crops=${JASNA_LARGE_REGION_DETAIL_CROPS:-2}
+large_region_detail_crops=${JASNA_LARGE_REGION_DETAIL_CROPS:-1}
 large_region_detail_dimension=${JASNA_LARGE_REGION_DETAIL_DIMENSION:-576}
 mosaic_detail_residual_limit=${JASNA_MOSAIC_DETAIL_RESIDUAL_LIMIT:-0.03}
 model_batch=${JASNA_MODEL_BATCH:-1}
@@ -287,7 +288,7 @@ if [[ "$SPARSE_MOSAIC" == "1" ]]; then
   echo "Large split limit: ${JASNA_LARGE_REGION_SPLIT_LIMIT:-1} region(s)/window, max ${JASNA_LARGE_REGION_MAX_AXIS_CROPS:-4}/axis"
   echo "Large crop blend:  normalized Metal delta accumulation"
   echo "Block mask halo:    ${JASNA_LARGE_REGION_BLOCK_GROWTH:-0.04}; temporal radius ${JASNA_LARGE_REGION_MASK_TEMPORAL_RADIUS:-1}"
-  echo "Lower detail crop:  up to ${JASNA_LARGE_REGION_DETAIL_CROPS:-2} at ${JASNA_LARGE_REGION_DETAIL_DIMENSION:-576}px"
+  echo "Lower detail crop:  up to ${JASNA_LARGE_REGION_DETAIL_CROPS:-1} at ${JASNA_LARGE_REGION_DETAIL_DIMENSION:-576}px"
 fi
 
 IFS=, read -r SOURCE_WIDTH SOURCE_HEIGHT < <(

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-[[ $# -eq 2 ]] || {
-  echo "usage: $0 INPUT_30FPS_EYE_VIDEO OUTPUT_MANIFEST.json" >&2
+[[ $# -eq 2 || $# -eq 3 ]] || {
+  echo "usage: $0 INPUT_30FPS_VIDEO OUTPUT_MANIFEST.json [RIGHT_MANIFEST.json]" >&2
   exit 2
 }
 
@@ -39,6 +39,7 @@ DETECT_BATCH_SIZE="${JASNA_DETECT_BATCH_SIZE:-2}"
 DETECT_DEVICE="${JASNA_DETECT_DEVICE:-auto}"
 DETECT_DECODE_MODE="${JASNA_DETECT_DECODE_MODE:-sequential}"
 DETECT_SAMPLE_STRIDE="${JASNA_DETECT_SAMPLE_STRIDE:-0.1}"
+STEREO_SAMPLE_MODE="${JASNA_STEREO_SAMPLE_MODE:-paired}"
 DETECT_COARSE_STRIDE="${JASNA_DETECT_COARSE_STRIDE:-1.0}"
 DETECT_COARSE_CONFIDENCE="${JASNA_DETECT_COARSE_CONFIDENCE:-0.05}"
 DETECT_REFINE_PADDING="${JASNA_DETECT_REFINE_PADDING:-1.0}"
@@ -50,7 +51,13 @@ REGION_NMS_IOU="${JASNA_REGION_NMS_IOU:-0.45}"
 MASK_EXPANSION="${JASNA_MASK_EXPANSION:-0.10}"
 MASK_SIZE="${JASNA_MASK_SIZE:-128}"
 RFDETR_MAX_DETECTIONS="${JASNA_RFDETR_MAX_DETECTIONS:-64}"
-CROP_EYE="${JASNA_DETECT_EYE:-none}"
+if [[ $# -eq 3 ]]; then
+  CROP_EYE=both
+  STEREO_ARGUMENTS=(--stereo-right-manifest "$3")
+else
+  CROP_EYE="${JASNA_DETECT_EYE:-none}"
+  STEREO_ARGUMENTS=()
+fi
 
 [[ "$DETECT_BATCH_SIZE" =~ ^[1-9][0-9]*$ ]] || {
   echo "error: JASNA_DETECT_BATCH_SIZE must be a positive integer" >&2
@@ -69,6 +76,18 @@ CROP_EYE="${JASNA_DETECT_EYE:-none}"
   echo "error: JASNA_ADAPTIVE_DETECT must be 0 or 1" >&2
   exit 1
 }
+[[ "$STEREO_SAMPLE_MODE" == "paired" || "$STEREO_SAMPLE_MODE" == "alternating" ]] || {
+  echo "error: JASNA_STEREO_SAMPLE_MODE must be paired or alternating" >&2
+  exit 1
+}
+if [[ "$STEREO_SAMPLE_MODE" == "alternating" && "$CROP_EYE" != "both" ]]; then
+  echo "error: JASNA_STEREO_SAMPLE_MODE=alternating requires shared stereo detection" >&2
+  exit 1
+fi
+if [[ "$STEREO_SAMPLE_MODE" == "alternating" && "$ADAPTIVE_DETECT" == "1" ]]; then
+  echo "error: alternating stereo sampling cannot be combined with adaptive detection" >&2
+  exit 1
+fi
 for setting in \
   "JASNA_DETECT_SAMPLE_STRIDE:$DETECT_SAMPLE_STRIDE" \
   "JASNA_DETECT_COARSE_STRIDE:$DETECT_COARSE_STRIDE"; do
@@ -121,8 +140,9 @@ done
   echo "error: JASNA_RFDETR_MAX_DETECTIONS must be an integer from 1 through 200" >&2
   exit 1
 }
-[[ "$CROP_EYE" == "none" || "$CROP_EYE" == "left" || "$CROP_EYE" == "right" ]] || {
-  echo "error: JASNA_DETECT_EYE must be none, left, or right" >&2
+[[ "$CROP_EYE" == "none" || "$CROP_EYE" == "left" \
+  || "$CROP_EYE" == "right" || "$CROP_EYE" == "both" ]] || {
+  echo "error: JASNA_DETECT_EYE must be none, left, right, or both" >&2
   exit 1
 }
 
@@ -154,6 +174,8 @@ fi
   --backend "$DETECTOR_BACKEND" \
   --rfdetr-variant "$RFDETR_VARIANT" \
   --crop-eye "$CROP_EYE" \
+  --stereo-sample-mode "$STEREO_SAMPLE_MODE" \
+  "${STEREO_ARGUMENTS[@]}" \
   --device "$DETECT_DEVICE" \
   --batch-size "$DETECT_BATCH_SIZE" \
   --max-detections "$RFDETR_MAX_DETECTIONS" \

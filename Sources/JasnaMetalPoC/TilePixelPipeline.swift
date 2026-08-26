@@ -84,6 +84,14 @@ struct MosaicCropSamplingMap: Sendable {
     let compositeSamples: [MosaicCompositeSample]
     private let samples: [Sample]
 
+    func sourceCoordinate(modelX: Int, modelY: Int) -> (x: Float, y: Float) {
+        guard modelX >= 0, modelX < modelSize, modelY >= 0, modelY < modelSize else {
+            return (0, 0)
+        }
+        let sample = samples[modelY * modelSize + modelX]
+        return (Float(sample.x0) + sample.fx, Float(sample.y0) + sample.fy)
+    }
+
     init(
         region: MosaicRegion,
         eyeWidth: Int,
@@ -432,6 +440,10 @@ struct MosaicRegionFrameAccumulator {
             ? region.y + region.height
             : region.effectiveBlendY + region.effectiveBlendHeight
         let detailResidualLimit = MosaicCompositeQuality.detailResidualLimit()
+        let recoverOrdinaryMaskHoles = projection == .fisheye
+            && region.subdivisionGroup == nil
+            && MosaicCompositeQuality.ordinaryMaskRecoveryEnabled()
+        let maskRecoveryThreshold = MosaicCompositeQuality.maskRecoveryDeltaThreshold()
         for pixelY in startY..<endY {
             for pixelX in startX..<endX {
                 let alpha = projection == .fisheye
@@ -444,10 +456,6 @@ struct MosaicRegionFrameAccumulator {
                         feather: region.recommendedFeather
                     )
                     : region.featherAlpha(x: pixelX, y: pixelY, feather: 12)
-                let maskedAlpha = alpha * region.segmentationMaskAlpha(
-                    x: pixelX, y: pixelY
-                )
-                guard maskedAlpha > 0 else { continue }
                 let model = fisheyeTransform?.modelCoordinate(
                     pixelX: pixelX, pixelY: pixelY
                 ) ?? rawTransform.modelCoordinate(pixelX: pixelX, pixelY: pixelY)
@@ -455,23 +463,51 @@ struct MosaicRegionFrameAccumulator {
                 let baseBlue = Float(bytes[destination]) / 255
                 let baseGreen = Float(bytes[destination + 1]) / 255
                 let baseRed = Float(bytes[destination + 2]) / 255
-                func restored(_ offset: Int, base: Float) -> Float {
-                    let value = Self.bilinearPlane(
+                func sampled(_ offset: Int) -> (restored: Float, original: Float?) {
+                    let restored = Self.bilinearPlane(
                         planarRGB, offset: offset, x: model.x, y: model.y
                     )
-                    guard let originalPlanarRGB else { return value }
-                    let original = Self.bilinearPlane(
+                    guard let originalPlanarRGB else { return (restored, nil) }
+                    return (restored, Self.bilinearPlane(
                         originalPlanarRGB, offset: offset, x: model.x, y: model.y
+                    ))
+                }
+                let redSample = sampled(0)
+                let greenSample = sampled(plane)
+                let blueSample = sampled(2 * plane)
+                var maskAlpha = region.segmentationMaskAlpha(x: pixelX, y: pixelY)
+                if recoverOrdinaryMaskHoles,
+                   let originalRed = redSample.original,
+                   let originalGreen = greenSample.original,
+                   let originalBlue = blueSample.original
+                {
+                    let deltaStrength = max(
+                        abs(redSample.restored - originalRed),
+                        abs(greenSample.restored - originalGreen),
+                        abs(blueSample.restored - originalBlue)
                     )
+                    maskAlpha = max(
+                        maskAlpha,
+                        Self.smoothstep(
+                            edge0: maskRecoveryThreshold,
+                            edge1: maskRecoveryThreshold * 2.5,
+                            value: deltaStrength
+                        )
+                    )
+                }
+                let maskedAlpha = alpha * maskAlpha
+                guard maskedAlpha > 0 else { continue }
+                func restored(_ sample: (restored: Float, original: Float?), base: Float) -> Float {
+                    guard let original = sample.original else { return sample.restored }
                     let detail = min(
                         detailResidualLimit,
                         max(-detailResidualLimit, base - original)
                     )
-                    return value + detail
+                    return sample.restored + detail
                 }
-                let red = restored(0, base: baseRed)
-                let green = restored(plane, base: baseGreen)
-                let blue = restored(2 * plane, base: baseBlue)
+                let red = restored(redSample, base: baseRed)
+                let green = restored(greenSample, base: baseGreen)
+                let blue = restored(blueSample, base: baseBlue)
                 bytes[destination] = Self.blend(
                     base: bytes[destination], restored: blue, alpha: maskedAlpha
                 )
@@ -483,6 +519,12 @@ struct MosaicRegionFrameAccumulator {
                 )
             }
         }
+    }
+
+    private static func smoothstep(edge0: Float, edge1: Float, value: Float) -> Float {
+        guard edge1 > edge0 else { return value >= edge1 ? 1 : 0 }
+        let t = min(1, max(0, (value - edge0) / (edge1 - edge0)))
+        return t * t * (3 - 2 * t)
     }
 
     private static func expandedFeatherAlpha(

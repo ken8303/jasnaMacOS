@@ -224,10 +224,16 @@ import Testing
         projection: .fisheye,
         restorationIdentity: "changed-model-or-source"
     )
+    let warmed = SideBySideRestoration.sparseRegionCacheVariant(
+        regions: regions,
+        projection: .fisheye,
+        temporalWarmupFrames: 5
+    )
 
     #expect(raw != fisheye)
     #expect(fisheye != shiftedRange)
     #expect(fisheye != changedRestoration)
+    #expect(fisheye != warmed)
     #expect(raw.contains("raw"))
     #expect(fisheye.contains("fisheye"))
 }

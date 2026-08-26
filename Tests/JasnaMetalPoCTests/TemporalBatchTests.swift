@@ -11,6 +11,7 @@ import Testing
             regionIndex: index,
             localStart: index,
             activeFrameCount: 3,
+            restoredFrameOffset: 0,
             inputFrames: [[Float16(index)], [Float16(index + 1)], [Float16(index + 2)]],
             context: "test crop \(index)"
         )
@@ -59,6 +60,71 @@ import Testing
     #expect(!breaker.disable())
 }
 
+@Test func retainedProductionGraphCoversNormalAndWarmupWindowsOnly() {
+    func eligible(_ frames: Int) -> Bool {
+        productionGraphReuseEligible(
+            frameCount: frames,
+            warmupCount: 0,
+            measurementCount: 1,
+            collectDiagnostics: false,
+            hasFlowOracle: false,
+            hasStagedPropagation: false,
+            hasStagedRestoration: false
+        )
+    }
+
+    #expect(eligible(30))
+    #expect(eligible(35))
+    #expect(!eligible(29))
+    #expect(!eligible(34))
+    #expect(!eligible(36))
+    #expect(!productionGraphReuseEligible(
+        frameCount: 35,
+        warmupCount: 1,
+        measurementCount: 1,
+        collectDiagnostics: false,
+        hasFlowOracle: false,
+        hasStagedPropagation: false,
+        hasStagedRestoration: false
+    ))
+}
+
+@available(macOS 27.0, *)
+@Test func modelCropReuseSummaryRequiresExactGeometryAndTemporalSchedule() {
+    let regions = [
+        MosaicRegion(
+            startFrame: 0, endFrame: 30,
+            x: 0, y: 0, width: 100, height: 100, confidence: 1
+        ),
+        MosaicRegion(
+            startFrame: 0, endFrame: 30,
+            x: 0, y: 0, width: 100, height: 100, confidence: 0.8,
+            blendX: 10, blendY: 10, blendWidth: 80, blendHeight: 80
+        ),
+        MosaicRegion(
+            startFrame: 0, endFrame: 30,
+            x: 10, y: 10, width: 90, height: 90, confidence: 1
+        ),
+        MosaicRegion(
+            startFrame: 5, endFrame: 30,
+            x: 0, y: 0, width: 50, height: 50, confidence: 1
+        ),
+    ]
+
+    let summary = SideBySideRestoration.modelCropReuseSummary(
+        regions: regions,
+        windowStartFrame: 0,
+        outputCount: 30,
+        temporalWarmupFrames: 0
+    )
+
+    #expect(summary.cropCount == 4)
+    #expect(summary.uniqueExactCropCount == 3)
+    #expect(summary.exactDuplicateCount == 1)
+    #expect(summary.highOverlapPairCount == 2)
+    #expect(summary.containedPairCount == 2)
+}
+
 @available(macOS 27.0, *)
 @Test func malformedBatchOutputThrowsBeforeTensorSlicing() throws {
     let work = [0, 1].map { index in
@@ -66,6 +132,7 @@ import Testing
             regionIndex: index,
             localStart: 0,
             activeFrameCount: 1,
+            restoredFrameOffset: 0,
             inputFrames: [[Float16(index)]],
             context: "malformed crop \(index)"
         )
@@ -103,7 +170,7 @@ import Testing
         batch2Enabled: true
     )
 
-    #expect(ordered.map(\.x) == [3, 1, 0, 2, 4])
+    #expect(ordered.map(\.x) == [0, 2, 3, 1, 4])
     #expect(
         SideBySideRestoration.batchOptimizedRegions(
             regions,
@@ -112,6 +179,31 @@ import Testing
             batch2Enabled: false
         ).map(\.x) == [0, 1, 2, 3, 4]
     )
+}
+
+@available(macOS 27.0, *)
+@Test func batchOptimizedRegionsDoNotSplitAnEvenGroupAfterAnOddGroup() {
+    let ranges = [(0, 10), (0, 20), (0, 20)]
+    let regions = ranges.enumerated().map { index, range in
+        MosaicRegion(
+            startFrame: range.0,
+            endFrame: range.1,
+            x: index,
+            y: 0,
+            width: 256,
+            height: 256,
+            confidence: 1
+        )
+    }
+
+    let ordered = SideBySideRestoration.batchOptimizedRegions(
+        regions,
+        windowStartFrame: 0,
+        outputCount: 30,
+        batch2Enabled: true
+    )
+
+    #expect(ordered.map(\.x) == [1, 2, 0])
 }
 
 @Test func temporalPreparationBatchMatchesIndependentRuns() throws {

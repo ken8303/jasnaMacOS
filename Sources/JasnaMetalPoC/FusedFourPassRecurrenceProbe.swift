@@ -39,21 +39,59 @@ private final class ProductionFusedGraphCache: @unchecked Sendable {
     static let shared = ProductionFusedGraphCache()
 
     private let lock = NSLock()
-    private var runners = [String: ProductionFusedGraphRunner]()
+    private struct Entry {
+        let graphKey: String
+        let runner: ProductionFusedGraphRunner
+    }
+    private var runners = [String: Entry]()
 
     private init() {}
 
-    func runner(for key: String) -> ProductionFusedGraphRunner? {
+    func runner(for key: String, family: String) -> ProductionFusedGraphRunner? {
         lock.lock()
         defer { lock.unlock() }
-        return runners[key]
+        guard let entry = runners[family] else { return nil }
+        guard entry.graphKey == key else {
+            // A 30-frame first window and its 35-frame warm-up successors must
+            // not both remain resident. Evict the old temporal shape before
+            // constructing the replacement to keep graph memory bounded.
+            runners.removeValue(forKey: family)
+            return nil
+        }
+        return entry.runner
     }
 
-    func retain(_ runner: ProductionFusedGraphRunner, for key: String) {
+    func retain(
+        _ runner: ProductionFusedGraphRunner,
+        for key: String,
+        family: String
+    ) {
         lock.lock()
         defer { lock.unlock() }
-        if runners[key] == nil { runners[key] = runner }
+        if runners[family]?.graphKey != key {
+            runners[family] = Entry(graphKey: key, runner: runner)
+        }
     }
+}
+
+func productionGraphReuseEligible(
+    frameCount: Int,
+    warmupCount: Int,
+    measurementCount: Int,
+    collectDiagnostics: Bool,
+    hasFlowOracle: Bool,
+    hasStagedPropagation: Bool,
+    hasStagedRestoration: Bool
+) -> Bool {
+    // Production uses 30 output frames. The quality-preserving temporal warm-up
+    // adds five preceding frames to almost every later window.
+    (frameCount == 30 || frameCount == 35)
+        && warmupCount == 0
+        && measurementCount == 1
+        && !collectDiagnostics
+        && !hasFlowOracle
+        && !hasStagedPropagation
+        && !hasStagedRestoration
 }
 
 @available(macOS 27.0, *)
@@ -117,13 +155,20 @@ func verifyFusedFourPassRecurrence(
     let hasFlowOracle = !backwardFlows.isEmpty || !forwardFlows.isEmpty
     let hasStagedPropagation = !stagedBranchFrames.isEmpty
     let hasStagedRestoration = !stagedRestoredFrames.isEmpty
-    let reusableProductionGraph = frameCount == 30
-        && warmupCount == 0
-        && measurementCount == 1
-        && !collectDiagnostics
-        && !hasFlowOracle
-        && !hasStagedPropagation
-        && !hasStagedRestoration
+    let reusableProductionGraph = ProcessInfo.processInfo.environment[
+        "JASNA_RETAINED_GRAPH"
+    ] != "0" && productionGraphReuseEligible(
+        frameCount: frameCount,
+        warmupCount: warmupCount,
+        measurementCount: measurementCount,
+        collectDiagnostics: collectDiagnostics,
+        hasFlowOracle: hasFlowOracle,
+        hasStagedPropagation: hasStagedPropagation,
+        hasStagedRestoration: hasStagedRestoration
+    )
+    let productionGraphFamily = "\(device.registryID):"
+        + "\(modelsURL.standardizedFileURL.path):"
+        + "\(weightsURL.standardizedFileURL.path):batch\(batch)"
     let productionGraphKey = "\(device.registryID):\(modelsURL.standardizedFileURL.path):"
         + "\(weightsURL.standardizedFileURL.path):\(frameCount):batch\(batch)"
     let branchSpecs: [(String, PropagationDirection)] = [
@@ -157,7 +202,10 @@ func verifyFusedFourPassRecurrence(
     else { throw DeformConvError.invalidShape }
 
     if reusableProductionGraph,
-       let runner = ProductionFusedGraphCache.shared.runner(for: productionGraphKey)
+       let runner = ProductionFusedGraphCache.shared.runner(
+           for: productionGraphKey,
+           family: productionGraphFamily
+       )
     {
         return try runner.restore(inputFrames)
     }
@@ -989,7 +1037,11 @@ func verifyFusedFourPassRecurrence(
                 restoredFrames: restored
             )
         }
-        ProductionFusedGraphCache.shared.retain(runner, for: productionGraphKey)
+        ProductionFusedGraphCache.shared.retain(
+            runner,
+            for: productionGraphKey,
+            family: productionGraphFamily
+        )
     }
     return result
 }

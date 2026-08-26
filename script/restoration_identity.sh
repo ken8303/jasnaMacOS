@@ -72,6 +72,8 @@ jasna_implementation_fingerprint() {
 jasna_model_fingerprint() {
   local root_dir="$1"
   local detector="$2"
+  local models_dir="${JASNA_MODELS_DIR:-$root_dir/Models/MetalML}"
+  local batch2_models_dir="${JASNA_BATCH2_MODELS_DIR:-$root_dir/Models/MetalMLBatch2}"
   local detector_model
   case "$detector" in
     rfdetr-v6)
@@ -92,8 +94,8 @@ jasna_model_fingerprint() {
   {
     printf 'detector=%s\n' "$detector_hash"
     printf 'restoration=%s\n' "$(jasna_metadata_fingerprint \
-      "$root_dir/Models/MetalML" \
-      "$root_dir/Models/MetalMLBatch2" \
+      "$models_dir" \
+      "$batch2_models_dir" \
       "$root_dir/Models/DeformConv")"
   } | jasna_hash_lines
 }

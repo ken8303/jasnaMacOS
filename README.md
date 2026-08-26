@@ -90,6 +90,47 @@ maximum error `3.05e-5`, but streamed execution measured `1.302 ms/frame` and
 specialization plus loading took `369 ms`. Core AI therefore remains parked for
 the rollout path.
 
+A separate direct Core ML microbenchmark compares three representative existing
+`.mlpackage` segments with their Metal ML equivalents without changing the
+restoration runtime:
+
+```sh
+JASNA_COREML_BENCHMARK_ITERATIONS=20 \
+  ./script/build_and_run.sh --core-ml-comparison
+```
+
+On the same M4 and Xcode 27 beta 5, direct Core ML with `.all` and explicit
+CPU+Neural Engine produced identical outputs. A 20-sample confirmation measured
+warm direct Core ML medians of `0.415 ms` for feature extraction, `0.220 ms` for
+the 64×64 SPyNet convolution, and `0.698 ms` for `backbone_backward_1`. The
+equivalent isolated Metal ML wall medians were `0.547`, `0.478`, and `0.907 ms`,
+so direct Core ML was 24%, 54%, and 23% faster at the standalone API boundary.
+Metal ML device-only medians were `0.414`, `0.359`, and `0.758 ms`; its production
+graph avoids most standalone wall overhead by fusing many packages into one
+command buffer. Forced CPU+GPU Core ML was 4–8× slower and changed FP16 outputs
+slightly. The result justifies a bounded interop spike, not a runtime switch:
+every SPyNet level is separated by a custom Metal warp, so the complete six-level
+Core ML/Metal graph must beat the existing fused Metal ML graph before adoption.
+
+Xcode 27 beta 6 (`27A5252f`) preserved the isolated result: direct Core ML
+medians were `0.414`, `0.217`, and `0.735 ms`, while isolated Metal ML wall
+medians were `0.533`, `0.476`, and `0.892 ms`. The required complete-graph test
+therefore keeps all six Core ML models loaded, shares FP16 buffers with the real
+Metal pyramid/warp/add kernels, and measures every synchronization boundary:
+
+```sh
+JASNA_COREML_SPYNET_ITERATIONS=7 \
+  ./script/build_and_run.sh --core-ml-spynet
+```
+
+The complete bidirectional graph rejected the Core ML path. Its seven-sample
+median was `4.303 ms` versus `3.520 ms` wall time and `2.309 ms` device time for
+the fused Metal ML graph, making Core ML 22.2% slower after interop. Correctness
+still passed: repeat error was zero, maximum difference from Metal ML was
+`0.02539`, and maximum difference from the PyTorch oracle was `0.03711`. Core ML
+therefore remains a benchmark-only experiment on beta 6; production SPyNet stays
+on the single Metal timeline.
+
 Run a complete first propagation body in one Metal 4 command buffer, using the
 real offset and backbone packages plus the checkpoint DCNv2 weights:
 
@@ -280,6 +321,16 @@ when the moving mask boundary spans more than three detail-crop widths. This
 targets the 3,000–4,000-pixel-wide VR strips that still produced dark block
 smears after their rectangular blend outline had been removed. The extra model
 work is limited to the single largest oversized region selected in each window.
+Post-subdivision crop telemetry reports exact reusable geometry, high-overlap
+pairs, and contained detail passes without changing scheduling. On the
+three-second beta 6 fixture all 71 crops were geometrically unique, confirming
+that exact-result reuse would save no inference. The contained pairs were the
+intentional high-resolution detail passes. An opt-in
+`JASNA_LARGE_REGION_DETAIL_CROPS=1` A/B reduced crops from 71 to 65, model-stage
+wall time from about 32.1 to 30.0 seconds, and end-to-end time from 47 to 45
+seconds. Visual validation accepted the moving-boundary quality, so one detail
+crop is now the rollout default. Set `JASNA_LARGE_REGION_DETAIL_CROPS=2` to
+restore the wider two-detail-crop coverage for unusually difficult boundaries.
 The v17 profile fills the temporal gaps between detector samples with a polygon
 mask at every output frame. Each generated mask follows the interpolated tracked
 box, translating and scaling the nearest real segmentation polygon instead of
@@ -311,6 +362,24 @@ gain, so v22 restores the single-region limit and records the cleaner v19
 behaviour as the stable profile. The remaining prominent pattern is a recovery
 limit of the current BasicVSR++ weights; stronger blending and additional crops
 make the area less clean without reconstructing the hidden detail.
+
+For fast-moving subjects whose one-second tracked union grows much larger than
+the mosaic itself, an experimental temporal-mask-guided crop mode can preserve
+more model-input detail without globally raising the subdivision limit:
+
+```sh
+JASNA_TEMPORAL_CROP_FRAMES=10 JASNA_TEMPORAL_CROP_PADDING=128 \
+./script/test_vr_finetuned_30s.sh input.mp4 motion-tight-test.mov 00:25:57
+```
+
+The mode is off by default. It activates only for regions at least 1024 pixels
+wide or high whose per-frame mask centre moves by at least 8% of the mask grid,
+splits their timeline into sections of at least three frames, and remaps masks
+into a tighter padded crop for both inference and compositing. Stationary and
+small regions retain the existing full temporal sequence. The four controls are
+`JASNA_TEMPORAL_CROP_FRAMES`, `JASNA_TEMPORAL_CROP_PADDING`,
+`JASNA_TEMPORAL_CROP_MIN_DIMENSION`, and `JASNA_TEMPORAL_CROP_MOTION`.
+
 On macOS 27 beta, an otherwise healthy crop can occasionally hit the Metal GPU
 watchdog. The launcher now recognizes that specific timeout, restarts a fresh
 Metal process, and resumes the preserved per-crop checkpoint up to two times.
@@ -320,7 +389,13 @@ Metal 4/MPSGraph allocations on the macOS 27 beta are released reliably only whe
 the restoration process exits. The macOS 27 asynchronous AVFoundation receiver
 can also retain queued 8K BGRA frames until an HEVC part finishes. Isolated
 decoders now seek directly to their first requested frame instead of rescanning a
-120-second source segment from frame zero. Direct SBS restoration uses a
+120-second source segment from frame zero. Direct SBS restoration now locks each
+8K source frame once and copies both 4K eyes through reusable pixel-buffer pools
+in one pass. On the dense six-second M4 fixture, this reduced end-to-end wall
+time from 163 to 158 seconds (3.1%) with all 180 output frames validated; the six
+30-frame decode/split phases totalled 3.405 seconds and peak resident memory
+remained bounded at 6.99 GiB.
+Direct SBS restoration uses a
 validated two-window subprocess default, then stream-copies completed windows
 into validated two-minute HEVC batches and removes the superseded short media
 parts. This halves model-process initialization compared with one-window
@@ -491,19 +566,32 @@ directory automatically, but only after the final SBS output passes codec,
 dimensions, frame-count, duration, and decode validation. The log and final
 video remain beside one another.
 
-Metal ML crop execution is serialized. The first 30-frame crop builds the
-retained graph and every later crop reuses it; attempting to construct two
+Metal ML crop execution is serialized. The first normal 30-frame crop or
+35-frame crop with temporal warm-up builds the retained graph and every later
+crop of that temporal shape reuses it; attempting to construct two
 first-use graphs concurrently proved unstable in the macOS 27 beta runtime.
 `JASNA_REGION_CONCURRENCY` is therefore ignored for production restoration.
 
-The optimized production path retains its first complete 30-frame Metal graph
-for the lifetime of the eye-restoration process. Later crops reuse the same
+The optimized production path retains one complete Metal graph per model batch
+for the lifetime of the eye-restoration process. A change between the 30-frame
+and 35-frame temporal shapes evicts the former graph before constructing the
+replacement, preventing the warm-up optimization from accumulating multiple
+large graphs. Later crops reuse the same
 tensors, buffers, argument tables, and residency set under a lock. Sequential
 Metal ML dispatches also share scratch heaps per pipeline/level instead of
 allocating hundreds of identical heaps per crop. A 4096×4096 one-second proof
 measured about 1.10 seconds for the initial graph build and execution, then
 about 0.45 seconds per reused 30-frame crop including roughly 0.38 seconds of
 GPU work. Decoded frame hashes matched the pre-cache output exactly.
+
+Xcode 27 beta 6 exposed that the former exact-30-frame gate bypassed this cache
+for nearly every production crop after five-frame temporal warm-up was enabled.
+The bounded 35-frame cache reduced the identical three-second batch-2 fixture's
+model-stage wall time from `34.8` to `32.1` seconds (7.8%) and completed the
+full restoration-only path in 47 seconds. Peak resident memory was 7.45 GiB.
+An alternating-input FP16 probe matched a fresh graph bit-for-bit, including
+hash `9fce8e1d284bfdc2`; decoded HEVC A/B differences remained compression-level
+(about 59–67 dB PSNR). Set `JASNA_RETAINED_GRAPH=0` for an immediate rollback.
 
 Restoration uses batch 2 by default, grouping two mosaic crops of the same
 temporal length in one retained graph when `Models/MetalMLBatch2` is present.
@@ -584,10 +672,34 @@ For the optimized quality-preserving profile, use:
   /path/to/input-sbs.mp4 /path/to/restored-vr-fast.mov 00:12:00
 ```
 
+To validate the same paired 10 Hz path with an MP4 source, one shared SBS MP4
+working file, no physical eye exports, and a final MP4 output, use:
+
+```sh
+./script/test_vr_direct_sbs_mp4_30s.sh \
+  /path/to/input-sbs.mp4 /path/to/restored-direct-sbs.mp4 00:25:57
+```
+
+The original 59.94 fps Main-10 source still requires one hardware-normalized
+30 fps SBS working file: Apple VideoToolbox has rejected direct AVFoundation
+decode of this source profile in prior tests, and the restoration manifests use
+an exact 30 fps timeline. That working file remains stereo and is never exported
+as separate physical left/right movies. Per-eye paths are links plus independent
+region manifests and caches. Internal resumable Metal segments remain MOV; the
+user-facing result is MP4.
+
 This profile keeps RF-DETR sampling at 10 Hz and the validated batch-2 model,
 but avoids temporary left/right source encodes. Both eye jobs reference the
-same SBS segment; detection crops only its requested eye and the stereo
-restoration path decodes each SBS frame once. Frame-exact, decodable packet-copy
+same SBS segment. The default shared stereo detector loads RF-DETR once, decodes
+each sampled 8K frame once, submits its left/right 4K crops through the retained
+model, and writes the same separate eye manifests used by restoration. Set
+`JASNA_STEREO_DETECT=0` to retain the legacy two-process detector for diagnosis.
+The diagnostic `script/test_vr_alternating_30s.sh` halves detector images, but
+its first 30-second comparison left 8.7%/9.2% of paired left/right region-frames
+with less than half spatial coverage. It therefore did not pass the promotion
+gate. Paired 10 Hz detection remains the validated default.
+The stereo restoration path also decodes each SBS frame once. Frame-exact,
+decodable packet-copy
 segments are reused directly. If a long-GOP source cannot be split exactly at a
 segment boundary, the launcher automatically performs one hardware SBS encode
 with forced boundary keyframes instead of producing mismatched eye timelines.
@@ -600,6 +712,15 @@ including a 31.7-second release rebuild. The prior physical-eye path took 634
 seconds with an already-built executable; excluding the one-time rebuild, the
 new run saved about 50 seconds while RF-DETR also scheduled slightly more source
 geometry from the cleaner, non-re-encoded input.
+
+On the dense six-second M4 fixture, shared detection preserved the exact 33/27
+left/right region counts, 22.272%/24.276% scheduled coverage, and all 1,629
+temporal mask keyframes. Detector scan time fell from 36.462 to 33.231 seconds,
+while complete end-to-end wall time fell from 154 to 149 seconds. The output
+passed as 180 8K frames with zero compositor fallbacks, and peak restoration
+memory remained bounded at 7.20 GiB. The one-second startup-heavy fixture fell
+from 48 to 40 seconds with the same manifests, showing the additional saving
+from avoiding a second RF-DETR model load.
 
 After validating quality, restore the complete SBS source with the production
 wrapper:
@@ -618,9 +739,12 @@ When the mosaic time ranges are already known, use the manual-range wrapper:
 ```
 
 For rollout, use the preset wrapper instead of assembling environment flags.
-It fixes the validated beta-5 profile: RF-DETR, batch 2, two Metal windows per
-process, direct/shared SBS output, a bounded 512 MiB crop handoff, stereo
-reconciliation, peak-memory telemetry, and adaptive detection disabled. Its
+It fixes the visually approved beta-5 profile: the `MetalMLFineTuneMac1000`
+restoration packages, RF-DETR, batch 2 when its matching generated package set
+is present, full mask-hole recovery, five temporal warm-up frames, two Metal
+windows per process, direct/shared SBS output, a bounded 512 MiB crop handoff,
+stereo reconciliation, peak-memory telemetry, and adaptive detection disabled.
+It falls back to batch 1 when those generated packages are unavailable. Its
 optional third argument supplies known mosaic ranges:
 
 ```sh
@@ -1167,6 +1291,390 @@ normalized non-GPU graph overhead fell by about 68 ms while model GPU time and
 decoded output remained unchanged. A dedicated Metal test verifies finite,
 Infinity, and NaN inputs.
 
+## Experimental restoration fine-tuning
+
+The remaining strong pattern on some moving mosaics is a limitation of the
+public `lada_mosaic_restoration_model_generic_v1.2.pth` checkpoint. Increasing
+mask coverage or adding more overlapping crops cannot reconstruct detail that
+the primary model never predicts. `tools/prepare_finetune_dataset.py` and
+`tools/finetune_basicvsrpp.py` provide a conservative same-architecture
+fine-tuning path. SPyNet stays frozen and accepted checkpoints retain the exact
+parameter layout consumed by the existing Metal converter, so model inference
+cost does not increase.
+
+Training requires clean, unmosaicked source video. Already-mosaicked output is
+not ground truth and must not be used as the target. Prepare isolated train and
+validation clips on the Mac; `--sbs-eyes` prevents a crop from crossing the eye
+boundary of a clean SBS source:
+
+```sh
+python3 tools/prepare_finetune_dataset.py \
+  /path/to/clean/videos \
+  --output /path/to/jasna-finetune-data \
+  --clips-per-video 20 \
+  --frames 30 \
+  --source-crop-size 1024 \
+  --exclude-ranges 00:25:57-00:26:27 \
+  --sbs-eyes
+```
+
+The extractor records every source/time/crop choice in `dataset.json` and
+refuses to overwrite a non-empty dataset. Synthetic moving mosaics are generated
+from those clean clips during training, so their block size and position change
+without duplicating ground-truth frames on disk. `--source-crop-size 1024`
+downscales a larger 8K-eye area into the model's 256-pixel input, approximating
+the scale of an oversized VR restoration region. `--exclude-ranges` accepts the
+same comma-separated source timeline syntax as manual restoration ranges and
+adds a two-second guard on both sides by default. It is intended for known
+mosaic intervals in an otherwise clean source; every extracted frame still
+needs visual review before training. At least two clips are required per input
+video; each source is represented independently in both train and validation
+so the promotion score cannot accidentally omit an entire source. Run the
+sensitive VR detector audit as a
+mandatory second gate:
+
+```sh
+./script/audit_finetune_dataset.sh /path/to/jasna-finetune-data
+```
+
+For a larger candidate dataset, the first audit can quarantine every flagged
+clip instead of requiring manual moves. Quarantine is recoverable: clips move
+under `rejected/train` or `rejected/validation` and are never deleted. This
+also rebalances a surviving clip when a source loses all of its train or
+validation representatives, recording both its original and current split in
+`dataset.json`. This
+first command intentionally exits with status 2 when it moves anything; run a
+second audit without quarantine to certify the remaining exact clip set:
+
+```sh
+JASNA_FINETUNE_QUARANTINE=1 \
+JASNA_FINETUNE_AUDIT_STRIDE=10 \
+./script/audit_finetune_dataset.sh /path/to/jasna-finetune-data
+
+./script/audit_finetune_dataset.sh /path/to/jasna-finetune-data
+```
+
+The audit samples the first, last, and intermediate frames of every clip and
+writes `mosaic-audit.json`. It also rejects black/empty and very low-detail
+clips that do not add useful restoration targets. Any rejected clip makes the
+command fail and the dataset must not be trained. The trainer independently
+requires a passing audit whose exact clip list still matches the dataset. This
+deliberately prefers rejecting a questionable clean clip over teaching the
+restoration model to reproduce mosaic blocks.
+
+Full BasicVSR++ back-propagation is intended for a Python 3.12+ CUDA training
+machine with Jasna's development dependencies installed. The
+M4 remains the validation and Metal deployment target; MPS/CPU training is an
+explicit diagnostic option because deformable-convolution backward support and
+speed are not validated there. Start with a small run before renting a longer
+GPU session:
+
+```sh
+python tools/finetune_basicvsrpp.py \
+  --jasna-source /path/to/jasna \
+  --weights Models/SourceWeights/lada_mosaic_restoration_model_generic_v1.2.pth \
+  --dataset /path/to/jasna-finetune-data \
+  --output /path/to/jasna-finetune-run \
+  --steps 1000 \
+  --frames 10
+```
+
+The CUDA wrapper keeps the complete console log beside the checkpoints and
+provides environment overrides for clip length, learning rate, validation
+frequency, and an explicit resume checkpoint:
+
+```sh
+JASNA_TRAIN_PYTHON=/path/to/jasna-venv/bin/python \
+./script/run_finetune_basicvsrpp.sh \
+  /path/to/jasna \
+  /path/to/jasna-finetune-data \
+  /path/to/jasna-finetune-run \
+  1000
+```
+
+An Apple-silicon Mac can run the already validated CPU diagnostic path when a
+CUDA machine is unavailable. Start with three frames and 150 steps; CPU is
+slower, but avoids relying on unsupported MPS deformable-convolution backward
+operations:
+
+```sh
+JASNA_FINETUNE_DEVICE=cpu \
+JASNA_FINETUNE_FRAMES=3 \
+JASNA_FINETUNE_VALIDATE_EVERY=25 \
+JASNA_FINETUNE_SAVE_EVERY=50 \
+./script/run_finetune_basicvsrpp.sh \
+  /path/to/jasna-source \
+  /path/to/audited-dataset \
+  /path/to/mac-pilot-run \
+  150
+```
+
+A fresh run refuses a non-empty output directory. Resume an interrupted run
+with `JASNA_FINETUNE_RESUME=/path/to/checkpoint-000500.pth` and a larger target
+step; the original v1.2 baseline remains immutable across resumes.
+
+The first three-frame Mac candidate improved its synthetic validation PSNR from
+23.183 to 23.412 dB and temporal MAE from 0.017968 to 0.016200 by step 500, but
+its fixed real moving-mosaic A/B looked almost unchanged. That test had already
+scheduled blend coverage of 44.5% for the left eye and 40.3% for the right eye,
+so increasing detector coverage again would only add work. Continue from the
+accepted checkpoint with the harder `moving-vr` corruption profile instead.
+It uses five-frame samples, faster curved motion, changing pixel-block sizes,
+non-rectangular masks, and occasional independent overlapping subjects. Because
+this validation task differs from the first recipe, the quality baseline must
+be measured again and the result must go into a new run directory:
+
+```sh
+JASNA_FINETUNE_DEVICE=cpu \
+JASNA_FINETUNE_RESUME="/path/to/mac-pilot-v1/checkpoint-000500.pth" \
+JASNA_FINETUNE_CORRUPTION_PROFILE=moving-vr \
+JASNA_FINETUNE_RESET_BASELINE=1 \
+JASNA_FINETUNE_FRAMES=5 \
+JASNA_FINETUNE_LEARNING_RATE=0.000005 \
+JASNA_FINETUNE_TEMPORAL_WEIGHT=0.20 \
+JASNA_FINETUNE_VALIDATE_EVERY=25 \
+JASNA_FINETUNE_SAVE_EVERY=50 \
+./script/run_finetune_basicvsrpp.sh \
+  /path/to/jasna-source \
+  /path/to/audited-dataset \
+  /path/to/mac-motion-v2 \
+  750
+```
+
+On resume, the wrapper's requested learning rate now overrides the optimizer
+checkpoint's old rate. This prevents a staged recipe from silently continuing
+with the previous learning rate. Do not train the old three-frame recipe beyond
+step 500 unless the fixed real-video A/B shows a benefit.
+
+The moving-VR step-750 candidate also passed its synthetic gate but remained
+almost unchanged in the same real 30-second A/B: the step-500 and step-750
+outputs measured 49.40 dB PSNR against each other. Inspection of the source
+mosaic found stable averaged grid blocks with hard or lightly softened edges.
+The earlier trainer generated blocks directly at model resolution and omitted
+Lada's post-mosaic video degradation. It also retained EMA decay 0.999, meaning
+only 22.1% of the resumed EMA at step 750 came from the new 250-step stage.
+
+The `lada-vr` profile more closely follows Lada's training recipe: one block
+grid is retained through a temporal sample, square and rectangular average or
+sampled blocks are selected through whole mask cells, optional feathering is
+applied, and lightweight blur plus one or two quantization passes approximate
+post-mosaic video compression. Continue into another isolated run with longer
+temporal context and a faster EMA that can actually incorporate the stage:
+
+```sh
+JASNA_FINETUNE_DEVICE=cpu \
+JASNA_FINETUNE_RESUME="/path/to/mac-motion-v2/checkpoint-000750.pth" \
+JASNA_FINETUNE_CORRUPTION_PROFILE=lada-vr \
+JASNA_FINETUNE_RESET_BASELINE=1 \
+JASNA_FINETUNE_FRAMES=8 \
+JASNA_FINETUNE_LEARNING_RATE=0.000005 \
+JASNA_FINETUNE_TEMPORAL_WEIGHT=0.20 \
+JASNA_FINETUNE_EMA_DECAY=0.995 \
+JASNA_FINETUNE_VALIDATE_EVERY=25 \
+JASNA_FINETUNE_SAVE_EVERY=50 \
+./script/run_finetune_basicvsrpp.sh \
+  /path/to/jasna-source \
+  /path/to/audited-dataset \
+  /path/to/mac-lada-vr-v3 \
+  1000
+```
+
+At decay 0.995, 250 optimizer updates give the new stage about 71.4% EMA
+contribution instead of 22.1%. The trainer prints this estimate at startup so a
+future short staged run cannot appear successful while barely changing the
+exported EMA weights.
+
+The trainer initializes both working and EMA generators from v1.2, freezes
+SPyNet, uses masked Charbonnier reconstruction plus a low-weight clean-background
+term and temporal-delta loss, clips gradients, and writes resumable optimizer
+checkpoints atomically. A candidate becomes `best-inference.pth` only when its
+held-out masked PSNR improves by at least 0.10 dB and its temporal MAE remains
+within 2% of the starting checkpoint. These are synthetic-data gates, not an
+automatic production promotion: the candidate must still pass the full-model
+oracle and a fixed real 30-second visual A/B before replacing any generated
+Metal package.
+
+After an accepted candidate has been converted into
+`Models/MetalMLFineTuneMac1000`, run the isolated visual test without replacing
+the production packages:
+
+```sh
+./script/test_vr_finetuned_30s.sh \
+  /path/to/input-sbs.mp4 \
+  /path/to/fine-tuned-test.mov \
+  00:25:57
+```
+
+This test forces batch 1 until a matching fine-tuned batch-2 package set is
+converted. It defaults to a 0.10 detector threshold and 18% segmentation-mask
+expansion because the first real A/B retained intermittent moving-edge mosaic
+at the normal 0.15/10% settings. It also enables the approved delta-gated
+mask-hole recovery for ordinary regions and five temporal warm-up frames.
+Override any setting explicitly for comparison. `JASNA_MODELS_DIR` and any
+selected batch-2 model directory are included in restoration cache identity, so
+a baseline or differently batched cache cannot be reused for the candidate
+accidentally. Set `JASNA_FINETUNED_MODELS_DIR` to compare a different converted
+candidate, such as `Models/MetalMLFineTuneMac750`.
+
+Once one 30-second test has prepared the SBS source and RF-DETR manifests, use
+the restoration-only harness for subsequent model or crop-geometry A/B runs:
+
+```sh
+JASNA_MODELS_DIR="$PWD/Models/MetalMLFineTuneMac1000" \
+JASNA_MODEL_BATCH=1 \
+./script/test_vr_restore_only_30s.sh \
+  "/path/to/previous-test.jasna-vr30-v22-work" \
+  "/path/to/restoration-only-candidate.mov"
+```
+
+This reuses the exact prepared 900-frame 8K clip and reconciled left/right
+detector manifests. It does not rerun source preparation or RF-DETR, so detector
+coverage is held constant and the log measures only restoration, clean-window
+bypass, and the final packet join. Each output receives an independent cache,
+which prevents model results from being reused across candidates. Set
+`JASNA_RESTORE_ONLY_VALIDATE=1` first to check the reference assets without
+building or writing video. For faster troubleshooting, select only the affected
+source-relative seconds inside the prepared 30-second clip:
+
+```sh
+JASNA_RESTORE_ONLY_START_SECOND=8 JASNA_RESTORE_ONLY_SECONDS=2 \
+JASNA_MODELS_DIR="$PWD/Models/MetalMLFineTuneMac1000" \
+JASNA_MODEL_BATCH=1 \
+./script/test_vr_restore_only_30s.sh \
+  "/path/to/previous-test.jasna-vr30-v22-work" \
+  "/path/to/restoration-only-seconds-8-10.mov"
+```
+
+The start is relative to the prepared clip, not the original video's absolute
+timeline. Omitting the duration restores from the selected second through the
+end of the 30-second fixture.
+
+For a controlled baseline-versus-fine-tuned comparison, run both model sets
+against that same source and those same manifests with one shared executable:
+
+```sh
+JASNA_RESTORE_ONLY_START_SECOND=0 JASNA_RESTORE_ONLY_SECONDS=3 \
+./script/test_vr_restore_ab.sh \
+  "/path/to/previous-test.jasna-vr30-v22-work" \
+  "/path/to/recovery-ab"
+```
+
+This writes `recovery-ab-baseline.mov` with `Models/MetalML` and
+`recovery-ab-candidate.mov` with `Models/MetalMLFineTuneMac1000`. Override
+`JASNA_AB_BASELINE_MODELS_DIR` or `JASNA_AB_CANDIDATE_MODELS_DIR` to compare
+other converted package sets. Detector preparation remains frozen for both
+outputs, so the only intended A/B variable is the restoration model.
+
+To inspect whether the model itself retains mosaic structure before final
+compositing, enable recovery diagnostics on a fresh restoration-only output:
+
+```sh
+JASNA_RECOVERY_DIAGNOSTIC_DIR="/path/to/recovery-diagnostics" \
+JASNA_RECOVERY_DIAGNOSTIC_REGION=all \
+JASNA_RECOVERY_DIAGNOSTIC_FRAME=15 \
+JASNA_RESTORE_ONLY_START_SECOND=0 JASNA_RESTORE_ONLY_SECONDS=1 \
+JASNA_MODELS_DIR="$PWD/Models/MetalMLFineTuneMac1000" \
+JASNA_MODEL_BATCH=1 \
+./script/test_vr_restore_only_30s.sh \
+  "/path/to/previous-test.jasna-vr30-v22-work" \
+  "/path/to/recovery-diagnostic.mov"
+```
+
+Large subdivided mosaic regions also use the raw model delta to recover pixels
+that a moving temporal mask misses. The default activation threshold is `0.025`
+in normalized RGB and is intentionally limited to subdivision groups. Raise it
+to make mask-hole recovery more conservative, or lower it when a verified raw
+reconstruction is still being suppressed:
+
+```bash
+JASNA_MOSAIC_MASK_RECOVERY_THRESHOLD=0.025
+```
+
+Raw-crop diagnostics can also show a strong restoration for an ordinary region
+whose resolved temporal mask is empty. Test delta-gated recovery for those
+non-subdivided regions without changing detection or model weights:
+
+```bash
+JASNA_MOSAIC_MASK_RECOVERY_ALL_REGIONS=1
+```
+
+This remains opt-in for experimental launchers, while the visually approved
+fine-tuned test and rollout wrappers enable it. The same spatial feather and
+delta threshold still bound the additional blend.
+
+One-second crop windows normally start with fresh temporal recurrence. To test
+whether that reset causes weak recovery immediately after a window boundary,
+prepend a small number of already-decoded source frames to each crop model call:
+
+```bash
+JASNA_TEMPORAL_WARMUP_FRAMES=5
+```
+
+Warm-up defaults to 5 frames, is clamped to that limit, and does not add output
+frames. Set `JASNA_TEMPORAL_WARMUP_FRAMES=0` for an immediate rollback. The
+preceding frames are passed through the restoration graph, then discarded before
+the intended 30 output frames are cached and composited. Later windows reuse a
+small in-memory decode tail, so this does not seek or decode the 8K source twice.
+
+On the fixed three-second 8K restoration-only fixture, both three- and five-frame
+warm-up passed 90-frame validation with zero compositor fallbacks. Three frames
+finished in 59 seconds; five frames took about 64 seconds after excluding its
+one-time release rebuild. The five-frame result produced the stronger bounded
+change during the first three frames after both recurrence boundaries, while the
+first 30-frame window remained bit-identical. After visual approval, five frames
+became the production default.
+
+The matching fine-tuned batch-2 package set subsequently passed the same
+three-second 8K restoration-only fixture with all 90 decoded frames pixel-identical
+to batch 1 and zero compositor fallbacks. Its warm run finished in 54 seconds
+versus 64 seconds for batch 1 after excluding the latter's one-time release build,
+a 15.6% end-to-end improvement. Measured GPU work fell from 31.825 to 28.812
+seconds (9.5%), while peak resident memory rose from 5.79 to 7.39 GiB. The rollout
+wrapper now selects this package set automatically when present.
+
+For each selected crop this writes the raw 256x256 model input and output,
+an amplified input/output difference, the resolved segmentation mask, and JSON
+geometry/delta telemetry. Use a non-negative zero-based region index instead of
+`all` to limit output. Diagnostics are opt-in and do not alter compositing.
+
+The `lada-vr-v4` fine-tuning recipe targets the observed conservative recovery:
+it synthesizes larger, faster, more heavily compressed moving mosaics and adds a
+masked spatial-gradient loss that penalizes retained block edges. Resume it into
+a new output directory so the earlier candidate remains reproducible:
+
+```sh
+JASNA_TRAIN_PYTHON="$PWD/.venv-coreai/bin/python" \
+JASNA_FINETUNE_DEVICE=cpu \
+JASNA_FINETUNE_RESUME="/path/to/checkpoint-001000.pth" \
+./script/run_finetune_lada_vr_v4.sh \
+  "/path/to/jasna-source" \
+  "/path/to/audited-dataset" \
+  "/path/to/mac-lada-vr-v4" \
+  1250
+```
+
+The wrapper defaults to eight frames, a `5e-6` learning rate, 0.15 temporal
+weight, 0.25 gradient weight, EMA 0.995, validation every 25 steps, and a reset
+quality baseline for resumed recipes. All values remain overridable through the
+existing `JASNA_FINETUNE_*` environment variables.
+
+Convert an accepted candidate into separate experimental directories first:
+
+```sh
+python tools/convert_basicvsrpp.py \
+  --jasna-source /path/to/jasna \
+  --weights /path/to/jasna-finetune-run/best-inference.pth \
+  --output Models/CoreMLFineTune \
+  --validate
+
+python tools/convert_basicvsrpp.py \
+  --jasna-source /path/to/jasna \
+  --weights /path/to/jasna-finetune-run/best-inference.pth \
+  --output Models/CoreMLFineTuneBatch2 \
+  --batch-size 2 \
+  --validate
+```
+
 ## Model conversion
 
 `tools/convert_basicvsrpp.py` splits the public Jasna/Lada BasicVSR++ checkpoint
@@ -1204,6 +1712,14 @@ about 10–18 ms per eye/window. This rules out CPU prefetch and array packing a
 meaningful targets: the remaining host gap is predominantly Metal/driver queue
 latency.
 
+The crop scheduler keeps stable same-length pairs ahead of odd leftovers. A
+single odd temporal-length group can therefore no longer shift a later even
+group off the batch-2 boundary. On the dense six-second M4 fixture, the same 139
+crops required 77 graph submissions instead of 80; graph wall time fell from
+59.508 to 58.794 seconds and end-to-end wall time from 158 to 154 seconds. Peak
+resident memory remained bounded at 7.28 GiB, and all 180 output frames passed
+the direct SBS validation gate.
+
 A fixed batch-4 experiment was also rejected on Xcode 27 beta 5. All 16 Core ML
 and Metal ML packages converted successfully, but the first restoration graph
 remained blocked for more than six minutes in synchronous ANE
@@ -1212,9 +1728,11 @@ submission. The batch-4 scheduler was removed; batch 2 remains the validated
 ceiling on this beta.
 
 The converter intentionally emits the iOS 18 Core ML operation set, even though
-the runtime target is macOS 27. Xcode 27 beta 5's Metal package builder still
-crashes on the newer `ios19.add` representation with `Missing pattern to rewrite
-MIL op ios19.add`; the equivalent iOS 18 packages compile. Pass
+the runtime target is macOS 27. Xcode 27 beta 5's Metal package builder crashes
+on the newer `ios19.add` representation with `Missing pattern to rewrite MIL op
+ios19.add`; the equivalent iOS 18 packages compile. The isolated feature-extract
+probe was repeated with Xcode 27 beta 6 (`27A5252f`) and its matching downloaded
+Metal Toolchain, and aborted on the same `ios19.add` rewrite exception. Pass
 `--minimum-deployment-target ios26` only for isolated future-beta probes.
 
 After conversion, `tools/build_metal_packages.sh` turns each `.mlpackage` into

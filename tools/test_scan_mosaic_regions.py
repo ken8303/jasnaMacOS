@@ -2,6 +2,9 @@
 """Focused tests for sparse mosaic region post-processing."""
 
 import base64
+import json
+from pathlib import Path
+import tempfile
 import unittest
 
 from scan_mosaic_regions import (
@@ -17,9 +20,27 @@ from scan_mosaic_regions import (
     mask_source_boxes,
     refinement_sample_indices,
     samples_in_intervals,
+    stereo_sample_eyes,
     suppress_duplicate_regions,
     suppress_nested_regions,
+    write_manifest,
 )
+
+
+class ManifestWritingTests(unittest.TestCase):
+    def test_writes_atomic_eye_manifest_with_expected_header(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "nested" / "left.json"
+            regions = [{"startFrame": 0, "endFrame": 30}]
+
+            write_manifest(path, 4096, 4096, 30, regions)
+
+            manifest = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(manifest["width"], 4096)
+            self.assertEqual(manifest["height"], 4096)
+            self.assertEqual(manifest["frameCount"], 30)
+            self.assertEqual(manifest["regions"], regions)
+            self.assertFalse(path.with_suffix(".json.tmp").exists())
 
 
 class DeviceSelectionTests(unittest.TestCase):
@@ -71,6 +92,22 @@ class AdaptiveScanScheduleTests(unittest.TestCase):
         intervals = active_frame_intervals("1.0/2.0", 30.0, 90)
         self.assertEqual(intervals, [(30, 60)])
         self.assertEqual(samples_in_intervals(range(0, 90, 3), intervals), list(range(30, 60, 3)))
+
+
+class StereoSampleScheduleTests(unittest.TestCase):
+    def test_paired_mode_scans_both_eyes_at_every_sample(self):
+        self.assertEqual(stereo_sample_eyes(0, "paired"), ("left", "right"))
+        self.assertEqual(stereo_sample_eyes(7, "paired"), ("left", "right"))
+
+    def test_alternating_mode_interleaves_real_eye_observations(self):
+        self.assertEqual(
+            [stereo_sample_eyes(index, "alternating") for index in range(4)],
+            [("left",), ("right",), ("left",), ("right",)],
+        )
+
+    def test_rejects_unknown_mode(self):
+        with self.assertRaises(ValueError):
+            stereo_sample_eyes(0, "unknown")
 
 
 class DetectorCoverageMetricsTests(unittest.TestCase):

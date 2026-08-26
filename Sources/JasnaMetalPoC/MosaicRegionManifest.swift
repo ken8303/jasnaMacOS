@@ -9,6 +9,21 @@ enum MosaicCompositeQuality {
         else { return 0.03 }
         return min(1, max(0, value))
     }
+
+    static func maskRecoveryDeltaThreshold(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> Float {
+        guard let text = environment["JASNA_MOSAIC_MASK_RECOVERY_THRESHOLD"],
+              let value = Float(text), value.isFinite
+        else { return 0.025 }
+        return min(1, max(0.001, value))
+    }
+
+    static func ordinaryMaskRecoveryEnabled(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> Bool {
+        environment["JASNA_MOSAIC_MASK_RECOVERY_ALL_REGIONS"] == "1"
+    }
 }
 
 struct MosaicMaskKeyframe: Codable, Equatable, Sendable {

@@ -26,6 +26,102 @@ private let sharedBatch2CircuitBreaker = RestorationBatchCircuitBreaker()
 
 @available(macOS 27.0, *)
 extension SideBySideRestoration {
+    struct ModelCropReuseSummary: Equatable, Sendable {
+        let cropCount: Int
+        let uniqueExactCropCount: Int
+        let exactDuplicateCount: Int
+        let highOverlapPairCount: Int
+        let containedPairCount: Int
+    }
+
+    private struct ModelCropReuseKey: Hashable {
+        let x: Int
+        let y: Int
+        let width: Int
+        let height: Int
+        let modelStartFrame: Int
+        let modelEndFrame: Int
+    }
+
+    static func modelCropReuseSummary(
+        regions: [MosaicRegion],
+        windowStartFrame: Int,
+        outputCount: Int,
+        temporalWarmupFrames: Int
+    ) -> ModelCropReuseSummary {
+        let windowEndFrame = windowStartFrame + outputCount
+        let keys = regions.map { region in
+            let targetStart = max(windowStartFrame, region.startFrame)
+            let targetEnd = min(windowEndFrame, region.endFrame)
+            return ModelCropReuseKey(
+                x: region.x,
+                y: region.y,
+                width: region.width,
+                height: region.height,
+                modelStartFrame: max(0, targetStart - max(0, temporalWarmupFrames)),
+                modelEndFrame: targetEnd
+            )
+        }
+        var highOverlapPairCount = 0
+        var containedPairCount = 0
+        if regions.count > 1 {
+            for leftIndex in 0..<(regions.count - 1) {
+                for rightIndex in (leftIndex + 1)..<regions.count {
+                    let leftKey = keys[leftIndex]
+                    let rightKey = keys[rightIndex]
+                    guard leftKey.modelStartFrame == rightKey.modelStartFrame,
+                          leftKey.modelEndFrame == rightKey.modelEndFrame,
+                          leftKey != rightKey
+                    else { continue }
+                    let left = regions[leftIndex]
+                    let right = regions[rightIndex]
+                    let intersectionWidth = max(
+                        0, min(left.x + left.width, right.x + right.width)
+                            - max(left.x, right.x)
+                    )
+                    let intersectionHeight = max(
+                        0, min(left.y + left.height, right.y + right.height)
+                            - max(left.y, right.y)
+                    )
+                    let intersection = intersectionWidth * intersectionHeight
+                    guard intersection > 0 else { continue }
+                    let leftArea = left.width * left.height
+                    let rightArea = right.width * right.height
+                    let union = leftArea + rightArea - intersection
+                    if union > 0, Double(intersection) / Double(union) >= 0.8 {
+                        highOverlapPairCount += 1
+                    }
+                    if intersection == min(leftArea, rightArea) {
+                        containedPairCount += 1
+                    }
+                }
+            }
+        }
+        let uniqueCount = Set(keys).count
+        return ModelCropReuseSummary(
+            cropCount: regions.count,
+            uniqueExactCropCount: uniqueCount,
+            exactDuplicateCount: regions.count - uniqueCount,
+            highOverlapPairCount: highOverlapPairCount,
+            containedPairCount: containedPairCount
+        )
+    }
+
+    static func reportModelCropReuseSummary(
+        _ summary: ModelCropReuseSummary,
+        windowIndex: Int,
+        eye: String? = nil
+    ) {
+        let eyeText = eye.map { " \($0)" } ?? ""
+        report(
+            "Window \(windowIndex + 1)\(eyeText) crop reuse: "
+                + "\(summary.uniqueExactCropCount)/\(summary.cropCount) unique exact crops, "
+                + "\(summary.exactDuplicateCount) reusable duplicate(s), "
+                + "\(summary.highOverlapPairCount) high-overlap pair(s), "
+                + "\(summary.containedPairCount) contained pair(s)"
+        )
+    }
+
     static var fullDetectedRegionBlendEnabled: Bool {
         ProcessInfo.processInfo.environment["JASNA_DIAGNOSTIC_FULL_REGION_BLEND"] == "1"
     }
@@ -40,6 +136,7 @@ extension SideBySideRestoration {
         let regionIndex: Int
         let localStart: Int
         let activeFrameCount: Int
+        let restoredFrameOffset: Int
         let inputFrames: [[Float16]]
         let context: String
     }
@@ -76,20 +173,37 @@ extension SideBySideRestoration {
         _ regions: [MosaicRegion],
         windowStartFrame: Int,
         outputCount: Int,
-        batch2Enabled: Bool
+        batch2Enabled: Bool,
+        temporalWarmupFrames: Int = 0
     ) -> [MosaicRegion] {
         guard batch2Enabled, regions.count > 2 else { return regions }
-        return regions.enumerated().sorted { left, right in
-            func modelFrameCount(_ region: MosaicRegion) -> Int {
-                let localStart = max(0, region.startFrame - windowStartFrame)
-                let localEnd = min(outputCount, region.endFrame - windowStartFrame)
-                return max(3, localEnd - localStart)
+        func modelFrameCount(_ region: MosaicRegion) -> Int {
+            let targetStart = max(windowStartFrame, region.startFrame)
+            let targetEnd = min(windowStartFrame + outputCount, region.endFrame)
+            let modelStart = max(
+                0, targetStart - max(0, temporalWarmupFrames)
+            )
+            return max(3, targetEnd - modelStart)
+        }
+        let grouped = Dictionary(grouping: regions.enumerated()) {
+            modelFrameCount($0.element)
+        }
+        var paired = [MosaicRegion]()
+        var leftovers = [MosaicRegion]()
+        for frameCount in grouped.keys.sorted() {
+            let stableGroup = grouped[frameCount, default: []].sorted {
+                $0.offset < $1.offset
             }
-            let leftFrames = modelFrameCount(left.element)
-            let rightFrames = modelFrameCount(right.element)
-            if leftFrames != rightFrames { return leftFrames < rightFrames }
-            return left.offset < right.offset
-        }.map(\.element)
+            let pairedCount = stableGroup.count - stableGroup.count % 2
+            paired.append(contentsOf: stableGroup[..<pairedCount].map(\.element))
+            if pairedCount < stableGroup.count {
+                leftovers.append(stableGroup[pairedCount].element)
+            }
+        }
+        // The restoration loop consumes two adjacent entries at a time. Put all
+        // compatible pairs first so an odd group cannot shift every later group
+        // off its pair boundary. At most one stable leftover remains per length.
+        return paired + leftovers
     }
 
     final class RegionRestorationBatch: @unchecked Sendable {
@@ -160,6 +274,7 @@ extension SideBySideRestoration {
         plan: SideBySideVideoPlan,
         regions: [MosaicRegion],
         decodedFrames: [CVPixelBuffer],
+        decodedStartFrame: Int,
         outputCount: Int,
         windowIndex: Int,
         windowCount: Int,
@@ -267,19 +382,29 @@ extension SideBySideRestoration {
                 let work = try (nextRegion..<batchEnd).map { regionIndex in
                     let windowStartFrame = windowIndex * SideBySideVideoPlan.temporalWindowFrames
                     let region = regions[regionIndex]
-                    let localStart = max(0, region.startFrame - windowStartFrame)
-                    let localEnd = min(outputCount, region.endFrame - windowStartFrame)
-                    guard localStart < localEnd else {
+                    let windowSchedule = TemporalWindowSchedule(
+                        outputStartFrame: windowStartFrame,
+                        outputFrameCount: outputCount,
+                        requestedWarmupFrames: windowStartFrame - decodedStartFrame
+                    )
+                    guard let regionSchedule = TemporalRegionSchedule(
+                        regionStartFrame: region.startFrame,
+                        regionEndFrame: region.endFrame,
+                        window: windowSchedule
+                    ) else {
                         throw DeformConvError.commandFailed(
                             "mosaic crop does not intersect its assigned window"
                         )
                     }
+                    guard regionSchedule.decodedLocalRange.lowerBound >= 0,
+                          regionSchedule.decodedLocalRange.upperBound <= decodedFrames.count,
+                          !regionSchedule.decodedLocalRange.isEmpty
+                    else { throw DeformConvError.invalidShape }
                     let samplingMap = samplingMaps[regionIndex]
-                    let activeFrames = decodedFrames[localStart..<localEnd]
-                    var cropFrames = try activeFrames.map {
+                    let modelFrames = decodedFrames[regionSchedule.decodedLocalRange]
+                    var cropFrames = try modelFrames.map {
                         try samplingMap.extractPlanarRGB(from: $0)
                     }
-                    let activeFrameCount = cropFrames.count
                     while cropFrames.count < 3 {
                         guard let last = cropFrames.last else {
                             throw DeformConvError.invalidShape
@@ -292,8 +417,9 @@ extension SideBySideRestoration {
                         + "\(region.startFrame)..<\(region.endFrame)"
                     return PreparedRegionRestoration(
                         regionIndex: regionIndex,
-                        localStart: localStart,
-                        activeFrameCount: activeFrameCount,
+                        localStart: regionSchedule.outputLocalStart,
+                        activeFrameCount: regionSchedule.activeFrameCount,
+                        restoredFrameOffset: regionSchedule.restoredFrameOffset,
                         inputFrames: cropFrames,
                         context: context
                     )
@@ -340,16 +466,20 @@ extension SideBySideRestoration {
                 }
                 for restored in completedWork {
                     let prepared = restored.prepared
+                    try writeRecoveryDiagnosticIfRequested(
+                        restored: restored,
+                        region: regions[prepared.regionIndex],
+                        samplingMap: samplingMaps[prepared.regionIndex],
+                        windowIndex: windowIndex,
+                        workDirectoryURL: workDirectoryURL
+                    )
                     let cacheWriteStarted = ContinuousClock.now
                     for frame in 0..<outputCount {
                         if frame >= prepared.localStart
                             && frame < prepared.localStart + prepared.activeFrameCount
                         {
                             let values = restored.frames[
-                                min(
-                                    frame - prepared.localStart,
-                                    prepared.activeFrameCount - 1
-                                )
+                                prepared.restoredFrameOffset + frame - prepared.localStart
                             ]
                             if let inMemoryCache {
                                 try inMemoryCache.store(
@@ -371,7 +501,7 @@ extension SideBySideRestoration {
                     inputPackingMilliseconds += restored.inputPackingMilliseconds
                     graphExecutionMilliseconds += restored.graphExecutionMilliseconds
                     outputSplittingMilliseconds += restored.outputSplittingMilliseconds
-                    restoredModelFrames += prepared.activeFrameCount
+                    restoredModelFrames += prepared.inputFrames.count
                     let completedCount = prepared.regionIndex + 1
                     let shouldCheckpoint = completedCount == regions.count
                         || completedCount.isMultiple(of: checkpointInterval)
@@ -460,6 +590,34 @@ extension SideBySideRestoration {
         )
     }
 
+    static func reportTemporalCropConfiguration(
+        _ configuration: MosaicTemporalCropConfiguration
+    ) {
+        guard configuration.chunkFrames >= 3 else {
+            report("Motion-tight temporal crops: disabled")
+            return
+        }
+        report(
+            "Motion-tight temporal crops: \(configuration.chunkFrames) frames, padding "
+                + "\(configuration.padding)px, minimum region "
+                + "\(configuration.minimumDimension)px, motion threshold "
+                + "\(String(format: "%.3f", configuration.minimumMotionFraction))"
+        )
+    }
+
+    static func reportTemporalWarmupConfiguration(
+        _ configuration: TemporalWarmupConfiguration
+    ) {
+        guard configuration.frames > 0 else {
+            report("Temporal crop warm-up: disabled")
+            return
+        }
+        report(
+            "Temporal crop warm-up: \(configuration.frames) preceding frame(s); "
+                + "warm-up outputs are discarded"
+        )
+    }
+
     static func restorePreparedRegionsWithBatchFallback(
         work: [PreparedRegionRestoration],
         batchRestore: ([PreparedRegionRestoration]) throws -> [CompletedRegionRestoration],
@@ -493,7 +651,8 @@ extension SideBySideRestoration {
         guard completed.count == work.count,
               zip(completed, work).allSatisfy({ restored, expected in
                   restored.prepared.regionIndex == expected.regionIndex
-                      && restored.frames.count >= expected.activeFrameCount
+                      && restored.frames.count
+                          >= expected.restoredFrameOffset + expected.activeFrameCount
                       && restored.frames.allSatisfy({ $0.count == tileElements })
               })
         else {
