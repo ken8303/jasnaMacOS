@@ -5,16 +5,19 @@ usage() {
   echo "usage: $0 REFERENCE_WORK_DIR OUTPUT_SBS_VIDEO" >&2
   echo "example: $0 previous-test.jasna-vr30-v22-work restored-model-b.mov" >&2
   echo "" >&2
-  echo "Reuses the prepared 30-second SBS source and detector manifests from a" >&2
-  echo "previous test. Only restoration and final packet joining are repeated." >&2
+  echo "Reuses the prepared SBS source and first-segment detector manifests from" >&2
+  echo "a previous test. Only restoration and final packet joining are repeated." >&2
   echo "" >&2
   echo "optional: JASNA_MODELS_DIR=/path/to/MetalMLModels" >&2
-  echo "          JASNA_RESTORE_ONLY_START_SECOND=0 (relative second, 0-29)" >&2
+  echo "          JASNA_RESTORE_ONLY_START_SECOND=0 (relative to selected segment)" >&2
   echo "          JASNA_RESTORE_ONLY_SECONDS=remaining (1 through remaining seconds)" >&2
-  echo "          JASNA_METAL_WINDOWS_PER_PROCESS=2" >&2
+  echo "          JASNA_RESTORE_ONLY_AUDIO_START_SECOND=segment-relative start" >&2
+  echo "          JASNA_METAL_WINDOWS_PER_PROCESS=1" >&2
   echo "          JASNA_MODEL_BATCH=1" >&2
+  echo "          JASNA_REGION_PREPARE_DEPTH=2 (overlap CPU crop preparation with Metal)" >&2
   echo "          JASNA_VIDEO_BITRATE=40000000" >&2
   echo "          JASNA_TEMPORAL_WARMUP_FRAMES=5 (set 0 to disable)" >&2
+  echo "          JASNA_STEREO_WRITER_DEPTH=2 (set 1 for an A/B control)" >&2
   echo "          JASNA_RESTORE_ONLY_VALIDATE=1 (check reused assets, then exit)" >&2
   exit 2
 }
@@ -24,19 +27,66 @@ usage() {
 REFERENCE_WORK_DIR="$1"
 OUTPUT_PATH="$2"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-WINDOWS_PER_PROCESS="${JASNA_METAL_WINDOWS_PER_PROCESS:-2}"
+[[ -d "$REFERENCE_WORK_DIR" ]] || {
+  echo "error: reference work directory not found: $REFERENCE_WORK_DIR" >&2
+  exit 1
+}
+REFERENCE_WORK_DIR="$(cd "$REFERENCE_WORK_DIR" && pwd)"
+SOURCE_CONFIG="$REFERENCE_WORK_DIR/run-config.txt"
+source "$ROOT_DIR/script/lib/run_configuration.sh"
+
+# Restore all settings that can change crop scheduling, model execution, or
+# final compositing. An explicit environment value remains an intentional A/B
+# override and is never replaced by the recorded value.
+RECORDED_RESTORATION_SETTINGS=(
+  "model_batch:JASNA_MODEL_BATCH"
+  "metal_windows_per_process:JASNA_METAL_WINDOWS_PER_PROCESS"
+  "region_prepare_depth:JASNA_REGION_PREPARE_DEPTH"
+  "large_region_max_blend:JASNA_LARGE_REGION_MAX_BLEND"
+  "large_region_overlap:JASNA_LARGE_REGION_OVERLAP"
+  "large_region_split_limit:JASNA_LARGE_REGION_SPLIT_LIMIT"
+  "large_region_max_axis_crops:JASNA_LARGE_REGION_MAX_AXIS_CROPS"
+  "large_region_mask_growth:JASNA_LARGE_REGION_MASK_GROWTH"
+  "large_region_mask_feather:JASNA_LARGE_REGION_MASK_FEATHER"
+  "large_region_block_growth:JASNA_LARGE_REGION_BLOCK_GROWTH"
+  "large_region_mask_temporal_radius:JASNA_LARGE_REGION_MASK_TEMPORAL_RADIUS"
+  "large_region_mask_temporal_strength:JASNA_LARGE_REGION_MASK_TEMPORAL_STRENGTH"
+  "large_region_detail_crops:JASNA_LARGE_REGION_DETAIL_CROPS"
+  "large_region_detail_dimension:JASNA_LARGE_REGION_DETAIL_DIMENSION"
+  "temporal_crop_frames:JASNA_TEMPORAL_CROP_FRAMES"
+  "temporal_crop_padding:JASNA_TEMPORAL_CROP_PADDING"
+  "temporal_crop_min_dimension:JASNA_TEMPORAL_CROP_MIN_DIMENSION"
+  "temporal_crop_motion:JASNA_TEMPORAL_CROP_MOTION"
+  "mosaic_detail_residual_limit:JASNA_MOSAIC_DETAIL_RESIDUAL_LIMIT"
+  "mosaic_mask_recovery_threshold:JASNA_MOSAIC_MASK_RECOVERY_THRESHOLD"
+  "mosaic_mask_recovery_all_regions:JASNA_MOSAIC_MASK_RECOVERY_ALL_REGIONS"
+  "temporal_warmup_frames:JASNA_TEMPORAL_WARMUP_FRAMES"
+  "allow_passthrough:JASNA_ALLOW_PASSTHROUGH"
+  "diagnostic_full_region_blend:JASNA_DIAGNOSTIC_FULL_REGION_BLEND"
+  "metal_texture_compositor:JASNA_METAL_TEXTURE_COMPOSITOR"
+  "metal_compositor:JASNA_METAL_COMPOSITOR"
+  "composite_concurrency:JASNA_COMPOSITE_CONCURRENCY"
+  "stereo_writer_depth:JASNA_STEREO_WRITER_DEPTH"
+  "in_memory_crop_cache:JASNA_IN_MEMORY_CROP_CACHE"
+  "in_memory_cache_limit_mb:JASNA_IN_MEMORY_CACHE_LIMIT_MB"
+)
+for recorded_setting in "${RECORDED_RESTORATION_SETTINGS[@]}"; do
+  IFS=: read -r recorded_key environment_name <<< "$recorded_setting"
+  jasna_adopt_recorded_environment \
+    "$SOURCE_CONFIG" "$recorded_key" "$environment_name"
+done
+
+WINDOWS_PER_PROCESS="${JASNA_METAL_WINDOWS_PER_PROCESS:-1}"
 VIDEO_BITRATE="${JASNA_VIDEO_BITRATE:-40000000}"
 VALIDATE_ONLY="${JASNA_RESTORE_ONLY_VALIDATE:-0}"
 GPU_TIMEOUT_RETRIES="${JASNA_GPU_TIMEOUT_RETRIES:-2}"
 START_WINDOW="${JASNA_RESTORE_ONLY_START_SECOND:-0}"
 SELECTED_SECONDS="${JASNA_RESTORE_ONLY_SECONDS:-}"
+AUDIO_START_SECOND="${JASNA_RESTORE_ONLY_AUDIO_START_SECOND:-$START_WINDOW}"
 TEMPORAL_WARMUP_FRAMES="${JASNA_TEMPORAL_WARMUP_FRAMES:-5}"
+STEREO_WRITER_DEPTH="${JASNA_STEREO_WRITER_DEPTH:-2}"
 RUN_STARTED_SECONDS=$SECONDS
 
-[[ -d "$REFERENCE_WORK_DIR" ]] || {
-  echo "error: reference work directory not found: $REFERENCE_WORK_DIR" >&2
-  exit 1
-}
 [[ "$OUTPUT_PATH" != *[[:space:]] ]] || {
   echo "error: output path ends with whitespace: '$OUTPUT_PATH'" >&2
   exit 1
@@ -63,17 +113,23 @@ RUN_STARTED_SECONDS=$SECONDS
   exit 1
 }
 export JASNA_TEMPORAL_WARMUP_FRAMES="$TEMPORAL_WARMUP_FRAMES"
-[[ "$START_WINDOW" =~ ^[0-9]+$ && "$START_WINDOW" -le 29 ]] || {
-  echo "error: JASNA_RESTORE_ONLY_START_SECOND must be an integer from 0 through 29" >&2
+[[ "$STEREO_WRITER_DEPTH" == "1" || "$STEREO_WRITER_DEPTH" == "2" ]] || {
+  echo "error: JASNA_STEREO_WRITER_DEPTH must be 1 or 2" >&2
   exit 1
 }
-[[ -n "$SELECTED_SECONDS" ]] || SELECTED_SECONDS=$((30 - START_WINDOW))
-[[ "$SELECTED_SECONDS" =~ ^[1-9][0-9]*$ \
-  && "$SELECTED_SECONDS" -le $((30 - START_WINDOW)) ]] || {
-  echo "error: JASNA_RESTORE_ONLY_SECONDS must fit between the selected start and second 30" >&2
+export JASNA_STEREO_WRITER_DEPTH="$STEREO_WRITER_DEPTH"
+[[ "$START_WINDOW" =~ ^[0-9]+$ ]] || {
+  echo "error: JASNA_RESTORE_ONLY_START_SECOND must be a non-negative integer" >&2
   exit 1
 }
-END_WINDOW=$((START_WINDOW + SELECTED_SECONDS))
+[[ -z "$SELECTED_SECONDS" || "$SELECTED_SECONDS" =~ ^[1-9][0-9]*$ ]] || {
+  echo "error: JASNA_RESTORE_ONLY_SECONDS must be a positive integer" >&2
+  exit 1
+}
+[[ "$AUDIO_START_SECOND" =~ ^[0-9]+$ ]] || {
+  echo "error: JASNA_RESTORE_ONLY_AUDIO_START_SECOND must be a non-negative integer" >&2
+  exit 1
+}
 [[ "$VALIDATE_ONLY" == "0" || "$VALIDATE_ONLY" == "1" ]] || {
   echo "error: JASNA_RESTORE_ONLY_VALIDATE must be 0 or 1" >&2
   exit 1
@@ -96,8 +152,6 @@ else
   exit 1
 fi
 
-REFERENCE_WORK_DIR="$(cd "$REFERENCE_WORK_DIR" && pwd)"
-SOURCE_CONFIG="$REFERENCE_WORK_DIR/run-config.txt"
 RECORDED_WORK_CONTAINER=""
 if [[ -s "$SOURCE_CONFIG" ]]; then
   RECORDED_WORK_CONTAINER="$(
@@ -128,8 +182,55 @@ case "$RECORDED_WORK_CONTAINER" in
     exit 1
     ;;
 esac
-LEFT_INPUT="$REFERENCE_WORK_DIR/left-restored.left-segments-work/source/left-00000.mov"
-RIGHT_INPUT="$REFERENCE_WORK_DIR/right-restored.right-segments-work/source/right-00000.mov"
+PHYSICAL_LEFT_INPUT="${JASNA_RESTORE_ONLY_LEFT_INPUT:-$REFERENCE_WORK_DIR/left-restored.left-segments-work/source/left-00000.mov}"
+PHYSICAL_RIGHT_INPUT="${JASNA_RESTORE_ONLY_RIGHT_INPUT:-$REFERENCE_WORK_DIR/right-restored.right-segments-work/source/right-00000.mov}"
+if [[ -n "${JASNA_RESTORE_ONLY_LEFT_INPUT:-}" \
+  || -n "${JASNA_RESTORE_ONLY_RIGHT_INPUT:-}" ]]; then
+  [[ -n "${JASNA_RESTORE_ONLY_LEFT_INPUT:-}" \
+    && -n "${JASNA_RESTORE_ONLY_RIGHT_INPUT:-}" ]] || {
+    echo "error: both restoration-only eye input overrides are required" >&2
+    exit 1
+  }
+  [[ -s "$PHYSICAL_LEFT_INPUT" && -s "$PHYSICAL_RIGHT_INPUT" ]] || {
+    echo "error: an explicitly selected eye/shared input is missing or empty" >&2
+    echo "refusing to substitute a different source segment" >&2
+    exit 1
+  }
+fi
+if [[ -s "$PHYSICAL_LEFT_INPUT" && -s "$PHYSICAL_RIGHT_INPUT" ]]; then
+  LEFT_INPUT="$PHYSICAL_LEFT_INPUT"
+  RIGHT_INPUT="$PHYSICAL_RIGHT_INPUT"
+  if [[ "$PHYSICAL_LEFT_INPUT" -ef "$PHYSICAL_RIGHT_INPUT" ]]; then
+    RESTORE_INPUT_KIND="one shared 8K SBS decode"
+  else
+    RESTORE_INPUT_KIND="physical 4K eye files"
+  fi
+else
+  RECORDED_SHARED_SBS="$(
+    /usr/bin/awk -F= '$1 == "shared_sbs_source" { print $2; exit }' "$SOURCE_CONFIG"
+  )"
+  [[ "$RECORDED_SHARED_SBS" == "1" ]] || {
+    echo "error: reusable physical eye inputs are missing and shared SBS was not recorded" >&2
+    exit 1
+  }
+  SHARED_SEGMENT_INPUT=""
+  for candidate in \
+      "$REFERENCE_WORK_DIR/shared-sbs-source/shared-00000.mp4" \
+      "$REFERENCE_WORK_DIR/shared-sbs-source/shared-00000.mov"; do
+    if [[ -s "$candidate" ]]; then
+      SHARED_SEGMENT_INPUT="$candidate"
+      break
+    fi
+  done
+  [[ -n "$SHARED_SEGMENT_INPUT" ]] || SHARED_SEGMENT_INPUT="$SOURCE_SBS"
+  # The direct stereo command recognizes identical 8K left/right paths and
+  # performs one shared decode with in-memory eye crops. Newer production work
+  # directories intentionally omit the old physical 4K intermediates. Prefer
+  # the first bounded shared segment because its timeline matches manifest 0.
+  LEFT_INPUT="$SHARED_SEGMENT_INPUT"
+  RIGHT_INPUT="$SHARED_SEGMENT_INPUT"
+  RESTORE_INPUT_KIND="one shared 8K SBS decode"
+fi
 
 find_one_manifest() {
   local eye="$1"
@@ -140,7 +241,17 @@ find_one_manifest() {
   printf '%s\n' "$found"
 }
 
-if [[ -s "$REFERENCE_WORK_DIR/stereo-reconciled-manifests/left-00000.json" \
+if [[ -n "${JASNA_RESTORE_ONLY_LEFT_MANIFEST:-}" \
+  || -n "${JASNA_RESTORE_ONLY_RIGHT_MANIFEST:-}" ]]; then
+  [[ -n "${JASNA_RESTORE_ONLY_LEFT_MANIFEST:-}" \
+    && -n "${JASNA_RESTORE_ONLY_RIGHT_MANIFEST:-}" ]] || {
+    echo "error: both restoration-only manifest overrides are required" >&2
+    exit 1
+  }
+  LEFT_MANIFEST="$JASNA_RESTORE_ONLY_LEFT_MANIFEST"
+  RIGHT_MANIFEST="$JASNA_RESTORE_ONLY_RIGHT_MANIFEST"
+  MANIFEST_KIND="selected reconciled stereo"
+elif [[ -s "$REFERENCE_WORK_DIR/stereo-reconciled-manifests/left-00000.json" \
   && -s "$REFERENCE_WORK_DIR/stereo-reconciled-manifests/right-00000.json" ]]; then
   LEFT_MANIFEST="$REFERENCE_WORK_DIR/stereo-reconciled-manifests/left-00000.json"
   RIGHT_MANIFEST="$REFERENCE_WORK_DIR/stereo-reconciled-manifests/right-00000.json"
@@ -173,8 +284,8 @@ SOURCE_INFO="$(
 IFS=, read -r SOURCE_CODEC SOURCE_WIDTH SOURCE_HEIGHT SOURCE_RATE \
   SOURCE_FRAME_COUNT SOURCE_EXTRA <<< "$SOURCE_INFO"
 [[ -z "$SOURCE_EXTRA" && "$SOURCE_WIDTH" == "8192" \
-  && "$SOURCE_HEIGHT" == "4096" && "$SOURCE_FRAME_COUNT" == "900" ]] || {
-  echo "error: reference source must be a 30-second, 900-frame 8192x4096 clip" >&2
+  && "$SOURCE_HEIGHT" == "4096" && "$SOURCE_FRAME_COUNT" =~ ^[0-9]+$ ]] || {
+  echo "error: reference source must be a frame-counted 8192x4096 video" >&2
   echo "found: $SOURCE_INFO" >&2
   exit 1
 }
@@ -187,20 +298,52 @@ IFS=, read -r SOURCE_CODEC SOURCE_WIDTH SOURCE_HEIGHT SOURCE_RATE \
   exit 1
 }
 
-/usr/bin/python3 - "$LEFT_MANIFEST" "$RIGHT_MANIFEST" <<'PY'
+LEFT_INPUT_FRAME_COUNT="$(
+  "$FFPROBE_PATH" -v error -select_streams v:0 \
+    -show_entries stream=nb_frames -of default=nw=1:nk=1 "$LEFT_INPUT"
+)"
+RIGHT_INPUT_FRAME_COUNT="$(
+  "$FFPROBE_PATH" -v error -select_streams v:0 \
+    -show_entries stream=nb_frames -of default=nw=1:nk=1 "$RIGHT_INPUT"
+)"
+[[ "$LEFT_INPUT_FRAME_COUNT" =~ ^[0-9]+$ \
+  && "$RIGHT_INPUT_FRAME_COUNT" == "$LEFT_INPUT_FRAME_COUNT" \
+  && "$LEFT_INPUT_FRAME_COUNT" -ge 30 ]] || {
+  echo "error: reusable eye inputs must have matching frame counts" >&2
+  exit 1
+}
+INPUT_SECONDS=$((LEFT_INPUT_FRAME_COUNT / 30))
+[[ "$START_WINDOW" -lt "$INPUT_SECONDS" ]] || {
+  echo "error: selected segment contains only $INPUT_SECONDS second(s)" >&2
+  exit 1
+}
+[[ -n "$SELECTED_SECONDS" ]] || SELECTED_SECONDS=$((INPUT_SECONDS - START_WINDOW))
+END_WINDOW=$((START_WINDOW + SELECTED_SECONDS))
+[[ "$END_WINDOW" -le "$INPUT_SECONDS" ]] || {
+  echo "error: restoration range $START_WINDOW-$END_WINDOW exceeds the selected segment" >&2
+  exit 1
+}
+[[ "$SOURCE_FRAME_COUNT" -ge $(((AUDIO_START_SECOND + SELECTED_SECONDS) * 30)) ]] || {
+  echo "error: prepared SBS source does not contain the selected audio timeline" >&2
+  exit 1
+}
+
+/usr/bin/python3 - "$LEFT_MANIFEST" "$RIGHT_MANIFEST" "$LEFT_INPUT_FRAME_COUNT" <<'PY'
 import json
 import sys
 
-for eye, path in zip(("left", "right"), sys.argv[1:]):
+expected_frames = int(sys.argv[3])
+for eye, path in zip(("left", "right"), sys.argv[1:3]):
     with open(path, "r", encoding="utf-8") as handle:
         manifest = json.load(handle)
     actual = (
         manifest.get("width"), manifest.get("height"),
         manifest.get("frameCount"), manifest.get("framesPerSecond"),
     )
-    if actual != (4096, 4096, 900, 30):
+    if actual != (4096, 4096, expected_frames, 30):
         raise SystemExit(
-            f"error: {eye} manifest does not describe 4096x4096, 900-frame, 30-fps input: {actual}"
+            f"error: {eye} manifest does not match the reusable 4096x4096, "
+            f"{expected_frames}-frame, 30-fps input: {actual}"
         )
 PY
 
@@ -209,8 +352,10 @@ echo "Reference:  $REFERENCE_WORK_DIR"
 echo "Source:     $SOURCE_SBS"
 echo "Container:  ${SOURCE_SBS##*.} (reused without conversion)"
 echo "Manifests:  $MANIFEST_KIND (detector will not run)"
+echo "Restore input: $RESTORE_INPUT_KIND"
 echo "Frames:     $SOURCE_FRAME_COUNT at $SOURCE_RATE"
 echo "Selected:   relative seconds $START_WINDOW-$END_WINDOW ($SELECTED_SECONDS second(s))"
+echo "Source timeline: seconds $AUDIO_START_SECOND-$((AUDIO_START_SECOND + SELECTED_SECONDS))"
 echo "Output:     $OUTPUT_PATH"
 echo "Windows/process: $WINDOWS_PER_PROCESS"
 echo "Models:     ${JASNA_MODELS_DIR:-$ROOT_DIR/Models/MetalML}"
@@ -349,8 +494,9 @@ while (( WINDOW_START < END_WINDOW )); do
       [[ ! -e "$BYPASS_TEMP" ]] || mv "$BYPASS_TEMP" \
         "${BYPASS_TEMP%.mov}.interrupted-$(date '+%Y%m%d-%H%M%S').mov"
       echo "Bypassing detector-confirmed clean windows $((WINDOW_START + 1))-$WINDOW_END/30"
+      BYPASS_SOURCE_SECOND=$((AUDIO_START_SECOND + WINDOW_START - START_WINDOW))
       if "$FFMPEG_PATH" -hide_banner -loglevel error \
-          -ss "$WINDOW_START" -i "$SOURCE_SBS" -t "$WINDOW_COUNT" \
+          -ss "$BYPASS_SOURCE_SECOND" -i "$SOURCE_SBS" -t "$WINDOW_COUNT" \
           -map '0:v:0' -an -c copy -avoid_negative_ts make_zero \
           -video_track_timescale 600 -movflags +faststart "$BYPASS_TEMP" \
         && valid_segment "$BYPASS_TEMP" "$EXPECTED_SEGMENT_FRAMES"; then
@@ -411,7 +557,7 @@ fi
 echo "Joining restored video and copying source audio"
 "$FFMPEG_PATH" -hide_banner \
   -f concat -safe 0 -i "$CONCAT_PATH" \
-  -ss "$START_WINDOW" -t "$SELECTED_SECONDS" -i "$SOURCE_SBS" \
+  -ss "$AUDIO_START_SECOND" -t "$SELECTED_SECONDS" -i "$SOURCE_SBS" \
   -map '0:v:0' -map '1:a?' -map_metadata 1 -map_chapters 1 \
   -c copy -video_track_timescale 600 -movflags +faststart -shortest \
   "$FINAL_TEMP"
@@ -425,6 +571,7 @@ ELAPSED_SECONDS=$((SECONDS - RUN_STARTED_SECONDS))
 echo "Restoration-only selected-range test: PASS"
 echo "Preparation/detection time: 0 seconds (reused)"
 echo "Selected source-relative seconds: $START_WINDOW-$END_WINDOW"
+echo "Selected prepared-SBS timeline: $AUDIO_START_SECOND-$((AUDIO_START_SECOND + SELECTED_SECONDS))"
 echo "Restored/bypassed windows: $RESTORED_WINDOWS/$BYPASSED_WINDOWS"
 echo "Wall time: ${ELAPSED_SECONDS}s"
 echo "Output: $OUTPUT_PATH"

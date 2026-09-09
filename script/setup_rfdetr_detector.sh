@@ -15,6 +15,7 @@ VR_MODEL_PATH="$MODEL_DIR/rfdetr-vr-v1.pt"
 V6_MODEL_PATH="$MODEL_DIR/rfdetr-v6.pt"
 PYTHON_BIN="${JASNA_RFDETR_PYTHON:-/opt/homebrew/bin/python3.13}"
 VENV_PATH="$ROOT_DIR/.venv-rfdetr"
+RFDETR_VERSION="1.10.0"
 
 EXPECTED_PART_ZERO="ea73281ebf73980cc71550a20e888e1c9ab2ba894bdf865b4eef42f671ecfcbd"
 EXPECTED_PART_ONE="19c973c24db7caaa48cf68bd1c33c3fe1db675495fbae70db2dc0d78d4a227c2"
@@ -81,9 +82,9 @@ if [[ ! -x "$VENV_PATH/bin/python" ]]; then
   "$PYTHON_BIN" -m venv "$VENV_PATH"
 fi
 "$VENV_PATH/bin/python" -m pip install --disable-pip-version-check \
-  'rfdetr==1.8.3' 'transformers==5.1.0' 'opencv-python-headless'
+  "rfdetr==$RFDETR_VERSION" 'transformers==5.1.0' 'opencv-python-headless'
 "$VENV_PATH/bin/python" -c \
-  'import cv2, rfdetr, torch; print(f"RF-DETR ready: torch {torch.__version__}, MPS {torch.backends.mps.is_available()}")'
+  'import cv2, importlib.metadata, rfdetr, torch; installed = importlib.metadata.version("rfdetr"); print(f"RF-DETR {installed} ready: torch {torch.__version__}, MPS {torch.backends.mps.is_available()}")'
 
 echo "VR model:    $VR_MODEL_PATH"
 echo "Fast model:  $V6_MODEL_PATH"

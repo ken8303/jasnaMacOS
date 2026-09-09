@@ -15,9 +15,19 @@ WINDOW_FRAMES = 30
 
 
 def center(region):
+    blend_x = region.get("blendX")
+    blend_y = region.get("blendY")
+    blend_width = region.get("blendWidth")
+    blend_height = region.get("blendHeight")
     return (
-        float(region["blendX"] + region["blendWidth"] / 2),
-        float(region["blendY"] + region["blendHeight"] / 2),
+        float(
+            (region["x"] if blend_x is None else blend_x)
+            + (region["width"] if blend_width is None else blend_width) / 2
+        ),
+        float(
+            (region["y"] if blend_y is None else blend_y)
+            + (region["height"] if blend_height is None else blend_height) / 2
+        ),
     )
 
 
@@ -79,8 +89,10 @@ def shifted_region(region, dx, dy, width, height, start_frame, end_frame):
     applied_dy = crop_y - int(region["y"])
     inferred["x"] = crop_x
     inferred["y"] = crop_y
-    inferred["blendX"] = int(region["blendX"]) + applied_dx
-    inferred["blendY"] = int(region["blendY"]) + applied_dy
+    blend_x = region.get("blendX")
+    blend_y = region.get("blendY")
+    inferred["blendX"] = int(region["x"] if blend_x is None else blend_x) + applied_dx
+    inferred["blendY"] = int(region["y"] if blend_y is None else blend_y) + applied_dy
     if "maskKeyframes" in inferred:
         keyframes = [
             keyframe

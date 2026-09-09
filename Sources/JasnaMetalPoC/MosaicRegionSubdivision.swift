@@ -9,6 +9,7 @@ struct MosaicRegionSubdivisionConfiguration: Equatable, Sendable {
     let maskFeatherFraction: Double
     let blockResidualGrowthFraction: Double
     let maskTemporalRadius: Int
+    let maskTemporalStrength: Double
     let detailCropDimension: Int
     let detailCropCount: Int
 
@@ -21,6 +22,7 @@ struct MosaicRegionSubdivisionConfiguration: Equatable, Sendable {
         maskFeatherFraction: 0,
         blockResidualGrowthFraction: 0,
         maskTemporalRadius: 0,
+        maskTemporalStrength: 0.5,
         detailCropDimension: 0,
         detailCropCount: 0
     )
@@ -53,6 +55,9 @@ struct MosaicRegionSubdivisionConfiguration: Equatable, Sendable {
                     Int(environment["JASNA_LARGE_REGION_MASK_TEMPORAL_RADIUS"] ?? "") ?? 1
                 )
             ),
+            maskTemporalStrength: boundedUnitFraction(
+                environment["JASNA_LARGE_REGION_MASK_TEMPORAL_STRENGTH"], default: 0.5
+            ),
             detailCropDimension: min(
                 maximumBlendDimension,
                 max(
@@ -72,6 +77,15 @@ struct MosaicRegionSubdivisionConfiguration: Equatable, Sendable {
             return defaultValue
         }
         return min(0.25, max(0, parsed))
+    }
+
+    private static func boundedUnitFraction(
+        _ value: String?, default defaultValue: Double
+    ) -> Double {
+        guard let value, let parsed = Double(value), parsed.isFinite else {
+            return defaultValue
+        }
+        return min(1, max(0, parsed))
     }
 }
 
@@ -109,6 +123,9 @@ enum MosaicRegionSubdivision {
         let regions: [MosaicRegion]
         let splitRegionCount: Int
         let addedModelCropCount: Int
+        let subdivisionModelCropCount: Int
+        let classifiedMaskCropCount: Int
+        let zeroMaskCropCount: Int
     }
 
     struct TemporalResult: Equatable, Sendable {
@@ -312,7 +329,14 @@ enum MosaicRegionSubdivision {
         guard configuration.maximumBlendDimension > 0,
               !regions.isEmpty
         else {
-            return Result(regions: regions, splitRegionCount: 0, addedModelCropCount: 0)
+            return Result(
+                regions: regions,
+                splitRegionCount: 0,
+                addedModelCropCount: 0,
+                subdivisionModelCropCount: 0,
+                classifiedMaskCropCount: 0,
+                zeroMaskCropCount: 0
+            )
         }
         let candidates = regions.indices.filter { index in
             max(
@@ -333,6 +357,9 @@ enum MosaicRegionSubdivision {
             regions.count + selected.count * (3 + configuration.detailCropCount)
         )
         var added = 0
+        var subdivisionModelCropCount = 0
+        var classifiedMaskCropCount = 0
+        var zeroMaskCropCount = 0
         for (index, region) in regions.enumerated() {
             let expandedMaskRegion = expandingMaskCoverage(
                 of: region, configuration: configuration
@@ -356,12 +383,49 @@ enum MosaicRegionSubdivision {
             expanded.append(contentsOf: children)
             expanded.append(contentsOf: detailCrops)
             added += children.count + detailCrops.count - 1
+            let modelCrops = children + detailCrops
+            subdivisionModelCropCount += modelCrops.count
+            for crop in modelCrops {
+                guard let containsMaskCoverage = semanticMaskContainsCoverage(crop) else {
+                    continue
+                }
+                classifiedMaskCropCount += 1
+                if !containsMaskCoverage { zeroMaskCropCount += 1 }
+            }
         }
         return Result(
             regions: expanded,
             splitRegionCount: selected.count,
-            addedModelCropCount: added
+            addedModelCropCount: added,
+            subdivisionModelCropCount: subdivisionModelCropCount,
+            classifiedMaskCropCount: classifiedMaskCropCount,
+            zeroMaskCropCount: zeroMaskCropCount
         )
+    }
+
+    /// Returns whether any static or temporal semantic mask contains coverage.
+    /// `nil` means that the crop has no valid mask data and must not be treated
+    /// as empty. This is diagnostic only: an all-zero semantic mask can still
+    /// contribute through the compositor's model-delta mask-hole recovery.
+    static func semanticMaskContainsCoverage(_ region: MosaicRegion) -> Bool? {
+        guard let maskWidth = region.maskWidth,
+              let maskHeight = region.maskHeight,
+              maskWidth > 1,
+              maskHeight > 1
+        else { return nil }
+        let expectedCount = maskWidth * maskHeight
+        var validMaskCount = 0
+        if let maskData = region.maskData, maskData.count == expectedCount {
+            validMaskCount += 1
+            if maskData.contains(where: { $0 != 0 }) { return true }
+        }
+        if let keyframes = region.maskKeyframes {
+            for keyframe in keyframes where keyframe.maskData.count == expectedCount {
+                validMaskCount += 1
+                if keyframe.maskData.contains(where: { $0 != 0 }) { return true }
+            }
+        }
+        return validMaskCount > 0 ? false : nil
     }
 
     static func expandedMask(
@@ -522,22 +586,33 @@ enum MosaicRegionSubdivision {
     static func temporallyStabilizedKeyframes(
         _ keyframes: [MosaicMaskKeyframe],
         expectedByteCount: Int,
-        radius: Int
+        radius: Int,
+        strength: Double = 0.5
     ) -> [MosaicMaskKeyframe] {
         guard radius > 0, keyframes.count > 1 else { return keyframes }
+        let boundedStrength = min(1, max(0, strength))
         return keyframes.indices.map { index in
             var output = [UInt8](keyframes[index].maskData)
             guard output.count == expectedByteCount else { return keyframes[index] }
             let lower = max(keyframes.startIndex, index - radius)
             let upper = min(keyframes.index(before: keyframes.endIndex), index + radius)
             for neighbourIndex in lower...upper where neighbourIndex != index {
+                // Radius primarily counts adjacent keyframes, but do not allow a
+                // sparse/imported manifest to union masks from an unrelated
+                // point in the motion. Two source frames per radius preserves
+                // the existing short-gap smoothing while bounding stale masks.
+                let frameDistance = abs(
+                    keyframes[neighbourIndex].frame - keyframes[index].frame
+                )
+                guard frameDistance <= radius * 2 else { continue }
                 let neighbour = [UInt8](keyframes[neighbourIndex].maskData)
                 guard neighbour.count == expectedByteCount else { continue }
                 for byteIndex in output.indices {
-                    // Keep the neighbour below the 128 expansion threshold:
-                    // it contributes alpha but does not seed another full halo.
+                    // The default 0.5 contribution stays below the 128 expansion
+                    // threshold. A recovery-only A/B may opt into a full temporal
+                    // union when fast motion otherwise leaves half-restored blocks.
                     let temporalCandidate = UInt8(
-                        clamping: Int(neighbour[byteIndex]) / 2
+                        clamping: Int(Double(neighbour[byteIndex]) * boundedStrength)
                     )
                     output[byteIndex] = max(output[byteIndex], temporalCandidate)
                 }
@@ -573,7 +648,8 @@ enum MosaicRegionSubdivision {
             temporallyStabilizedKeyframes(
                 $0,
                 expectedByteCount: maskWidth * maskHeight,
-                radius: configuration.maskTemporalRadius
+                radius: configuration.maskTemporalRadius,
+                strength: configuration.maskTemporalStrength
             )
         }
         let expandedKeyframes = stabilizedKeyframes?.compactMap { keyframe in

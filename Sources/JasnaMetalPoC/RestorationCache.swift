@@ -171,10 +171,13 @@ extension SideBySideRestoration {
         regions: [MosaicRegion],
         projection: VRMosaicProjection = .raw,
         restorationIdentity: String = "",
-        temporalWarmupFrames: Int = 0
+        temporalWarmupFrames: Int = 0,
+        allowPassthrough: Bool = false
     ) -> String {
         var hash: UInt64 = 14_695_981_039_346_656_037
-        for byte in "\(projection.rawValue):\(restorationIdentity):warmup=\(temporalWarmupFrames)".utf8 {
+        let configuration = "\(projection.rawValue):\(restorationIdentity):"
+            + "warmup=\(temporalWarmupFrames):passthrough=\(allowPassthrough ? 1 : 0)"
+        for byte in configuration.utf8 {
             hash ^= UInt64(byte)
             hash &*= 1_099_511_628_211
         }
@@ -196,7 +199,7 @@ extension SideBySideRestoration {
                 }
             }
         }
-        return String(format: "crop-v4-%@-%016llx", projection.rawValue, hash)
+        return String(format: "crop-v5-%@-%016llx", projection.rawValue, hash)
     }
 
     static func restorationCacheIdentity(

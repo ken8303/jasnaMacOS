@@ -32,6 +32,7 @@ extension SideBySideRestoration {
         let exactDuplicateCount: Int
         let highOverlapPairCount: Int
         let containedPairCount: Int
+        let protectedDetailContainedPairCount: Int
     }
 
     private struct ModelCropReuseKey: Hashable {
@@ -64,6 +65,7 @@ extension SideBySideRestoration {
         }
         var highOverlapPairCount = 0
         var containedPairCount = 0
+        var protectedDetailContainedPairCount = 0
         if regions.count > 1 {
             for leftIndex in 0..<(regions.count - 1) {
                 for rightIndex in (leftIndex + 1)..<regions.count {
@@ -93,6 +95,9 @@ extension SideBySideRestoration {
                     }
                     if intersection == min(leftArea, rightArea) {
                         containedPairCount += 1
+                        if left.detailBlendFeather != nil || right.detailBlendFeather != nil {
+                            protectedDetailContainedPairCount += 1
+                        }
                     }
                 }
             }
@@ -103,7 +108,8 @@ extension SideBySideRestoration {
             uniqueExactCropCount: uniqueCount,
             exactDuplicateCount: regions.count - uniqueCount,
             highOverlapPairCount: highOverlapPairCount,
-            containedPairCount: containedPairCount
+            containedPairCount: containedPairCount,
+            protectedDetailContainedPairCount: protectedDetailContainedPairCount
         )
     }
 
@@ -118,7 +124,8 @@ extension SideBySideRestoration {
                 + "\(summary.uniqueExactCropCount)/\(summary.cropCount) unique exact crops, "
                 + "\(summary.exactDuplicateCount) reusable duplicate(s), "
                 + "\(summary.highOverlapPairCount) high-overlap pair(s), "
-                + "\(summary.containedPairCount) contained pair(s)"
+                + "\(summary.containedPairCount) contained pair(s), "
+                + "\(summary.protectedDetailContainedPairCount) protected detail pair(s)"
         )
     }
 
@@ -139,6 +146,112 @@ extension SideBySideRestoration {
         let restoredFrameOffset: Int
         let inputFrames: [[Float16]]
         let context: String
+    }
+
+    private struct PreparedRegionBatch: Sendable {
+        let work: [PreparedRegionRestoration]
+        let extractionMilliseconds: Double
+    }
+
+    // CVPixelBuffer contents remain immutable during region restoration, but
+    // CoreVideo does not declare the reference type Sendable. Keep that
+    // unchecked boundary confined to this preparation-only request.
+    private struct RegionPreparationRequest: @unchecked Sendable {
+        let regionRange: Range<Int>
+        let regions: [MosaicRegion]
+        let decodedFrames: [CVPixelBuffer]
+        let decodedStartFrame: Int
+        let outputCount: Int
+        let windowIndex: Int
+        let windowCount: Int
+        let samplingMaps: [MosaicCropSamplingMap]
+    }
+
+    private final class RegionPreparationFuture: @unchecked Sendable {
+        private let group = DispatchGroup()
+        private let lock = NSLock()
+        private var result: Result<PreparedRegionBatch, any Error>?
+
+        init(request: RegionPreparationRequest) {
+            group.enter()
+            DispatchQueue.global(qos: .userInitiated).async { [self] in
+                let prepared = Result {
+                    try SideBySideRestoration.prepareRegionBatch(request)
+                }
+                lock.withLock { result = prepared }
+                group.leave()
+            }
+        }
+
+        func value() throws -> PreparedRegionBatch {
+            group.wait()
+            return try lock.withLock {
+                guard let result else {
+                    throw DeformConvError.commandFailed(
+                        "region preparation completed without a result"
+                    )
+                }
+                return try result.get()
+            }
+        }
+    }
+
+    private static func prepareRegionBatch(
+        _ request: RegionPreparationRequest
+    ) throws -> PreparedRegionBatch {
+        let extractionStarted = ContinuousClock.now
+        let windowStartFrame = request.windowIndex
+            * SideBySideVideoPlan.temporalWindowFrames
+        let windowSchedule = TemporalWindowSchedule(
+            outputStartFrame: windowStartFrame,
+            outputFrameCount: request.outputCount,
+            requestedWarmupFrames: windowStartFrame - request.decodedStartFrame
+        )
+        let work = try request.regionRange.map { regionIndex in
+            let region = request.regions[regionIndex]
+            guard let regionSchedule = TemporalRegionSchedule(
+                regionStartFrame: region.startFrame,
+                regionEndFrame: region.endFrame,
+                window: windowSchedule
+            ) else {
+                throw DeformConvError.commandFailed(
+                    "mosaic crop does not intersect its assigned window"
+                )
+            }
+            guard regionSchedule.decodedLocalRange.lowerBound >= 0,
+                  regionSchedule.decodedLocalRange.upperBound
+                    <= request.decodedFrames.count,
+                  !regionSchedule.decodedLocalRange.isEmpty
+            else { throw DeformConvError.invalidShape }
+            let samplingMap = request.samplingMaps[regionIndex]
+            let modelFrames = request.decodedFrames[regionSchedule.decodedLocalRange]
+            var cropFrames = try modelFrames.map {
+                try samplingMap.extractPlanarRGB(from: $0)
+            }
+            while cropFrames.count < 3 {
+                guard let last = cropFrames.last else {
+                    throw DeformConvError.invalidShape
+                }
+                cropFrames.append(last)
+            }
+            let context = "Window \(request.windowIndex + 1)/"
+                + "\(request.windowCount): mosaic crop \(regionIndex + 1)/"
+                + "\(request.regions.count), x \(region.x), y \(region.y), "
+                + "size \(region.width)×\(region.height), frames "
+                + "\(region.startFrame)..<\(region.endFrame)"
+            return PreparedRegionRestoration(
+                regionIndex: regionIndex,
+                localStart: regionSchedule.outputLocalStart,
+                activeFrameCount: regionSchedule.activeFrameCount,
+                restoredFrameOffset: regionSchedule.restoredFrameOffset,
+                inputFrames: cropFrames,
+                context: context
+            )
+        }
+        return PreparedRegionBatch(
+            work: work,
+            extractionMilliseconds: elapsedMilliseconds(since: extractionStarted)
+        )
     }
 
     struct CompletedRegionRestoration: Sendable {
@@ -289,13 +402,17 @@ extension SideBySideRestoration {
             throw DeformConvError.invalidShape
         }
         let cacheBytes = regions.count * outputCount * tileBytes
-        let configuredWorkPath = workDirectoryURL?.path
-            ?? ProcessInfo.processInfo.environment["JASNA_WORK_DIR"]
-        let workURL = configuredWorkPath.map {
-            URL(fileURLWithPath: $0, isDirectory: true)
-        } ?? FileManager.default.temporaryDirectory
+        guard let configuredWorkPath = workDirectoryURL?.path
+            ?? ProcessInfo.processInfo.environment["JASNA_WORK_DIR"],
+            !configuredWorkPath.isEmpty
+        else {
+            throw DeformConvError.commandFailed(
+                "sparse restoration requires an output-local work directory"
+            )
+        }
+        let workURL = URL(fileURLWithPath: configuredWorkPath, isDirectory: true)
         try FileManager.default.createDirectory(at: workURL, withIntermediateDirectories: true)
-        let resumed = configuredWorkPath == nil ? nil : try resumableWindowCache(
+        let resumed = try resumableWindowCache(
             in: workURL,
             windowIndex: windowIndex,
             outputCount: outputCount,
@@ -312,10 +429,10 @@ extension SideBySideRestoration {
         do {
             let configuredMemoryLimitMiB = Int(
                 ProcessInfo.processInfo.environment["JASNA_IN_MEMORY_CACHE_LIMIT_MB"] ?? ""
-            ) ?? 512
+            ) ?? 128
             let memoryLimitBytes = max(0, configuredMemoryLimitMiB) * 1_048_576
             let useInMemoryCache = resumed == nil
-                && ProcessInfo.processInfo.environment["JASNA_IN_MEMORY_CROP_CACHE"] != "0"
+                && ProcessInfo.processInfo.environment["JASNA_IN_MEMORY_CROP_CACHE"] == "1"
                 && cacheBytes <= memoryLimitBytes
             let inMemoryCache = useInMemoryCache
                 ? try InMemoryRegionFrameCache(
@@ -342,6 +459,7 @@ extension SideBySideRestoration {
             let completedRegions = resumed?.completedTiles ?? 0
             var gpuMilliseconds: Double = 0
             var extractionMilliseconds: Double = 0
+            var foregroundPreparationMilliseconds: Double = 0
             var graphWallMilliseconds: Double = 0
             var inputPackingMilliseconds: Double = 0
             var graphExecutionMilliseconds: Double = 0
@@ -351,9 +469,7 @@ extension SideBySideRestoration {
             let configuredCheckpointInterval = Int(
                 ProcessInfo.processInfo.environment["JASNA_REGION_CHECKPOINT_INTERVAL"] ?? ""
             )
-            let checkpointInterval = configuredWorkPath == nil
-                ? max(1, regions.count)
-                : max(1, configuredCheckpointInterval ?? 5)
+            let checkpointInterval = max(1, configuredCheckpointInterval ?? 5)
             let batchModelsURL = sharedBatch2CircuitBreaker.isDisabled ? nil
                 : ProcessInfo.processInfo.environment[
                     "JASNA_BATCH2_MODELS_DIR"
@@ -368,6 +484,10 @@ extension SideBySideRestoration {
             // graphs are unstable in the macOS 27 beta. A fixed-batch graph can
             // still restore two compatible crops in one command buffer.
             let regionBatchSize = batchModelsURL == nil ? 1 : 2
+            let configuredPreparationDepth = Int(
+                ProcessInfo.processInfo.environment["JASNA_REGION_PREPARE_DEPTH"] ?? ""
+            ) ?? 1
+            let preparationDepth = min(2, max(1, configuredPreparationDepth))
             report(
                 "Window \(windowIndex + 1)/\(windowCount): restoring "
                     + "\(regions.count) tight mosaic crops; cache "
@@ -375,56 +495,71 @@ extension SideBySideRestoration {
                     + "model batch \(regionBatchSize); handoff "
                     + (useInMemoryCache ? "bounded memory" : "restartable disk")
             )
+            report(
+                "Window \(windowIndex + 1)/\(windowCount): crop preparation pipeline "
+                    + "depth \(preparationDepth)"
+            )
+            func preparationRequest(
+                _ regionRange: Range<Int>
+            ) -> RegionPreparationRequest {
+                RegionPreparationRequest(
+                    regionRange: regionRange,
+                    regions: regions,
+                    decodedFrames: decodedFrames,
+                    decodedStartFrame: decodedStartFrame,
+                    outputCount: outputCount,
+                    windowIndex: windowIndex,
+                    windowCount: windowCount,
+                    samplingMaps: samplingMaps
+                )
+            }
             var nextRegion = completedRegions
+            var pendingPreparation: (
+                range: Range<Int>, future: RegionPreparationFuture
+            )?
             while nextRegion < regions.count {
                 let batchEnd = min(regions.count, nextRegion + regionBatchSize)
-                let extractionStarted = ContinuousClock.now
-                let work = try (nextRegion..<batchEnd).map { regionIndex in
-                    let windowStartFrame = windowIndex * SideBySideVideoPlan.temporalWindowFrames
-                    let region = regions[regionIndex]
-                    let windowSchedule = TemporalWindowSchedule(
-                        outputStartFrame: windowStartFrame,
-                        outputFrameCount: outputCount,
-                        requestedWarmupFrames: windowStartFrame - decodedStartFrame
+                let currentRange = nextRegion..<batchEnd
+                let preparedBatch: PreparedRegionBatch
+                if let pendingPreparation,
+                   pendingPreparation.range == currentRange
+                {
+                    let waitStarted = ContinuousClock.now
+                    preparedBatch = try pendingPreparation.future.value()
+                    foregroundPreparationMilliseconds += elapsedMilliseconds(since: waitStarted)
+                } else {
+                    preparedBatch = try prepareRegionBatch(
+                        preparationRequest(currentRange)
                     )
-                    guard let regionSchedule = TemporalRegionSchedule(
-                        regionStartFrame: region.startFrame,
-                        regionEndFrame: region.endFrame,
-                        window: windowSchedule
-                    ) else {
-                        throw DeformConvError.commandFailed(
-                            "mosaic crop does not intersect its assigned window"
+                    foregroundPreparationMilliseconds += preparedBatch.extractionMilliseconds
+                }
+                pendingPreparation = nil
+                extractionMilliseconds += preparedBatch.extractionMilliseconds
+                let work = preparedBatch.work
+                let followingStart = batchEnd
+                if preparationDepth == 2, followingStart < regions.count {
+                    let followingEnd = min(
+                        regions.count, followingStart + regionBatchSize
+                    )
+                    let followingRange = followingStart..<followingEnd
+                    pendingPreparation = (
+                        range: followingRange,
+                        future: RegionPreparationFuture(
+                            request: preparationRequest(followingRange)
                         )
-                    }
-                    guard regionSchedule.decodedLocalRange.lowerBound >= 0,
-                          regionSchedule.decodedLocalRange.upperBound <= decodedFrames.count,
-                          !regionSchedule.decodedLocalRange.isEmpty
-                    else { throw DeformConvError.invalidShape }
-                    let samplingMap = samplingMaps[regionIndex]
-                    let modelFrames = decodedFrames[regionSchedule.decodedLocalRange]
-                    var cropFrames = try modelFrames.map {
-                        try samplingMap.extractPlanarRGB(from: $0)
-                    }
-                    while cropFrames.count < 3 {
-                        guard let last = cropFrames.last else {
-                            throw DeformConvError.invalidShape
-                        }
-                        cropFrames.append(last)
-                    }
-                    let context = "Window \(windowIndex + 1)/\(windowCount): mosaic crop "
-                        + "\(regionIndex + 1)/\(regions.count), x \(region.x), y \(region.y), "
-                        + "size \(region.width)×\(region.height), frames "
-                        + "\(region.startFrame)..<\(region.endFrame)"
-                    return PreparedRegionRestoration(
-                        regionIndex: regionIndex,
-                        localStart: regionSchedule.outputLocalStart,
-                        activeFrameCount: regionSchedule.activeFrameCount,
-                        restoredFrameOffset: regionSchedule.restoredFrameOffset,
-                        inputFrames: cropFrames,
-                        context: context
                     )
                 }
-                extractionMilliseconds += elapsedMilliseconds(since: extractionStarted)
+                let uncachedTemporalShapes = Set(work.map(\.inputFrames.count)).filter {
+                    $0 != 30 && $0 != 35
+                }.sorted()
+                if !uncachedTemporalShapes.isEmpty {
+                    report(
+                        "Window \(windowIndex + 1)/\(windowCount): partial temporal shape(s) "
+                            + "\(uncachedTemporalShapes.map(String.init).joined(separator: ",")) "
+                            + "frame(s); first use builds one bounded retained graph and "
+                            + "equal following crops reuse it"
+                    )
+                }
                 let completedWork: [CompletedRegionRestoration]
                 if let batchModelsURL, !sharedBatch2CircuitBreaker.isDisabled {
                     completedWork = try restorePreparedRegionsWithBatchFallback(
@@ -529,7 +664,9 @@ extension SideBySideRestoration {
             report(
                 "Window \(windowIndex + 1)/\(windowCount): sparse hot-path phases: "
                     + "\(restoredModelFrames) model frames, extraction "
-                    + "\(String(format: "%.3f", extractionMilliseconds)) ms, graph wall "
+                    + "\(String(format: "%.3f", extractionMilliseconds)) ms "
+                    + "(foreground blocking \(String(format: "%.3f", foregroundPreparationMilliseconds)) ms), "
+                    + "graph wall "
                     + "\(String(format: "%.3f", graphWallMilliseconds)) ms, GPU "
                     + "\(String(format: "%.3f", gpuMilliseconds)) ms, cache writes "
                     + "\(String(format: "%.3f", cacheWriteMilliseconds)) ms"
@@ -550,11 +687,7 @@ extension SideBySideRestoration {
                 inMemoryRegionCache: inMemoryCache
             )
         } catch {
-            if configuredWorkPath == nil {
-                try? FileManager.default.removeItem(at: directory)
-            } else {
-                report("Preserving failed crop cache at \(directory.path)")
-            }
+            report("Preserving failed crop cache at \(directory.path)")
             throw error
         }
     }
@@ -584,7 +717,8 @@ extension SideBySideRestoration {
                 + "\(String(format: "%.3f", configuration.maskGrowthFraction)), feather "
                 + "\(String(format: "%.3f", configuration.maskFeatherFraction)), block halo "
                 + "\(String(format: "%.3f", configuration.blockResidualGrowthFraction)), "
-                + "temporal radius \(configuration.maskTemporalRadius); lower detail "
+                + "temporal radius \(configuration.maskTemporalRadius), strength "
+                + "\(String(format: "%.3f", configuration.maskTemporalStrength)); lower detail "
                 + "\(configuration.detailCropCount)x"
                 + "\(configuration.detailCropDimension)px"
         )
@@ -615,6 +749,14 @@ extension SideBySideRestoration {
         report(
             "Temporal crop warm-up: \(configuration.frames) preceding frame(s); "
                 + "warm-up outputs are discarded"
+        )
+    }
+
+    static func reportCropExtractionConfiguration() {
+        report(
+            MosaicCropSamplingMap.parallelExtractionEnabled()
+                ? "Crop extraction: four-worker CPU sampling; exact FP16 output"
+                : "Crop extraction: serial compatibility mode"
         )
     }
 

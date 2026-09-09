@@ -343,6 +343,37 @@ private func benchmark(
 
 func runJasnaCLI() async throws {
     let commandLine = JasnaCommandLine()
+    // Generated application-path diagnostic: no normal Metal runner, models,
+    // detector, video decode, restoration graph, compositor, or encoder.
+    if let index = commandLine.index(of: .syntheticCropExtractionAB) {
+        guard commandLine.arguments.indices.contains(index + 1) else {
+            throw DeformConvError.commandFailed(
+                "--synthetic-crop-extraction-ab requires a new report path"
+            )
+        }
+        try runSyntheticCropExtractionAB(
+            reportURL: URL(fileURLWithPath: commandLine.arguments[index + 1])
+        )
+        return
+    }
+    // Load diagnostics must not initialize the normal runner, shader kernels,
+    // or tensor-allocation smoke test before the measurements begin.
+    if let index = commandLine.index(of: .metalMLLoadOnly) {
+        guard #available(macOS 27.0, *) else {
+            throw DeformConvError.commandFailed("Metal ML load-only requires macOS 27")
+        }
+        try runMetalMLLoadOnly(commandLine: commandLine, index: index)
+        return
+    }
+    // Generated production-graph lifecycle diagnostic: this uses the real
+    // batch-2 graph and weights, but no video, detector, compositor, or encoder.
+    if let index = commandLine.index(of: .metalMLGraphLifecycle) {
+        guard #available(macOS 27.0, *) else {
+            throw DeformConvError.commandFailed("Metal ML graph lifecycle requires macOS 27")
+        }
+        try runMetalMLGraphLifecycle(commandLine: commandLine, index: index)
+        return
+    }
     let runner = try MetalDeformConv()
     print("Metal device: \(runner.device.name)")
     print("Metal ML tensor family available: \(runner.device.supportsFamily(.apple7) ? "yes" : "no")")

@@ -11,6 +11,7 @@ private let subdivisionConfiguration = MosaicRegionSubdivisionConfiguration(
     maskFeatherFraction: 0.025,
     blockResidualGrowthFraction: 0.04,
     maskTemporalRadius: 1,
+    maskTemporalStrength: 0.5,
     detailCropDimension: 576,
     detailCropCount: 1
 )
@@ -94,6 +95,74 @@ private let subdivisionConfiguration = MosaicRegionSubdivisionConfiguration(
     #expect(!result.regions.contains(largest))
 }
 
+@Test func semanticMaskOccupancyIsConservativeAcrossStaticAndTemporalMasks() {
+    let noMask = MosaicRegion(
+        startFrame: 0, endFrame: 3, x: 0, y: 0,
+        width: 64, height: 64, confidence: 1
+    )
+    let zeroMask = MosaicRegion(
+        startFrame: 0, endFrame: 3, x: 0, y: 0,
+        width: 64, height: 64, confidence: 1,
+        maskWidth: 2, maskHeight: 2,
+        maskData: Data(repeating: 0, count: 4),
+        maskKeyframes: [
+            MosaicMaskKeyframe(frame: 0, maskData: Data(repeating: 0, count: 4)),
+        ]
+    )
+    let temporalCoverage = MosaicRegion(
+        startFrame: 0, endFrame: 3, x: 0, y: 0,
+        width: 64, height: 64, confidence: 1,
+        maskWidth: 2, maskHeight: 2,
+        maskData: Data(repeating: 0, count: 4),
+        maskKeyframes: [
+            MosaicMaskKeyframe(frame: 0, maskData: Data([0, 0, 0, 1])),
+        ]
+    )
+
+    #expect(MosaicRegionSubdivision.semanticMaskContainsCoverage(noMask) == nil)
+    #expect(MosaicRegionSubdivision.semanticMaskContainsCoverage(zeroMask) == false)
+    #expect(MosaicRegionSubdivision.semanticMaskContainsCoverage(temporalCoverage) == true)
+}
+
+@Test func subdivisionReportsAllZeroMaskCandidatesWithoutPruningThem() {
+    var mask = Data(repeating: 0, count: 8 * 8)
+    mask[0] = 255
+    let region = MosaicRegion(
+        startFrame: 0,
+        endFrame: 30,
+        x: 0,
+        y: 0,
+        width: 1_600,
+        height: 1_600,
+        confidence: 1,
+        maskWidth: 8,
+        maskHeight: 8,
+        maskData: mask
+    )
+    let telemetryConfiguration = MosaicRegionSubdivisionConfiguration(
+        maximumBlendDimension: 800,
+        overlap: 0,
+        splitLimit: 1,
+        maximumAxisCrops: 4,
+        maskGrowthFraction: 0,
+        maskFeatherFraction: 0,
+        blockResidualGrowthFraction: 0,
+        maskTemporalRadius: 0,
+        maskTemporalStrength: 0.5,
+        detailCropDimension: 576,
+        detailCropCount: 0
+    )
+
+    let result = MosaicRegionSubdivision.expand(
+        [region], configuration: telemetryConfiguration
+    )
+
+    #expect(result.regions.count == 4)
+    #expect(result.subdivisionModelCropCount == 4)
+    #expect(result.classifiedMaskCropCount == 4)
+    #expect(result.zeroMaskCropCount == 3)
+}
+
 @Test func subdivisionConfigurationCanBeDisabled() {
     let defaults = MosaicRegionSubdivisionConfiguration.fromEnvironment([:])
     let disabled = MosaicRegionSubdivisionConfiguration.fromEnvironment([
@@ -108,6 +177,7 @@ private let subdivisionConfiguration = MosaicRegionSubdivisionConfiguration(
     #expect(defaults.maskFeatherFraction == 0.025)
     #expect(defaults.blockResidualGrowthFraction == 0.04)
     #expect(defaults.maskTemporalRadius == 1)
+    #expect(defaults.maskTemporalStrength == 0.5)
     #expect(defaults.detailCropDimension == 576)
     #expect(defaults.detailCropCount == 1)
     #expect(disabled == .disabled)
@@ -255,6 +325,48 @@ private let subdivisionConfiguration = MosaicRegionSubdivisionConfiguration(
     #expect(stabilized[0].maskData[1] == 255)
     #expect(stabilized[0].maskData[7] == 127)
     #expect(stabilized[1].maskData[1] == 127)
+    #expect(stabilized[1].maskData[7] == 255)
+}
+
+@Test func adjacentMaskKeyframesCanUseFullTemporalCoverageForFastMotion() {
+    var first = [UInt8](repeating: 0, count: 9)
+    var second = [UInt8](repeating: 0, count: 9)
+    first[1] = 255
+    second[7] = 255
+    let stabilized = MosaicRegionSubdivision.temporallyStabilizedKeyframes(
+        [
+            MosaicMaskKeyframe(frame: 0, maskData: Data(first)),
+            MosaicMaskKeyframe(frame: 2, maskData: Data(second)),
+        ],
+        expectedByteCount: 9,
+        radius: 1,
+        strength: 1
+    )
+
+    #expect(stabilized[0].maskData[1] == 255)
+    #expect(stabilized[0].maskData[7] == 255)
+    #expect(stabilized[1].maskData[1] == 255)
+    #expect(stabilized[1].maskData[7] == 255)
+}
+
+@Test func distantMaskKeyframesDoNotLeakAcrossSparseManifestGaps() {
+    var first = [UInt8](repeating: 0, count: 9)
+    var distant = [UInt8](repeating: 0, count: 9)
+    first[1] = 255
+    distant[7] = 255
+    let stabilized = MosaicRegionSubdivision.temporallyStabilizedKeyframes(
+        [
+            MosaicMaskKeyframe(frame: 0, maskData: Data(first)),
+            MosaicMaskKeyframe(frame: 30, maskData: Data(distant)),
+        ],
+        expectedByteCount: 9,
+        radius: 1,
+        strength: 1
+    )
+
+    #expect(stabilized[0].maskData[1] == 255)
+    #expect(stabilized[0].maskData[7] == 0)
+    #expect(stabilized[1].maskData[1] == 0)
     #expect(stabilized[1].maskData[7] == 255)
 }
 
@@ -427,6 +539,7 @@ private let subdivisionConfiguration = MosaicRegionSubdivisionConfiguration(
         maskFeatherFraction: 0.025,
         blockResidualGrowthFraction: 0.04,
         maskTemporalRadius: 1,
+        maskTemporalStrength: 0.5,
         detailCropDimension: 576,
         detailCropCount: 2
     )

@@ -81,6 +81,7 @@ extension SideBySideRestoration {
         reportSubdivisionConfiguration(subdivisionConfiguration)
         reportTemporalCropConfiguration(temporalCropConfiguration)
         reportTemporalWarmupConfiguration(temporalWarmupConfiguration)
+        reportCropExtractionConfiguration()
         var decoder: FrameDecoder?
         let encoderWindowsPerSegment = min(
             windowFrameCounts.count,
@@ -99,6 +100,9 @@ extension SideBySideRestoration {
         var completedWindows = 0
         var restoredRegionWindows = 0
         var skippedTileWindows = 0
+        var subdivisionModelCrops = 0
+        var classifiedSubdivisionMasks = 0
+        var zeroSubdivisionMasks = 0
         var previousFrames = [CVPixelBuffer]()
         var previousFramesEnd = 0
         var windowIndex = 0
@@ -193,6 +197,9 @@ extension SideBySideRestoration {
                 let subdivision = MosaicRegionSubdivision.expand(
                     temporalCrops.regions, configuration: subdivisionConfiguration
                 )
+                subdivisionModelCrops += subdivision.subdivisionModelCropCount
+                classifiedSubdivisionMasks += subdivision.classifiedMaskCropCount
+                zeroSubdivisionMasks += subdivision.zeroMaskCropCount
                 let unsortedActiveRegions = fullDetectedRegionBlendEnabled
                     ? subdivision.regions.map { $0.usingFullDetectedRegionBlend() }
                     : subdivision.regions
@@ -224,6 +231,14 @@ extension SideBySideRestoration {
                         "Window \(currentWindowIndex + 1)/\(windowFrameCounts.count): "
                             + "split \(subdivision.splitRegionCount) oversized region(s), "
                             + "added \(subdivision.addedModelCropCount) overlapping crop(s)"
+                    )
+                    report(
+                        "Window \(currentWindowIndex + 1)/\(windowFrameCounts.count): "
+                            + "subdivision mask occupancy "
+                            + "\(subdivision.classifiedMaskCropCount)/"
+                            + "\(subdivision.subdivisionModelCropCount) classified, "
+                            + "\(subdivision.zeroMaskCropCount) all-zero candidate(s); "
+                            + "telemetry only, scheduling unchanged"
                     )
                 }
                 if temporalCrops.movingRegionCount > 0 {
@@ -272,7 +287,10 @@ extension SideBySideRestoration {
                     regions: activeRegions,
                     projection: projection,
                     restorationIdentity: restorationIdentity,
-                    temporalWarmupFrames: schedule.warmupFrameCount
+                    temporalWarmupFrames: schedule.warmupFrameCount,
+                    allowPassthrough: ProcessInfo.processInfo.environment[
+                        "JASNA_ALLOW_PASSTHROUGH"
+                    ] == "1"
                 )
                 let samplingMaps = activeRegions.map {
                     MosaicCropSamplingMap(
@@ -358,6 +376,18 @@ extension SideBySideRestoration {
                 + "\(restoredRegionWindows) mosaic crops restored, "
                 + "\(skippedTileWindows) clean windows bypassed"
         )
+        if subdivisionModelCrops > 0 {
+            let zeroPercent = classifiedSubdivisionMasks > 0
+                ? 100 * Double(zeroSubdivisionMasks) / Double(classifiedSubdivisionMasks)
+                : 0
+            report(
+                "Subdivision mask occupancy for processed windows: "
+                    + "\(classifiedSubdivisionMasks)/\(subdivisionModelCrops) classified, "
+                    + "\(zeroSubdivisionMasks) all-zero candidate(s) "
+                    + "(\(String(format: "%.1f", zeroPercent))% of classified); "
+                    + "telemetry only, scheduling unchanged"
+            )
+        }
         return completedWindows
     }
 
@@ -493,9 +523,16 @@ extension SideBySideRestoration {
         reportSubdivisionConfiguration(subdivisionConfiguration)
         reportTemporalCropConfiguration(temporalCropConfiguration)
         reportTemporalWarmupConfiguration(temporalWarmupConfiguration)
+        reportCropExtractionConfiguration()
         var previousLeftFrames = [CVPixelBuffer]()
         var previousRightFrames = [CVPixelBuffer]()
         var previousFramesEnd = rangeStartFrame
+        var leftSubdivisionModelCrops = 0
+        var rightSubdivisionModelCrops = 0
+        var leftClassifiedSubdivisionMasks = 0
+        var rightClassifiedSubdivisionMasks = 0
+        var leftZeroSubdivisionMasks = 0
+        var rightZeroSubdivisionMasks = 0
         for windowIndex in windowRange {
             let windowStart = windowIndex * SideBySideVideoPlan.temporalWindowFrames
             let outputCount = min(
@@ -522,6 +559,12 @@ extension SideBySideRestoration {
             let rightSubdivision = MosaicRegionSubdivision.expand(
                 rightTemporalCrops.regions, configuration: subdivisionConfiguration
             )
+            leftSubdivisionModelCrops += leftSubdivision.subdivisionModelCropCount
+            rightSubdivisionModelCrops += rightSubdivision.subdivisionModelCropCount
+            leftClassifiedSubdivisionMasks += leftSubdivision.classifiedMaskCropCount
+            rightClassifiedSubdivisionMasks += rightSubdivision.classifiedMaskCropCount
+            leftZeroSubdivisionMasks += leftSubdivision.zeroMaskCropCount
+            rightZeroSubdivisionMasks += rightSubdivision.zeroMaskCropCount
             let unsortedLeftRegions = fullDetectedRegionBlendEnabled
                 ? leftSubdivision.regions.map { $0.usingFullDetectedRegionBlend() }
                 : leftSubdivision.regions
@@ -579,6 +622,17 @@ extension SideBySideRestoration {
                         + "\(rightSubdivision.splitRegionCount), added crops "
                         + "\(leftSubdivision.addedModelCropCount)/"
                         + "\(rightSubdivision.addedModelCropCount)"
+                )
+                report(
+                    "Direct SBS window \(windowIndex + 1)/\(windowCount): subdivision "
+                        + "mask occupancy left/right classified "
+                        + "\(leftSubdivision.classifiedMaskCropCount)/"
+                        + "\(leftSubdivision.subdivisionModelCropCount), "
+                        + "\(rightSubdivision.classifiedMaskCropCount)/"
+                        + "\(rightSubdivision.subdivisionModelCropCount); all-zero "
+                        + "candidates \(leftSubdivision.zeroMaskCropCount)/"
+                        + "\(rightSubdivision.zeroMaskCropCount); telemetry only, "
+                        + "scheduling unchanged"
                 )
             }
             if leftTemporalCrops.movingRegionCount + rightTemporalCrops.movingRegionCount > 0 {
@@ -706,7 +760,10 @@ extension SideBySideRestoration {
                     regions: leftRegions,
                     projection: projection,
                     restorationIdentity: restorationIdentity,
-                    temporalWarmupFrames: schedule.warmupFrameCount
+                    temporalWarmupFrames: schedule.warmupFrameCount,
+                    allowPassthrough: ProcessInfo.processInfo.environment[
+                        "JASNA_ALLOW_PASSTHROUGH"
+                    ] == "1"
                 ),
                 projection: projection,
                 samplingMaps: leftSamplingMaps,
@@ -727,7 +784,10 @@ extension SideBySideRestoration {
                     regions: rightRegions,
                     projection: projection,
                     restorationIdentity: restorationIdentity,
-                    temporalWarmupFrames: schedule.warmupFrameCount
+                    temporalWarmupFrames: schedule.warmupFrameCount,
+                    allowPassthrough: ProcessInfo.processInfo.environment[
+                        "JASNA_ALLOW_PASSTHROUGH"
+                    ] == "1"
                 ),
                 projection: projection,
                 samplingMaps: rightSamplingMaps,
@@ -764,6 +824,21 @@ extension SideBySideRestoration {
         }
         for directory in completedCacheDirectories {
             try FileManager.default.removeItem(at: directory)
+        }
+        if leftSubdivisionModelCrops + rightSubdivisionModelCrops > 0 {
+            let classified = leftClassifiedSubdivisionMasks
+                + rightClassifiedSubdivisionMasks
+            let zero = leftZeroSubdivisionMasks + rightZeroSubdivisionMasks
+            let zeroPercent = classified > 0 ? 100 * Double(zero) / Double(classified) : 0
+            report(
+                "Direct SBS subdivision mask occupancy: left/right classified "
+                    + "\(leftClassifiedSubdivisionMasks)/\(leftSubdivisionModelCrops), "
+                    + "\(rightClassifiedSubdivisionMasks)/\(rightSubdivisionModelCrops); "
+                    + "all-zero candidates \(leftZeroSubdivisionMasks)/"
+                    + "\(rightZeroSubdivisionMasks) "
+                    + "(\(String(format: "%.1f", zeroPercent))% combined); "
+                    + "telemetry only, scheduling unchanged"
+            )
         }
         report(
             "Direct SBS segment encoded and validated: \(outputURL.path)"

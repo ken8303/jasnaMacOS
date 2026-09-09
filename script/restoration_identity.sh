@@ -55,6 +55,7 @@ jasna_implementation_fingerprint() {
     "$root_dir/Package.swift" \
     "$root_dir/Sources/JasnaMetalPoC" \
     "$root_dir/script/build_and_run.sh" \
+    "$root_dir/script/lib" \
     "$root_dir/script/restoration_identity.sh" \
     "$root_dir/script/restore_vr_eye_segments.sh" \
     "$root_dir/script/restore_vr_eye_sparse.sh" \

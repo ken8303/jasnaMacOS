@@ -14,6 +14,23 @@ class RFDetrPrediction:
     polygons: list[list[list[list[float]]]]
 
 
+def valid_prefix_counts(rows) -> list[int]:
+    """Count the leading valid entries in score-sorted selection rows."""
+    counts = []
+    for row in rows:
+        count = 0
+        saw_invalid = False
+        for value in row:
+            if bool(value):
+                if saw_invalid:
+                    raise ValueError("valid detector selections must form a prefix")
+                count += 1
+            else:
+                saw_invalid = True
+        counts.append(count)
+    return counts
+
+
 class RFDetrMPSDetector:
     """Run Jasna's RF-DETR checkpoint without full-resolution mask tensors.
 
@@ -104,7 +121,7 @@ class RFDetrMPSDetector:
         # the same query more than once when a checkpoint gains extra classes.
         query_probability = probability.amax(dim=2)
         values, selected_queries = torch.topk(
-            query_probability, select_count, dim=1
+            query_probability, select_count, dim=1, sorted=True
         )
 
         center_x, center_y, width, height = pred_boxes.unbind(-1)
@@ -131,16 +148,22 @@ class RFDetrMPSDetector:
 
         boxes_cpu = boxes.cpu().numpy()
         values_cpu = values.cpu().numpy()
-        masks_cpu = (masks > 0).cpu().numpy()
         valid_cpu = valid.cpu().numpy()
+        valid_counts = valid_prefix_counts(valid_cpu)
+        # Scores are sorted, so valid selections form a prefix. Transfer only
+        # that prefix instead of copying max_select masks for every image. The
+        # detector commonly keeps about 6 of 64 selections on 4K VR frames.
+        transfer_count = max(valid_counts, default=0)
+        if transfer_count > 0:
+            masks_cpu = (masks[:, :transfer_count] > 0).cpu().numpy()
+        else:
+            masks_cpu = None
         predictions = []
         for batch_index, (target_height, target_width) in enumerate(sizes):
             output_boxes = []
             confidences = []
             polygons = []
-            for select_index in range(select_count):
-                if not valid_cpu[batch_index, select_index]:
-                    continue
+            for select_index in range(valid_counts[batch_index]):
                 normalized_box = boxes_cpu[batch_index, select_index]
                 output_boxes.append(
                     [
@@ -151,6 +174,8 @@ class RFDetrMPSDetector:
                     ]
                 )
                 confidences.append(float(values_cpu[batch_index, select_index]))
+                if masks_cpu is None:
+                    raise RuntimeError("valid RF-DETR selection has no mask payload")
                 mask = masks_cpu[batch_index, select_index].astype(np.uint8)
                 contours, _ = cv2.findContours(
                     mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE

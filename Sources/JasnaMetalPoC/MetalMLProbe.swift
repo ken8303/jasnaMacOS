@@ -109,12 +109,23 @@ private func extentValues(_ extents: MTLTensorExtents) -> [Int] {
 @available(macOS 26.0, *)
 func makeMetalMLPipeline(
     device: MTLDevice,
-    packageURL: URL
+    packageURL: URL,
+    reportPhase: ((String) -> Void)? = nil,
+    reportMeasurement: ((MetalMLPipelineLoadMeasurement) -> Void)? = nil
 ) throws -> any MTL4MachineLearningPipelineState {
-    try MetalResourceCache.shared.machineLearningPipeline(
+    let started = ContinuousClock.now
+    var cacheHit = true
+    var libraryMilliseconds = 0.0
+    var compilerMilliseconds = 0.0
+    var specializationMilliseconds = 0.0
+    let pipeline = try MetalResourceCache.shared.machineLearningPipeline(
         device: device, packageURL: packageURL
     ) {
+        cacheHit = false
+        reportPhase?("loading package library")
+        let libraryStarted = ContinuousClock.now
         let library = try device.makeLibrary(URL: packageURL)
+        libraryMilliseconds = MetalMLPipelineLoadMeasurement.milliseconds(since: libraryStarted)
 
         let function = MTL4LibraryFunctionDescriptor()
         function.name = "main"
@@ -130,9 +141,25 @@ func makeMetalMLPipeline(
 
         let compilerDescriptor = MTL4CompilerDescriptor()
         compilerDescriptor.label = "Jasna Metal ML probe"
+        reportPhase?("creating compiler")
+        let compilerStarted = ContinuousClock.now
         let compiler = try device.makeCompiler(descriptor: compilerDescriptor)
-        return try compiler.makeMachineLearningPipelineState(descriptor: descriptor)
+        compilerMilliseconds = MetalMLPipelineLoadMeasurement.milliseconds(since: compilerStarted)
+        reportPhase?("specializing pipeline")
+        let specializationStarted = ContinuousClock.now
+        let created = try compiler.makeMachineLearningPipelineState(descriptor: descriptor)
+        specializationMilliseconds = MetalMLPipelineLoadMeasurement.milliseconds(since: specializationStarted)
+        return created
     }
+    reportMeasurement?(MetalMLPipelineLoadMeasurement(
+        package: packageURL.deletingPathExtension().lastPathComponent,
+        cacheHit: cacheHit,
+        libraryMilliseconds: libraryMilliseconds,
+        compilerMilliseconds: compilerMilliseconds,
+        specializationMilliseconds: specializationMilliseconds,
+        totalMilliseconds: MetalMLPipelineLoadMeasurement.milliseconds(since: started)
+    ))
+    return pipeline
 }
 
 @available(macOS 26.0, *)

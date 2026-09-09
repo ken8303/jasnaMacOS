@@ -229,13 +229,21 @@ import Testing
         projection: .fisheye,
         temporalWarmupFrames: 5
     )
+    let diagnosticPassthrough = SideBySideRestoration.sparseRegionCacheVariant(
+        regions: regions,
+        projection: .fisheye,
+        allowPassthrough: true
+    )
 
     #expect(raw != fisheye)
     #expect(fisheye != shiftedRange)
     #expect(fisheye != changedRestoration)
     #expect(fisheye != warmed)
+    #expect(fisheye != diagnosticPassthrough)
     #expect(raw.contains("raw"))
     #expect(fisheye.contains("fisheye"))
+    #expect(raw.hasPrefix("crop-v5-"))
+    #expect(fisheye.hasPrefix("crop-v5-"))
 }
 
 @Test func mosaicCropUsesAspectFitAndReflectPadding() {

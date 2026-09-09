@@ -20,7 +20,7 @@ EYE_BITRATE="${JASNA_EYE_BITRATE:-20000000}"
 SPARSE_MOSAIC="${JASNA_SPARSE_MOSAIC:-0}"
 VR_PROJECTION="${JASNA_VR_PROJECTION:-raw}"
 FAST_ENCODE="${JASNA_FAST_ENCODE:-1}"
-DETECT_BATCH_SIZE="${JASNA_DETECT_BATCH_SIZE:-2}"
+DETECT_BATCH_SIZE="${JASNA_DETECT_BATCH_SIZE:-1}"
 DETECT_DEVICE="${JASNA_DETECT_DEVICE:-auto}"
 DETECT_DECODE_MODE="${JASNA_DETECT_DECODE_MODE:-sequential}"
 REGION_DURATION="${JASNA_REGION_DURATION:-1.0}"
@@ -77,6 +77,7 @@ fi
   exit 1
 }
 export JASNA_DETECT_DEVICE="$DETECT_DEVICE"
+export JASNA_DETECT_BATCH_SIZE="$DETECT_BATCH_SIZE"
 [[ "$ALLOW_IMPLEMENTATION_RESUME" == "0" || "$ALLOW_IMPLEMENTATION_RESUME" == "1" ]] || {
   echo "error: JASNA_ALLOW_IMPLEMENTATION_RESUME must be 0 or 1" >&2
   exit 1
@@ -219,17 +220,20 @@ large_region_mask_growth=${JASNA_LARGE_REGION_MASK_GROWTH:-0.05}
 large_region_mask_feather=${JASNA_LARGE_REGION_MASK_FEATHER:-0.025}
 large_region_block_growth=${JASNA_LARGE_REGION_BLOCK_GROWTH:-0.04}
 large_region_mask_temporal_radius=${JASNA_LARGE_REGION_MASK_TEMPORAL_RADIUS:-1}
+large_region_mask_temporal_strength=${JASNA_LARGE_REGION_MASK_TEMPORAL_STRENGTH:-0.5}
 large_region_detail_crops=${JASNA_LARGE_REGION_DETAIL_CROPS:-1}
 large_region_detail_dimension=${JASNA_LARGE_REGION_DETAIL_DIMENSION:-576}
 mosaic_detail_residual_limit=${JASNA_MOSAIC_DETAIL_RESIDUAL_LIMIT:-0.03}
 model_batch=${JASNA_MODEL_BATCH:-1}
+allow_passthrough=${JASNA_ALLOW_PASSTHROUGH:-0}
 diagnostic_full_region_blend=${JASNA_DIAGNOSTIC_FULL_REGION_BLEND:-0}
 metal_texture_compositor=${JASNA_METAL_TEXTURE_COMPOSITOR:-1}
 metal_compositor=${JASNA_METAL_COMPOSITOR:-1}
+composite_concurrency=${JASNA_COMPOSITE_CONCURRENCY:-1}
 shared_sbs_source=${JASNA_SHARED_SBS_SOURCE:-0}
 detect_eye=${JASNA_DETECT_EYE:-none}
-in_memory_crop_cache=${JASNA_IN_MEMORY_CROP_CACHE:-1}
-in_memory_cache_limit_mb=${JASNA_IN_MEMORY_CACHE_LIMIT_MB:-512}"
+in_memory_crop_cache=${JASNA_IN_MEMORY_CROP_CACHE:-0}
+in_memory_cache_limit_mb=${JASNA_IN_MEMORY_CACHE_LIMIT_MB:-128}"
 if [[ -s "$RUN_CONFIG_PATH" ]]; then
   EXISTING_RUN_CONFIG="$(/bin/cat "$RUN_CONFIG_PATH")"
   if [[ "$EXISTING_RUN_CONFIG" != "$RUN_CONFIG" ]]; then
@@ -287,7 +291,7 @@ if [[ "$SPARSE_MOSAIC" == "1" ]]; then
   echo "Large crop grid:   max ${JASNA_LARGE_REGION_MAX_BLEND:-768}px, overlap ${JASNA_LARGE_REGION_OVERLAP:-96}px"
   echo "Large split limit: ${JASNA_LARGE_REGION_SPLIT_LIMIT:-1} region(s)/window, max ${JASNA_LARGE_REGION_MAX_AXIS_CROPS:-4}/axis"
   echo "Large crop blend:  normalized Metal delta accumulation"
-  echo "Block mask halo:    ${JASNA_LARGE_REGION_BLOCK_GROWTH:-0.04}; temporal radius ${JASNA_LARGE_REGION_MASK_TEMPORAL_RADIUS:-1}"
+  echo "Block mask halo:    ${JASNA_LARGE_REGION_BLOCK_GROWTH:-0.04}; temporal radius ${JASNA_LARGE_REGION_MASK_TEMPORAL_RADIUS:-1}, strength ${JASNA_LARGE_REGION_MASK_TEMPORAL_STRENGTH:-0.5}"
   echo "Lower detail crop:  up to ${JASNA_LARGE_REGION_DETAIL_CROPS:-1} at ${JASNA_LARGE_REGION_DETAIL_DIMENSION:-576}px"
 fi
 

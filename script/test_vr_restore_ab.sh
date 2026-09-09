@@ -13,6 +13,8 @@ usage() {
   echo "          JASNA_RESTORE_ONLY_SECONDS=3" >&2
   echo "          JASNA_AB_BASELINE_MODELS_DIR=Models/MetalML" >&2
   echo "          JASNA_AB_CANDIDATE_MODELS_DIR=Models/MetalMLFineTuneMac1000" >&2
+  echo "          JASNA_AB_BASELINE_BATCH2_MODELS_DIR=Models/MetalMLBatch2" >&2
+  echo "          JASNA_AB_CANDIDATE_BATCH2_MODELS_DIR=/path/to/candidate-batch2" >&2
   echo "          JASNA_APP_BINARY=/path/to/JasnaMetalPoC" >&2
   exit 2
 }
@@ -24,13 +26,19 @@ OUTPUT_PREFIX="$2"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BASELINE_MODELS="${JASNA_AB_BASELINE_MODELS_DIR:-$ROOT_DIR/Models/MetalML}"
 CANDIDATE_MODELS="${JASNA_AB_CANDIDATE_MODELS_DIR:-$ROOT_DIR/Models/MetalMLFineTuneMac1000}"
+BASELINE_BATCH2_MODELS="${JASNA_AB_BASELINE_BATCH2_MODELS_DIR:-$ROOT_DIR/Models/MetalMLBatch2}"
+CANDIDATE_BATCH2_MODELS="${JASNA_AB_CANDIDATE_BATCH2_MODELS_DIR:-${JASNA_BATCH2_MODELS_DIR:-$ROOT_DIR/Models/MetalMLBatch2}}"
 MODEL_BATCH="${JASNA_MODEL_BATCH:-1}"
 
 [[ -d "$REFERENCE_WORK_DIR" ]] || {
   echo "error: reference work directory not found: $REFERENCE_WORK_DIR" >&2
   exit 1
 }
-for model_dir in "$BASELINE_MODELS" "$CANDIDATE_MODELS"; do
+model_dirs=("$BASELINE_MODELS" "$CANDIDATE_MODELS")
+if [[ "$MODEL_BATCH" == "2" ]]; then
+  model_dirs+=("$BASELINE_BATCH2_MODELS" "$CANDIDATE_BATCH2_MODELS")
+fi
+for model_dir in "${model_dirs[@]}"; do
   [[ -d "$model_dir" ]] || {
     echo "error: model directory not found: $model_dir" >&2
     exit 1
@@ -89,11 +97,14 @@ echo "Recovery-only A/B"
 echo "Reference: $REFERENCE_WORK_DIR"
 echo "Baseline:  $BASELINE_MODELS"
 echo "Candidate: $CANDIDATE_MODELS"
+echo "Baseline batch 2:  $BASELINE_BATCH2_MODELS"
+echo "Candidate batch 2: $CANDIDATE_BATCH2_MODELS"
 echo "Selected:  relative second ${JASNA_RESTORE_ONLY_START_SECOND:-0}, duration ${JASNA_RESTORE_ONLY_SECONDS:-remaining}"
 
 echo
 echo "A/B 1/2: baseline"
 JASNA_MODELS_DIR="$BASELINE_MODELS" \
+JASNA_BATCH2_MODELS_DIR="$BASELINE_BATCH2_MODELS" \
 JASNA_MODEL_BATCH="$MODEL_BATCH" \
   "$ROOT_DIR/script/test_vr_restore_only_30s.sh" \
     "$REFERENCE_WORK_DIR" "$BASELINE_OUTPUT"
@@ -101,6 +112,7 @@ JASNA_MODEL_BATCH="$MODEL_BATCH" \
 echo
 echo "A/B 2/2: candidate"
 JASNA_MODELS_DIR="$CANDIDATE_MODELS" \
+JASNA_BATCH2_MODELS_DIR="$CANDIDATE_BATCH2_MODELS" \
 JASNA_MODEL_BATCH="$MODEL_BATCH" \
   "$ROOT_DIR/script/test_vr_restore_only_30s.sh" \
     "$REFERENCE_WORK_DIR" "$CANDIDATE_OUTPUT"

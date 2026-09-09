@@ -7,6 +7,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
+from rfdetr_mps_detector import valid_prefix_counts
 from scan_mosaic_regions import (
     active_frame_intervals,
     box_polygon_groups,
@@ -19,7 +20,9 @@ from scan_mosaic_regions import (
     mask_keyframe_box_groups,
     mask_source_boxes,
     refinement_sample_indices,
+    reusable_gate_boxes,
     samples_in_intervals,
+    samples_without,
     stereo_sample_eyes,
     suppress_duplicate_regions,
     suppress_nested_regions,
@@ -69,6 +72,23 @@ class DeviceSelectionTests(unittest.TestCase):
         self.assertEqual(choose_device(self.FakeTorch(True), "cpu"), "cpu")
 
 
+class RFDetrMaskPackingTests(unittest.TestCase):
+    def test_counts_only_score_sorted_valid_prefix(self):
+        self.assertEqual(
+            valid_prefix_counts(
+                [[True, True, False, False], [True, False, False, False]]
+            ),
+            [2, 1],
+        )
+
+    def test_accepts_empty_valid_selection(self):
+        self.assertEqual(valid_prefix_counts([[False, False]]), [0])
+
+    def test_rejects_non_prefix_valid_selection(self):
+        with self.assertRaises(ValueError):
+            valid_prefix_counts([[True, False, True]])
+
+
 class AdaptiveScanScheduleTests(unittest.TestCase):
     def test_coarse_scan_uses_center_frame_once_per_second(self):
         self.assertEqual(coarse_sample_indices(95, 30.0, 1.0), [15, 45, 75])
@@ -92,6 +112,40 @@ class AdaptiveScanScheduleTests(unittest.TestCase):
         intervals = active_frame_intervals("1.0/2.0", 30.0, 90)
         self.assertEqual(intervals, [(30, 60)])
         self.assertEqual(samples_in_intervals(range(0, 90, 3), intervals), list(range(30, 60, 3)))
+
+    def test_short_manual_range_gets_an_anchored_detector_sample(self):
+        intervals = [(1, 2)]
+
+        self.assertEqual(
+            samples_in_intervals(
+                range(0, 90, 3), intervals, ensure_each_interval=True
+            ),
+            [1],
+        )
+
+    def test_empty_adaptive_refinement_schedule_stays_empty(self):
+        self.assertEqual(samples_in_intervals([], [(30, 60)]), [])
+
+    def test_removes_only_samples_already_inferred_by_the_gate(self):
+        self.assertEqual(
+            samples_without([0, 3, 6, 9, 12, 15], [15, 45]),
+            [0, 3, 6, 9, 12],
+        )
+
+    def test_removes_gate_sample_even_when_it_had_no_final_detection(self):
+        self.assertEqual(samples_without([12, 15, 18], [15]), [12, 18])
+
+    def test_reuses_only_gate_boxes_that_pass_the_final_threshold(self):
+        low = (0, 0, 10, 10, 0.05, 15, [])
+        final = (0, 0, 10, 10, 0.15, 15, [])
+        strong = (0, 0, 10, 10, 0.90, 45, [])
+
+        self.assertEqual(
+            reusable_gate_boxes(
+                {"left": [low, final], "right": [strong]}, 0.15
+            ),
+            {"left": [final], "right": [strong]},
+        )
 
 
 class StereoSampleScheduleTests(unittest.TestCase):

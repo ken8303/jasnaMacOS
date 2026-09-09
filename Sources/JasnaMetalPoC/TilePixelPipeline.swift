@@ -1,4 +1,5 @@
 import CoreVideo
+import Dispatch
 import Foundation
 
 enum VRMosaicProjection: String, CaseIterable, Sendable {
@@ -69,6 +70,9 @@ struct MosaicCompositeSample: Sendable {
 }
 
 struct MosaicCropSamplingMap: Sendable {
+    private static let defaultParallelExtractionEnabled =
+        ProcessInfo.processInfo.environment["JASNA_PARALLEL_CROP_EXTRACTION"] != "0"
+
     private struct Sample: Sendable {
         let x0: Int32
         let y0: Int32
@@ -76,6 +80,45 @@ struct MosaicCropSamplingMap: Sendable {
         let y1: Int32
         let fx: Float
         let fy: Float
+    }
+
+    private struct ParallelExtractionStorage: @unchecked Sendable {
+        let source: UnsafePointer<UInt8>
+        let samples: UnsafePointer<Sample>
+        let output: UnsafeMutablePointer<Float16>
+        let bytesPerRow: Int
+        let plane: Int
+
+        @inline(__always)
+        func extract(_ range: Range<Int>) {
+            for destination in range {
+                let sample = samples[destination]
+                let x0 = Int(sample.x0)
+                let y0 = Int(sample.y0)
+                let x1 = Int(sample.x1)
+                let y1 = Int(sample.y1)
+                let topLeft = y0 * bytesPerRow + x0 * 4
+                let topRight = y0 * bytesPerRow + x1 * 4
+                let bottomLeft = y1 * bytesPerRow + x0 * 4
+                let bottomRight = y1 * bytesPerRow + x1 * 4
+                let topWeight = 1 - sample.fy
+                let leftWeight = 1 - sample.fx
+                let w00 = leftWeight * topWeight
+                let w10 = sample.fx * topWeight
+                let w01 = leftWeight * sample.fy
+                let w11 = sample.fx * sample.fy
+                @inline(__always) func channel(_ offset: Int) -> Float16 {
+                    let value = Float(source[topLeft + offset]) * w00
+                        + Float(source[topRight + offset]) * w10
+                        + Float(source[bottomLeft + offset]) * w01
+                        + Float(source[bottomRight + offset]) * w11
+                    return Float16(value / 255)
+                }
+                output[destination] = channel(2)
+                output[plane + destination] = channel(1)
+                output[2 * plane + destination] = channel(0)
+            }
+        }
     }
 
     let eyeWidth: Int
@@ -181,7 +224,21 @@ struct MosaicCropSamplingMap: Sendable {
         }
     }
 
+    static func parallelExtractionEnabled(
+        environment: [String: String]? = nil
+    ) -> Bool {
+        guard let environment else { return defaultParallelExtractionEnabled }
+        return environment["JASNA_PARALLEL_CROP_EXTRACTION"] != "0"
+    }
+
     func extractPlanarRGB(from pixelBuffer: CVPixelBuffer) throws -> [Float16] {
+        if Self.parallelExtractionEnabled() {
+            return try extractPlanarRGBParallel(from: pixelBuffer)
+        }
+        return try extractPlanarRGBSerial(from: pixelBuffer)
+    }
+
+    func extractPlanarRGBSerial(from pixelBuffer: CVPixelBuffer) throws -> [Float16] {
         guard CVPixelBufferGetPixelFormatType(pixelBuffer) == kCVPixelFormatType_32BGRA,
               CVPixelBufferGetWidth(pixelBuffer) == eyeWidth,
               CVPixelBufferGetHeight(pixelBuffer) == eyeHeight
@@ -222,6 +279,41 @@ struct MosaicCropSamplingMap: Sendable {
             result[2 * plane + destination] = channel(0)
         }
         return result
+    }
+
+    /// Four-worker application-path sampler. Its disjoint output ranges retain
+    /// the serial implementation's operation order and exact FP16 output.
+    func extractPlanarRGBParallel(from pixelBuffer: CVPixelBuffer) throws -> [Float16] {
+        guard CVPixelBufferGetPixelFormatType(pixelBuffer) == kCVPixelFormatType_32BGRA,
+              CVPixelBufferGetWidth(pixelBuffer) == eyeWidth,
+              CVPixelBufferGetHeight(pixelBuffer) == eyeHeight
+        else { throw DeformConvError.invalidShape }
+        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+        guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else {
+            throw DeformConvError.commandFailed("pixel buffer has no base address")
+        }
+        let source = baseAddress.assumingMemoryBound(to: UInt8.self)
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
+        let plane = modelSize * modelSize
+        return Array<Float16>(unsafeUninitializedCapacity: 3 * plane) {
+            result, initializedCount in
+            samples.withUnsafeBufferPointer { sampleBuffer in
+                let storage = ParallelExtractionStorage(
+                    source: source,
+                    samples: sampleBuffer.baseAddress!,
+                    output: result.baseAddress!,
+                    bytesPerRow: bytesPerRow,
+                    plane: plane
+                )
+                DispatchQueue.concurrentPerform(iterations: 4) { worker in
+                    let start = worker * plane / 4
+                    let end = (worker + 1) * plane / 4
+                    storage.extract(start..<end)
+                }
+            }
+            initializedCount = 3 * plane
+        }
     }
 }
 
@@ -295,8 +387,8 @@ struct FisheyeMosaicCropTransform: Equatable, Sendable {
         let u = longitude / .pi + 0.5
         let v = 0.5 - latitude / .pi
         return (
-            Float(u * Double(eyeWidth - 1)),
-            Float(v * Double(eyeHeight - 1))
+            Float(u * Double(eyeWidth) - 0.5),
+            Float(v * Double(eyeHeight) - 0.5)
         )
     }
 
@@ -307,8 +399,8 @@ struct FisheyeMosaicCropTransform: Equatable, Sendable {
         let patchU = (fisheye.u - fisheyeMinU) / (fisheyeMaxU - fisheyeMinU)
         let patchV = (fisheye.v - fisheyeMinV) / (fisheyeMaxV - fisheyeMinV)
         return (
-            Float(patchU * Double(modelSize - 1)),
-            Float(patchV * Double(modelSize - 1))
+            Float(patchU * Double(modelSize) - 0.5),
+            Float(patchV * Double(modelSize) - 0.5)
         )
     }
 

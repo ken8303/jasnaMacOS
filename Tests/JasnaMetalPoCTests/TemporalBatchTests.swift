@@ -60,7 +60,7 @@ import Testing
     #expect(!breaker.disable())
 }
 
-@Test func retainedProductionGraphCoversNormalAndWarmupWindowsOnly() {
+@Test func retainedProductionGraphCoversAllValidProductionTemporalShapes() {
     func eligible(_ frames: Int) -> Bool {
         productionGraphReuseEligible(
             frameCount: frames,
@@ -73,11 +73,14 @@ import Testing
         )
     }
 
+    #expect(eligible(3))
+    #expect(eligible(10))
+    #expect(eligible(29))
     #expect(eligible(30))
+    #expect(eligible(34))
     #expect(eligible(35))
-    #expect(!eligible(29))
-    #expect(!eligible(34))
-    #expect(!eligible(36))
+    #expect(eligible(36))
+    #expect(!eligible(2))
     #expect(!productionGraphReuseEligible(
         frameCount: 35,
         warmupCount: 1,
@@ -123,6 +126,33 @@ import Testing
     #expect(summary.exactDuplicateCount == 1)
     #expect(summary.highOverlapPairCount == 2)
     #expect(summary.containedPairCount == 2)
+    #expect(summary.protectedDetailContainedPairCount == 0)
+}
+
+@available(macOS 27.0, *)
+@Test func modelCropReuseSummaryProtectsContainedDetailCrop() {
+    let regions = [
+        MosaicRegion(
+            startFrame: 0, endFrame: 30,
+            x: 0, y: 0, width: 768, height: 768, confidence: 1,
+            subdivisionGroup: 1
+        ),
+        MosaicRegion(
+            startFrame: 0, endFrame: 30,
+            x: 96, y: 96, width: 576, height: 576, confidence: 1,
+            subdivisionGroup: 1, detailBlendFeather: 72
+        ),
+    ]
+
+    let summary = SideBySideRestoration.modelCropReuseSummary(
+        regions: regions,
+        windowStartFrame: 0,
+        outputCount: 30,
+        temporalWarmupFrames: 5
+    )
+
+    #expect(summary.containedPairCount == 1)
+    #expect(summary.protectedDetailContainedPairCount == 1)
 }
 
 @available(macOS 27.0, *)

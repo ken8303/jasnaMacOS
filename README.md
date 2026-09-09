@@ -256,7 +256,9 @@ those quality settings for controlled comparisons. An experimental adaptive mode
 checks one center frame per second at a sensitive 0.05 gate threshold, then runs
 0.1-second temporal mask tracking at the normal confidence only within flagged
 seconds plus one second on either side. Gate detections never become restoration
-masks directly. Enable it with `JASNA_ADAPTIVE_DETECT=1`, or tune
+masks directly unless they independently pass the normal confidence threshold;
+those exact samples and segmentation polygons are reused instead of running the
+same RF-DETR inference twice. Enable it with `JASNA_ADAPTIVE_DETECT=1`, or tune
 `JASNA_DETECT_COARSE_STRIDE`,
 `JASNA_DETECT_COARSE_CONFIDENCE`, `JASNA_DETECT_SAMPLE_STRIDE`, and
 `JASNA_DETECT_REFINE_PADDING` for controlled comparisons. It is not the default:
@@ -308,6 +310,11 @@ keyframe union protects quickly moving mask edges. The defaults add 4% block
 coverage and one temporal keyframe on each side without adding model crops. Tune
 `JASNA_LARGE_REGION_BLOCK_GROWTH` and
 `JASNA_LARGE_REGION_MASK_TEMPORAL_RADIUS`; set either to `0` to disable that part.
+The neighbouring keyframe contribution remains 50% by default. For recovery-only
+comparison of fast-moving masks, set
+`JASNA_LARGE_REGION_MASK_TEMPORAL_STRENGTH=1.0` to use full adjacent-mask coverage;
+validate this visually because the stronger union can restore more moving-edge
+background.
 The v15 path adds one 576-pixel detail crop centred on the lower boundary of the
 selected semantic mask. It joins the same normalized compositor group as the 2x2
 base grid, increasing sampling density only where the large VR block ring remained.
@@ -331,6 +338,11 @@ wall time from about 32.1 to 30.0 seconds, and end-to-end time from 47 to 45
 seconds. Visual validation accepted the moving-boundary quality, so one detail
 crop is now the rollout default. Set `JASNA_LARGE_REGION_DETAIL_CROPS=2` to
 restore the wider two-detail-crop coverage for unusually difficult boundaries.
+Subdivision logs also report how many emitted model crops have valid semantic
+masks and how many of those masks are all zero. This is telemetry only: zero-mask
+crops remain scheduled because the v22 compositor can still use their restored
+model delta to fill temporal mask holes. A future pruning experiment must first
+show that removing those candidates is visually equivalent on moving mosaics.
 The v17 profile fills the temporal gaps between detector samples with a polygon
 mask at every output frame. Each generated mask follows the interpolated tracked
 box, translating and scaling the nearest real segmentation polygon instead of
@@ -427,6 +439,17 @@ rollout default. This points to beta-driver stability rather than memory pressur
 The current sparse VR path decodes and encodes 8-bit BGRA/SDR. A Main 10 or HDR
 source therefore does not retain its original bit depth or HDR transfer
 characteristics; do not use this path when HDR preservation is required.
+The rollout deliberately performs this normalization during its first 30 fps
+encode and writes an HEVC Main 8 `yuv420p` MP4 working source. An already-30-fps
+input is packet-copied only when it is already HEVC Main 8 `yuv420p`; Main10 and
+other codec profiles are normalized so clean bypasses and restored segments have
+one compatible format. The macOS app also suggests an MP4 final filename.
+
+Internal Metal checkpoints remain short MOV files. Neither ordinary MP4 nor MOV
+supports safely reopening and appending compressed frames after a crashed writer.
+The checkpoint boundaries enable frame-exact resume and release retained
+AVFoundation/Metal surfaces between processes. Final joining is a packet copy,
+so these safety boundaries do not cause another video encode.
 Detector setup is isolated from Swift:
 
 ```sh
@@ -463,6 +486,35 @@ seconds. RF-DETR is therefore the coverage-oriented option rather than the
 speed default. The bounded batch-2 scan peaked at 1.84 GiB resident memory with
 zero swap activity on the M4, compared with the rejected wrapper path's
 12.5 GiB allocation request for one frame.
+
+To compare an upstream RF-DETR release without changing the production Python
+environment, run the source-video detector-only harness. It prepares one short
+30 fps Main 8 fixture beside the results, installs the candidate into that
+result directory, and alternates the installed and candidate packages in ABBA
+order. Restoration, compositing, audio, and final-video encoding remain
+disabled. Fixture preparation is reported separately and excluded from detector
+timings:
+
+```sh
+./script/test_rfdetr_110_source_8s.sh \
+  "/path/to/source-sbs.mp4" \
+  "/path/to/new-rfdetr-110-test" \
+  "00:19:50"
+```
+
+The comparison defaults to RF-DETR 1.10.0, eight seconds, paired 10 Hz eye
+sampling, detector batch 2, and two alternating rounds. It reports scan-time
+dispersion, region counts, and byte-exact left/right manifest parity. The
+candidate is isolated during the comparison, so the production `.venv-rfdetr`
+remains unchanged until the result is accepted.
+
+The accepted Apple M4 source-video A/B at 00:19:50 measured RF-DETR 1.10.0 at
+38.175 seconds on average versus 38.862 seconds for 1.8.3, a 1.77% detector
+improvement. Both alternating runs produced byte-identical manifests: 72 left
+regions with 2,013 mask keyframes and 66 right regions with 1,834 keyframes.
+Because the result preserved exact detector coverage without MPS fallback,
+production setup and the packaged test app now require RF-DETR 1.10.0. Jasna's
+bounded MPS wrapper and post-processing remain unchanged.
 
 Detector device selection defaults to `JASNA_DETECT_DEVICE=auto`: it uses MPS
 when available and switches to CPU if an MPS inference fails. The transition
@@ -560,23 +612,24 @@ startup and drain work, but proportionally increase temporary disk use until
 the encoded segment is validated.
 
 All restartable source clips, manifests, restored windows, and eye videos remain
-beside the output by default. After visually checking a completed output, they
-can be removed manually. Set `JASNA_CLEAN_WORK_ON_SUCCESS=1` to remove that work
-directory automatically, but only after the final SBS output passes codec,
-dimensions, frame-count, duration, and decode validation. The log and final
-video remain beside one another.
+beside the output. They are never deleted automatically, so a completed run can
+be inspected or resumed without risking expensive intermediate work. After
+visually checking a completed output, the work directory can be removed
+manually. The log and final video remain beside one another.
 
-Metal ML crop execution is serialized. The first normal 30-frame crop or
-35-frame crop with temporal warm-up builds the retained graph and every later
-crop of that temporal shape reuses it; attempting to construct two
+Metal ML crop execution is serialized. The first crop of a temporal length
+builds the retained graph and every immediately following crop of that same
+length reuses it; attempting to construct two
 first-use graphs concurrently proved unstable in the macOS 27 beta runtime.
 `JASNA_REGION_CONCURRENCY` is therefore ignored for production restoration.
 
 The optimized production path retains one complete Metal graph per model batch
-for the lifetime of the eye-restoration process. A change between the 30-frame
-and 35-frame temporal shapes evicts the former graph before constructing the
-replacement, preventing the warm-up optimization from accumulating multiple
-large graphs. Later crops reuse the same
+for the lifetime of the eye-restoration process. A temporal-shape change evicts
+the former graph before constructing the replacement, preventing full 30-frame,
+35-frame warm-up, and shorter partial-region shapes from accumulating multiple
+large graphs. The crop scheduler groups equal lengths so repeated partial
+regions now reuse the current bounded graph instead of rebuilding it. Later
+crops reuse the same
 tensors, buffers, argument tables, and residency set under a lock. Sequential
 Metal ML dispatches also share scratch heaps per pipeline/level instead of
 allocating hundreds of identical heaps per crop. A 4096×4096 one-second proof
@@ -593,8 +646,9 @@ An alternating-input FP16 probe matched a fresh graph bit-for-bit, including
 hash `9fce8e1d284bfdc2`; decoded HEVC A/B differences remained compression-level
 (about 59–67 dB PSNR). Set `JASNA_RETAINED_GRAPH=0` for an immediate rollback.
 
-Restoration uses batch 2 by default, grouping two mosaic crops of the same
-temporal length in one retained graph when `Models/MetalMLBatch2` is present.
+The rollout and quality-speed profiles use batch 2 by default, grouping two
+mosaic crops of the same temporal length in one retained graph when
+`Models/MetalMLBatch2` is present.
 Incompatible or odd final crops stay on batch 1. The first batch failure retries
 both crops individually and disables batch 2 for the remainder of that process,
 preventing a bad graph from imposing another minute-long timeout on every later
@@ -738,22 +792,129 @@ When the mosaic time ranges are already known, use the manual-range wrapper:
   "00:12:00-00:14:00,00:20:30-00:22:00"
 ```
 
+For a native end-user interface, launch the macOS app:
+
+```sh
+./script/run_jasna_app.sh
+```
+
+Choose the original side-by-side video and the final `.mov` or `.mp4` output,
+then enter each source-timeline interval that contains mosaic in one field, such
+as `11:00-30:00`. The range starts empty; times may use `HH:MM:SS`, `MM:SS`, or
+plain seconds. Leaving every range blank runs automatic detection and restoration
+across the full video. Otherwise, the app validates and merges overlapping ranges,
+then runs the validated rollout profile. Only those ranges are detected and
+restored; clean time outside them is copied from the original SBS source into the
+final output. Start and stop controls preserve the normal resumable work
+directory, live output is shown in the window, and an additional
+`NAME.jasna-ui.log` is saved beside the selected output. Failed and stopped runs
+always preserve their restart files, and successful runs preserve them as well.
+Four progress rows show preparation, detection, restoration, and final
+assembly/verification percentages, with an estimated completion time once the
+run has enough measurements. An optional shutdown control powers off the Mac
+only after the output passes validation and provides a 60-second cancellation
+period. The Stop
+button signals the complete active FFmpeg/Metal worker tree so shutdown does not
+wait for an unrelated long child process to finish. Workers that ignore the
+normal termination request are force-stopped after a five-second grace period.
+The UI drains the process pipe before closing `NAME.jasna-ui.log`, including
+UTF-8 text split across pipe reads, so the final validation or failure line is
+not lost.
+
+The app remembers a **Fast** or **Balanced** performance choice. Fast is the
+recommended default for a 16 GB or larger Mac: it keeps model batch 2 and eight
+Metal windows per process, raises RF-DETR to batch 2, and hands off up to 512 MiB
+of restored crops in memory instead of writing every eligible crop cache to disk.
+Balanced keeps detector batch 1 and the restartable disk handoff for lower
+memory pressure. The command-line rollout remains balanced by default; set
+`JASNA_PERFORMANCE_PROFILE=fast` to select the same faster profile explicitly.
+
 For rollout, use the preset wrapper instead of assembling environment flags.
 It fixes the validated runtime profile: the baseline `MetalML` restoration
-packages, RF-DETR, batch 2 when `MetalMLBatch2` is present, full mask-hole
-recovery, five temporal warm-up frames, two Metal windows per process,
-direct/shared SBS output, a bounded 512 MiB crop handoff, stereo reconciliation,
-peak-memory telemetry, and adaptive detection disabled. It deliberately ignores
+packages, RF-DETR, model batch 2 when matching packages are present, detector
+batch 1, full mask-hole recovery, five temporal warm-up frames, two Metal
+windows per process, one composited frame at a time, direct/shared SBS output,
+disk-backed crop handoff with a 128 MiB ceiling, stereo reconciliation,
+peak-memory telemetry, and adaptive detection disabled.
+It deliberately ignores
 a pre-existing `JASNA_MODELS_DIR`, keeping fine-tuned weights out of runtime
 sign-off; use the dedicated fine-tuned or restoration-only A/B wrappers for
-candidate models. It falls back to batch 1 when the baseline batch-2 packages
-are unavailable. Its optional third argument supplies known mosaic ranges:
+candidate models. A checkout without the complete matching batch-2 package set
+falls back to batch 1. When an existing output work directory is resumed, the
+launcher retains its recorded model batch unless the user explicitly overrides
+`JASNA_MODEL_BATCH`; this prevents a rollout-default update from invalidating
+otherwise compatible restart data. Its optional third argument supplies known
+mosaic ranges:
+
+The rollout uses Apple acceleration wherever the measured path is faster and
+stable: RF-DETR runs through PyTorch MPS on the GPU, restoration and compositing
+run through Metal ML/Metal, and HEVC encoding uses VideoToolbox. FFmpeg decoding
+and its frame-rate/crop/stack filters remain on the CPU for the 8192×4096 SBS and
+4096×4096 eye layouts. On the current macOS 27 beta, VideoToolbox rejects those
+decode surfaces and silently falls back to software. Native Core ML FP16 export
+was also tested for RF-DETR, but was substantially slower and used more memory
+than MPS, so it is not enabled in the production preset.
+
+The rollout now defaults to the validated balanced profile: two 30-frame Metal
+windows per subprocess, model batch 2, detector batch 1 with sequential decode,
+and disk-backed crop handoff. This keeps
+the original 15-block restoration model and output quality unchanged while
+forcing Metal/IOSurface allocations to be released every second. Python,
+PyTorch, Core ML, and Swift temporary/cache paths are redirected to
+`<output>.jasna-vr-*-work/runtime-scratch` on the output volume. That scratch
+directory is marked, safety-checked, and removed whenever the workflow exits;
+resume media and detector manifests remain untouched. Apple's macOS 27 beta
+MPSGraph compiler currently ignores `TMPDIR` and writes to its fixed system
+temporary directory. The launcher records the exact Jasna child-process ID and
+removes only that process's MPSGraph folders after a normal exit or GPU failure.
+When the same work directory resumes after a launcher crash or restart, its
+recorded inactive child is reclaimed before processing continues. It never
+removes an active process's cache. Set model batch 1 or one window per process
+for the conservative path; enable in-memory handoff explicitly only when
+trading additional memory for speed is acceptable.
+Direct restoration commands also require `JASNA_WORK_DIR`; they fail clearly
+instead of silently placing large tile or crop caches on the system volume.
 
 ```sh
 ./script/restore_vr_rollout.sh \
   /path/to/input-sbs.mp4 /path/to/restored-full.mov \
   "00:12:00-00:14:00,00:20:30-00:22:00"
 ```
+
+The restoration-only A/B below compares two versus four Metal windows with the
+same prepared source, detector manifests, model batch, and compositing settings:
+
+```sh
+./script/test_vr_metal_windows_ab_30s.sh \
+  /path/to/previous.jasna-vr30-v22-work \
+  /path/to/metal-windows-ab
+```
+
+The measured 30-second M4 fixture completed in 216 seconds with two windows and
+130 seconds with four. The first candidate included a one-time 61-second cold
+partial-shape graph build; removing that order bias leaves roughly 155 versus
+130 seconds, or a 16% warm-cache gain. Peak memory was 7.23 versus 7.28 GiB, and
+both outputs passed with no GPU timeout, non-finite failure, or compositor
+fallback. The A/B disables GPU-timeout retries so a watchdog reset cannot be
+mistaken for a valid speed result.
+
+A later equal-settings 30-second M4 comparison used the same prepared source,
+manifests, model batch 2, 512 MiB in-memory crop handoff, and writer depth 2 for
+four versus eight windows/process. Both processed exactly 28,282 model frames
+without a GPU timeout, non-finite result, or compositor fallback. Eight windows
+finished in 467 seconds versus 488 seconds for four (4.3% faster), reduced
+first-family correctness executions from 16 to 8, and measured 7.05 GiB peak
+resident memory versus 7.47 GiB. The Fast app/rollout profile therefore uses
+eight windows; the Balanced profile remains at two.
+
+The Fast profile also overlaps preparation of the next crop batch on the CPU
+with the current BasicVSR++ Metal execution (`JASNA_REGION_PREPARE_DEPTH=2`).
+An eight-second real 8K restoration A/B produced pixel-identical decoded video
+and reduced the warm windows 2–8 estimated serial critical path from 85.34 to
+79.40 seconds. Background preparation waited only 0.082 ms in total. The
+Balanced profile keeps depth 1; direct expert runs can select either 1 or 2.
+This setting is recorded with restart data but is performance-only, so changing
+it does not invalidate already completed, output-identical windows.
 
 Times refer to the original source timeline. RF-DETR and Jasna run only inside
 those intervals. With direct SBS output, completely clean 120-second segments
@@ -802,9 +963,98 @@ JASNA_TEST_SECONDS=300 ./script/test_vr_sparse_30s.sh \
   /path/to/input-sbs.mp4 /path/to/restored-vr-5m.mov 00:12:00
 ```
 
+The recommended measured M4 profile is also available as one command. It uses
+the quality-focused RF-DETR VR detector at paired 10 Hz, full BasicVSR++, model
+and detector batch 2, eight Metal windows per process, a bounded 512 MiB crop
+handoff, direct SBS output, and output-local temporary files:
+
+```sh
+./script/test_vr_best_5min.sh \
+  /path/to/input-sbs.mp4 /path/to/restored-vr-5m.mp4 00:12:00
+```
+
+Five minutes remains the default, while `JASNA_TEST_SECONDS=30` selects the same
+settings for a short performance or subdivision-telemetry check.
+
+An optional fourth argument limits detection and restoration to known source
+timeline ranges, for example `00:12:20-00:14:10,00:15:00-00:15:30`. Failed or
+stopped runs retain restart data beside the output. Successful runs retain it
+too, until the user removes the work directory manually.
+
+For a quality-preserving speed comparison on a Mac with additional memory,
+use a different output filename with the high-throughput profile:
+
+```sh
+./script/test_vr_quality_speed_5min.sh \
+  /path/to/input-sbs.mp4 /path/to/restored-quality-speed-5m.mp4 00:12:00
+```
+
+This retains the same RF-DETR VR paired 10 Hz scan, full BasicVSR++ graph,
+mask recovery, and temporal warm-up. It changes scheduling only: detector and
+model batch 2, eight Metal windows per process, and a bounded 512 MiB in-memory
+crop handoff. The final 30-second M4 comparison reduced wall time from 601 to
+524 seconds (12.8%) and GPU time from 343.29 to 280.54 seconds (18.3%). A
+historical four-window follow-up was stable after restart but took 121 seconds for the
+same first eight seconds that two-window isolation completed in about 113
+seconds. The later equal-settings four-versus-eight comparison above supersedes
+that short, noisy result and promoted eight windows for Fast mode. Serial compositing
+remains enabled because two-frame lookahead
+measured slower on M4. This profile can use substantially more unified memory;
+macOS swap is a safety net, not an accelerator, so memory pressure may erase
+the speed gain. The final file is MP4. Short internal MOV files are independently
+validated recovery checkpoints and are packet-joined into the final MP4; they
+are removed after final validation and do not introduce another video encode.
+
+To isolate detector batch 2 before changing restoration scheduling, reuse an
+existing five-minute test's prepared 120/120/60-second SBS segments:
+
+```sh
+./script/test_detector_batch2_reuse.sh \
+  /path/to/existing-output.jasna-vr30-v22-work
+```
+
+This performs no source conversion, BasicVSR++ restoration, compositing, or
+final encoding. It retains RF-DETR VR, paired 10 Hz sampling, confidence, masks,
+and sequential decode; detector batch size is the only inference change. New
+manifests and a comparison log are written to a sibling `.detector-batch2`
+directory so the reference run remains untouched.
+
+For the alternative physical eye-by-eye experiment, keep preparation isolated
+from detection and restoration. Phase 1 exports five one-minute 4096×4096,
+30 fps, HEVC Main 8 MP4 files per eye from an existing prepared five-minute SBS
+source:
+
+```sh
+./script/prepare_eye_by_eye_5min.sh \
+  /path/to/existing-output.jasna-vr30-v22-work
+```
+
+The source is decoded once and both eye encoders use VideoToolbox. The wrapper
+validates codec profile, pixel format, dimensions, frame rate, all 1,800 frames
+in each of ten MP4 files, and a real first-frame decode. It deliberately performs
+no detector or restoration work so physical eye preparation can be timed
+independently. After that phase passes, run the requested detector batch-4 test:
+
+```sh
+./script/test_detector_batch4_eye_files.sh \
+  /path/to/existing-output.jasna-vr30-v22-work.eyes-4k-main8
+```
+
+The second wrapper scans the ten physical 4K files sequentially with RF-DETR VR
+at 10 Hz and batch 4. It performs no restoration or final encoding. Batch 4 is
+experimental; the existing paired-SBS fixture found batch 2 faster, so this
+physical-eye measurement must pass independently before adoption.
+
 The test duration is capped at 300 seconds. A five-minute run uses physical and
 restored eye segments of 120, 120, and 60 seconds while model recurrence and
 resume checkpoints remain one second apart.
+
+The main sparse workflow keeps configuration, locking, detection coordination,
+and high-level stage dispatch in `test_vr_sparse_30s.sh`. Media validation and
+shared-source helpers live in `script/lib/vr_sparse_media.sh`; direct SBS
+restoration and eye-pair assembly live in `vr_sparse_direct.sh` and
+`vr_sparse_eye_pair.sh`. These are sourced modules rather than separate
+processes, so the split does not add launches, waits, or change resume identity.
 
 The test wrapper reuses a fresh release executable when available, otherwise it
 builds once and shares that executable across both eyes. When the source is
@@ -1721,6 +1971,272 @@ about 10–18 ms per eye/window. This rules out CPU prefetch and array packing a
 meaningful targets: the remaining host gap is predominantly Metal/driver queue
 latency.
 
+For first-use stalls, the same telemetry now separates graph lookup/setup,
+retained-runner and ML execution lock waits, synchronous submission, feedback
+wait, and readback. `JASNA_GRAPH_TRACE=1` adds timestamped phase markers written
+directly to the log, including before pipeline loading and queue submission.
+This is opt-in instrumentation; graph math, cache policy, and rollout defaults
+are unchanged. Submission and feedback times subdivide the existing `wait`
+measurement and must not be added to it again.
+
+The cached 30-second crop-grid comparison at prepared-source 00:19:50–00:20:20
+measured 798 crops / 275.4 GPU seconds at 768px versus 654 crops / 223.5 GPU
+seconds at 1024px. Peak process RSS was 8.16 / 8.10 GiB, with compositor safety
+PASS and no fallbacks in either run. Per-part elapsed times summed to 725 / 426
+seconds, excluding the shared initial build and final variant joins. However,
+the 768px run included a roughly 211-second first-pair call with only 0.686
+seconds of GPU work: the apparent 41% elapsed reduction is **not** evidence of a
+repeatable 41% speedup. The missing time cannot be localized further from that
+older log. The 1024px grid remains an experimental candidate.
+
+Repeat the comparison in reverse order with a fresh output prefix:
+
+```sh
+JASNA_AB_ORDER=candidate-first JASNA_METAL_WINDOWS_PER_PROCESS=4 \
+./script/test_vr_crop_density_ab_30s.sh \
+  /path/to/retained-work /path/to/fresh-comparison "00:19:50"
+```
+
+The harness enables identical graph diagnostics for both variants, reuses the
+source and manifests, and records its combined log in
+`fresh-comparison.jasna-crop-density-ab-work/comparison.log`. It rejects existing
+comparison work instead of treating resumed pieces as independent samples.
+Set `JASNA_RESTORE_ONLY_VALIDATE=1` to check assets without processing or writing
+video. `START_TIME` is relative to the prepared source, not necessarily the
+original video's timeline if that source was already trimmed.
+
+The reverse-order repeat reproduced the GPU-work reduction: 225.6 seconds at
+1024px versus 274.7 seconds at 768px (17.9% less). It also localized a 212.9-second
+pause to first-use propagation-branch construction, before GPU submission.
+Lock waits were negligible. Total measured times were 675 / 518 seconds because
+1024px ran first and absorbed that setup delay. These are not interchangeable
+with warmed timings; the precise slow initialization API still needs measuring.
+
+Two isolated diagnostics are available without changing rollout defaults:
+
+```sh
+# No video processing: load the eight batch-2 propagation packages twice.
+./script/test_metal_ml_load_only.sh /path/to/new-load-diagnostics
+
+# Same prepared 30 seconds and 1024px grid: disk vs bounded-memory crop handoff.
+./script/test_vr_crop_handoff_ab_30s.sh \
+  /path/to/retained-work /path/to/new-handoff-comparison "00:19:50"
+```
+
+The load-only probe reports library loading, compiler creation, pipeline
+specialization, and subsequent in-process cache hits. It does not initialize
+the normal frame runner or dispatch inference, and it does not clear Apple's
+persistent caches. The log is `new-load-diagnostics/load-only.jasna.log`;
+`JASNA_MODELS_DIR` can select a different package directory.
+
+To measure the larger production graph lifecycle without video or detection,
+run the generated-input diagnostic below with a new output directory:
+
+```sh
+./script/test_metal_ml_graph_lifecycle.sh /path/to/new-graph-diagnostics
+```
+
+It executes the real batch-2 graph across a full 30-frame shape, a representative
+partial 17-frame sparse-region shape, and the 35-frame temporal-warm-up shape.
+Each miss is followed immediately by a retained hit. The log separates lookup,
+setup, GPU, and total wall time; `graph-lifecycle-report.json` records the same
+samples and verifies that each retained run stays within the project's FP16
+repeat-error tolerance. It then runs eight retained 35-frame executions and
+reports GPU, wall-time, and host-overhead distributions. Set
+`JASNA_GRAPH_LIFECYCLE_REPEATS=16` to request more samples (the diagnostic caps
+this at 32). This test uses generated tensors and the installed
+Metal ML/DeformConv weights, but no video reader, detector,
+compositor, or encoder.
+
+For GPU timestamps around feature extraction, SPyNet, each propagation branch,
+and reconstruction, enable component telemetry on the same isolated test:
+
+```sh
+JASNA_GRAPH_COMPONENT_TELEMETRY=1 \
+  ./script/test_metal_ml_graph_lifecycle.sh /path/to/new-component-diagnostics
+```
+
+The timestamps use Metal 4's relaxed counter-heap sampling at command-encoder
+boundaries. They are diagnostic-only because counter sampling can perturb
+timing. The report includes per-execution component values and medians for the
+retained 35-frame series; invalid or inconsistent counter data fails the probe.
+
+To split the propagation passes further into offset inference, preparation and
+assembly, DCNv2 transform/gather/GEMM, backbone inference, and residual work,
+add `JASNA_GRAPH_PROPAGATION_TELEMETRY=1`. This detailed mode temporarily splits
+the four DCNv2 stages into separate diagnostic encoders and writes relaxed
+per-branch package medians for `backward_1`, `forward_1`, `backward_2`, and
+`forward_2` into the schema-version-2 JSON report. This makes offset-network,
+DCNv2, backbone-network, and residual imbalance visible without changing the
+production restoration schedule. It samples timestamps at stable
+command-buffer boundaries. The detailed mode is intended only for
+choosing the next kernel optimization because the extra encoder boundaries can
+perturb execution; it remains disabled for normal restoration. The probe
+rejects coalesced timestamp data instead of reporting gather or GEMM as
+zero-cost work.
+
+The focused package profile has a one-command wrapper:
+
+```sh
+./script/test_basicvsr_package_profile.sh /path/to/new-package-profile
+```
+
+The output directory must be new so an earlier compiler cache or report cannot
+be mistaken for the current run.
+
+An initial four-repeat batch-2 run on Apple M4 passed with exact repeated
+output and a 770.456 ms 35-frame diagnostic GPU median. Backbone medians were
+balanced across the four branches at 52.874/53.759/53.638/55.639 ms, so there
+is no single anomalous backbone package to replace. `backward_1` instead spent
+57.031 ms in DCNv2 versus 45.261/47.935/47.396 ms for the other branches; its
+27.448 ms gather phase was the main difference. The next narrow A/B should
+therefore investigate first-branch DCNv2 cache behavior while keeping the
+restoration model and production scheduler unchanged.
+
+A follow-up private-scratch A/B confirmed that cross-branch buffer reuse is not
+the cause. `backward_1` gather remained 29.411 ms with private scratch versus
+30.642 ms with shared scratch, while the other branches remained near
+22–26 ms. Private scratch also raised peak resident memory from 1.16 GiB in the
+paired shared-scratch run to 1.44 GiB, so the experiment was removed. The
+remaining difference is data-dependent locality from `backward_1`'s learned offsets; the production
+shared-scratch path remains unchanged.
+
+The follow-up locality diagnostic reduces every learned offset field to eight
+small GPU counters per temporal step. It reports displacement magnitude,
+fractions above 2/4/8 pixels, out-of-bounds samples, and neighbor variation for
+each branch without retaining the full intermediate tensors:
+
+```sh
+./script/test_dcn_offset_locality.sh /path/to/new-offset-locality-profile
+```
+
+This instrumentation is enabled only together with detailed propagation
+telemetry and is isolated in its own retained-graph cache family. Normal
+restoration does not compile, dispatch, or allocate its statistics resources.
+
+The first four-repeat Apple M4 diagnostic confirmed that `backward_1`'s learned
+sampling field is materially harder to cache: its mean displacement was
+4.097 pixels versus 2.060 for `forward_1`, 18.58% of samples exceeded 8 pixels
+versus 1.79%, and 10.55% sampled outside the input versus 5.77%. Neighbor
+variation was also higher at 0.266 versus 0.156 pixels. This supports a
+locality/cache-focused gather experiment; it does not support changing the
+backbone packages or allocating private scratch per branch.
+
+DCNv2 gather threadgroup-size experiments retained the 128-thread production
+path. At batch 2, 256 threads regressed the isolated gather median from `0.557`
+to `0.600 ms` and combined gather/GEMM from `1.053` to `1.089 ms`. Although 64
+threads measured `0.528 ms` gather and `1.018 ms` combined in isolation, the
+complete retained 35-frame graph measured `798.5 ms` versus the prior
+128-thread control's `790.7 ms`, with overlapping distributions. Neither
+candidate justified a production change.
+
+A direct fused gather/SIMD-group-GEMM prototype was also rejected. It avoided
+the full batch-2 im2col device-memory round trip and matched the FP16 oracle at
+`0.000244` maximum error, but recomputing sampling coordinates inside each
+8-row matrix tile raised the median from `1.046` to `1.971 ms`. The existing
+shared-coordinate gather plus 32-row GEMM remains substantially faster.
+
+A grouped SPyNet scheduling experiment reduced 35-frame Metal ML encoder
+creation from 408 to 6 and cut host encoding from roughly `12` to `5 ms`. It
+was nevertheless rejected: explicit intra-encoder resource-alias barriers
+raised SPyNet's retained median to `154.8 ms`, versus roughly `114–134 ms` for
+the separate-encoder path, and did not improve total GPU time. The output was
+exact and all eight repetitions completed, confirming this was a performance
+rejection rather than a correctness failure.
+
+Grouping the 70 independent per-frame feature and reconstruction dispatches
+into two Metal ML encoders was also rejected. Eight output-exact repetitions
+completed, but the two component medians increased to about `29.2` and
+`81.4 ms`, versus roughly `19` and `75 ms` with separate encoders. A lower
+whole-graph median came from unrelated propagation variance and was not used to
+justify the candidate.
+
+A zero-copy buffer-backed `R16Float` texture gather was tested and rejected.
+It preserved exact output hashes and zero repeat error, but raised the four-pass
+gather median from `84.287` to `94.436 ms` (12.0%), raised the complete retained
+graph median from `951.610` to `1019.715 ms`, and raised peak resident memory
+from `1.17` to `1.52 GiB`. Apple GPU texture-cache reads therefore do not help
+this channel-first learned-offset access pattern; production retains the ordinary
+device-buffer gather.
+
+Channel-last staging produced the useful locality result. A tiled Metal
+transpose converts each 128-channel DCNv2 input from NCHW to NHWC, then gather
+lanes traverse channels for a fixed kernel position so every offset group's
+eight reads are contiguous. The transpose cost is included in the gather phase.
+In an eight-repeat reverse-order Apple M4 confirmation, the complete retained
+35-frame graph median fell from `944.973` to `841.612 ms` (10.9%). Combined
+DCNv2 transform, staged gather, and GEMM fell from `195.502` to `164.120 ms`
+(16.1%); all four branch medians improved, the output hash remained
+`f5d4c49712842e4d`, and repeat error remained zero. A subsequent real 30-second
+8K restore-only A/B rejected it for production, however. With identical source,
+reconciled manifests, 28,282 model frames, model batch 2, and two windows per
+process, channel-last raised total GPU time from `365.481` to `454.591 s`
+(24.4%), graph wall time from `455.899` to `559.788 s` (22.8%), and end-to-end
+wall time from `643` to `747 s` (16.2%). Both outputs and all compositor safety
+checks passed, while peak resident memory changed from `7.52` to `7.33 GiB`.
+Production therefore retains the ordinary NCHW buffer gather. Channel-last is
+kept as an opt-in experiment with `JASNA_DCN_CHANNEL_LAST_GATHER=1`; use either
+A/B wrapper to reproduce the generated-input or real-video comparison:
+
+```sh
+./script/test_dcn_channel_last_gather_ab.sh /path/to/new-channel-last-ab
+./script/test_vr_dcn_channel_last_ab_30s.sh \
+  /path/to/reference.jasna-vr30-v22-work /path/to/new-real-video-ab
+```
+
+A bounded depth-2 experiment with two independent batch-2, 35-frame graph and
+buffer slots was rejected on Apple M4. Its first concurrent pair was faster
+than the sequential control, but the following pair triggered an unrecoverable
+ANE/MPSGraph assertion. Production therefore continues to serialize Metal ML
+execution; removing that safety lock is not a supported performance option.
+
+On Apple M4 with Xcode 27 beta 6, a truly cold batch-2 run spent
+`208610 ms` in setup: feature extraction, reconstruction, and SPyNet were ready
+in about two seconds, then each of the four propagation branches took roughly
+51–54 seconds. The same diagnostic in a fresh second process completed the
+30-frame setup in `593.9 ms`, showing that Apple's persistent specialization
+cache survives a normal Jasna process restart. Changing to the 35-frame warm-up
+shape then needed only `11.0 ms`; retained 30- and 35-frame executions had exact
+`0.0` repeat error. The practical conclusion is that a multi-minute pause is a
+cold or invalidated Metal ML specialization event, not normal per-process graph
+construction or the 30→35-frame shape transition.
+
+Metal 4 pipeline data-set serializers and archives do not currently provide an
+archive lookup parameter on machine-learning pipeline creation in the macOS 27
+SDK. Jasna therefore keeps the supported serial specialization path and relies
+on the system's persistent cache rather than attempting an unsupported ML
+archive shortcut. The timestamped lifecycle trace keeps the four long branch
+steps visible instead of making a cold build look stalled.
+
+The truly cold diagnostic's first 30-frame output hash differed from its
+immediate retained repeat. A later release rebuild reproduced a `0.02368`
+first/repeat maximum error even though setup took only `587 ms`, proving setup
+duration alone cannot identify the unsafe first execution. Jasna now always
+discards exactly one execution for the first retained graph family in each
+worker process. Later temporal-shape changes do not pay that extra execution
+unless their own setup exceeds five seconds. Set `JASNA_INITIAL_GRAPH_WARMUP=0`
+or `JASNA_COLD_GRAPH_WARMUP_THRESHOLD_MS=0` only for controlled diagnostics;
+the former disables first-family protection and the latter disables the
+additional slow-specialization threshold.
+
+The extended lifecycle probe also verifies a representative 17-frame partial
+sparse crop. On Apple M4 its first bounded graph setup took `5.9 ms`; the
+immediate retained run reduced wall time from `403.8` to `370.6 ms` and matched
+with `0.0` maximum error. This is an incremental saving for repeated partial
+shapes. Model execution and the number of subdivided crops remain the dominant
+restoration cost.
+
+The handoff comparison uses the existing source-time A/B harness and keeps
+model batch 2, four windows/process, and the 1024px grid fixed in both variants.
+It changes only crop storage. The memory allowance is **512 MiB per eye/window**,
+not a total process-memory cap; both eye caches may coexist. Oversized windows
+retain the existing disk fallback. Outputs are `-disk.mov` / `-memory512.mov`,
+with a combined log under `.jasna-crop-handoff-ab-work/comparison.log`.
+`JASNA_AB_ORDER=candidate-first` tests memory first; both orders disable timeout
+retries to avoid mixing restarted work into a timing sample. Asset-only checking
+with `JASNA_RESTORE_ONLY_VALIDATE=1` is supported. First-use setup time must be
+reported separately when comparing either order.
+
 The crop scheduler keeps stable same-length pairs ahead of odd leftovers. A
 single odd temporal-length group can therefore no longer shift a later even
 group off the batch-2 boundary. On the dense six-second M4 fixture, the same 139
@@ -1772,6 +2288,13 @@ The model converter expects the public Lada/Jasna checkpoint path as its first
 argument. Use `--help` for all output-path and validation options. Model weights
 are intentionally not copied into this repository's source history.
 
+An August 2026 experiment that truncated each pretrained propagation backbone
+from 15 residual blocks to 8 was rejected. Although propagation GPU time fell
+about 13.6% on a one-second 8K fixture, end-to-end wall time improved only 6.7%
+and the restored output was unusable. Architecture reduction must use a trained
+student with teacher distillation; pretrained residual blocks must not simply be
+removed. The original 15-block model remains the only supported runtime model.
+
 Generate the independent three-frame full-model oracle with the same Python
 environment, Jasna checkout, and checkpoint used for conversion:
 
@@ -1787,6 +2310,98 @@ The exporter reproduces the Metal probe's deterministic FP16 input
 quantization, then saves both FP32 and FP16 restored tensors. Oracle data and
 model weights remain excluded from version control. Replace `--frames` and the
 final output-directory component with `30` or another desired clip length.
+
+## Generated application crop-extraction A/B
+
+The restoration path always extracts a fixed 256×256×3 FP16 model crop, only
+65,536 output pixels. It therefore cannot use the standalone synthetic
+resampler's ≥262,144-pixel Metal candidate. Fisheye output compositing is already
+Metal-based. The remaining resampling opportunity was duplicate CPU extraction:
+the same source/map crop is needed for model input and later for preserving
+source detail during compositing.
+
+Run the application-path diagnostic without video or models:
+
+```sh
+./script/test_synthetic_crop_extraction_ab.sh
+```
+
+It generates four 4096×4096 BGRA eye buffers and uses the production
+`MosaicCropSamplingMap` plus its production Float16 extractor. The control
+extracts each crop twice; the candidate extracts once and checksum-consumes the
+same full array for both consumers. A second scenario delays the second consumer
+across a complete 30-frame/two-region window, retaining all 60 candidate crops.
+Schema 3 also compares the original serial sampler with a four-worker sampler
+that writes disjoint planar ranges without first zero-filling the output array.
+No detector, model, restoration graph, compositor, encoder, or media is used.
+The diagnostic command is opt-in. The four-worker sampler is now the production
+default; set `JASNA_PARALLEL_CROP_EXTRACTION=0` only to use the serial
+compatibility path.
+
+Two schema-2 M4 release runs passed pre/post exact output, work-count, pair-order,
+and persistent-report gates:
+
+| Scenario | Run | Control median | Reuse median | Paired median [P10–P90] | Wins |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 4 frames × 2 regions | 1 | 7.092 ms | 5.226 ms | −1.878 [−2.118–−1.637] ms | 48/48 |
+| 4 frames × 2 regions | 2 | 7.077 ms | 5.203 ms | −1.894 [−2.138–−1.622] ms | 48/48 |
+| delayed 30 frames × 2 regions | 1 | 55.408 ms | 39.043 ms | −16.343 [−16.876–−15.786] ms | 24/24 |
+| delayed 30 frames × 2 regions | 2 | 54.977 ms | 38.845 ms | −16.245 [−17.464–−15.142] ms | 24/24 |
+
+The delayed candidate retains 22.50 MiB per eye, or about 45 MiB for two eyes
+with two active regions. The repeatable ~16 ms saving per 30-frame eye window is
+too small relative to restoration graph time to justify a new production cache
+lifecycle yet. The safe outcome is therefore **measurement only**: no default,
+resume format, or memory policy changed. Revisit only if runtime telemetry shows
+crop extraction becoming a material share of a real window.
+
+Two schema-3 M4 release runs then validated the bounded-memory sampler change:
+
+| Run | Serial, 8 crops | Parallel×4, 8 crops | Paired median [P10–P90] | Wins |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 3.915 ms | 2.982 ms | −0.920 [−1.048–−0.789] ms | 48/48 |
+| 2 | 3.658 ms | 2.778 ms | −0.894 [−1.083–−0.740] ms | 48/48 |
+| enabled-default validation | 3.691 ms | 2.823 ms | −0.847 [−0.993–−0.724] ms | 48/48 |
+
+Both runs were bit-exact at FP16 output. The candidate retains no crop arrays
+between consumers and improves this CPU phase by about 24%, so it was promoted.
+An earlier SIMD-vector candidate was rejected because its exact-output version
+was slower than the scalar control.
+
+Direct SBS writer summaries now break preparation into restored-cache reads,
+original-crop extraction, mask/input assembly, Metal compositing, and remaining
+pixel-buffer/attachment work. This is telemetry only.
+
+A real 30-second 8192×4096 M4 comparison then processed the same detector
+manifests and the same 28,282 model frames. Four-worker model-input extraction
+fell from 16.287 to 9.255 seconds (43.2%). Writer preparation fell from 55.959
+to 49.120 seconds (12.2%), and complete writer time fell from 58.457 to 52.227
+seconds (10.7%). The detailed writer total was 41.925 seconds of Metal
+compositing (85.4%), 5.742 seconds of original-crop extraction (11.7%), 1.378
+seconds of restored-cache reads (2.8%), and less than 0.1% of mask assembly and
+other buffer work. Compositing is therefore the next writer-local candidate,
+but the entire writer is only about 6% of end-to-end runtime on this dense
+fixture.
+
+That candidate run took 870 seconds end to end versus 777 seconds for the
+control despite the extraction and writer gains. The first retained batch-2
+graph performed two roughly 79-second host executions: the required discarded
+first-family correctness execution followed by the accepted execution. Later
+work returned to the control's steady-state timing, and reported GPU work stayed
+essentially unchanged (282.296 versus 283.947 seconds). This was a cold Metal ML
+specialization/cache event, not an extraction regression. Every discarded safety
+execution now logs both `started` and `completed` messages, including setup,
+reason, wall, and GPU times. A cold specialization is therefore visible while it
+is running instead of looking like a stalled process, without enabling the
+verbose graph trace.
+
+Valid reports, relative to the repository root:
+
+- `.test-results/synthetic-crop-extraction-ab/run-20260904T090742Z-yOBcEa/report.json`
+- `.test-results/synthetic-crop-extraction-ab/run-20260904T090901Z-nLU279/report.json`
+- `.test-results/synthetic-crop-extraction-ab/run-20260904T142110Z-nbcmNq/report.json`
+- `.test-results/synthetic-crop-extraction-ab/run-20260904T142202Z-KiaIsa/report.json`
+- `.test-results/synthetic-crop-extraction-ab/run-20260904T142524Z-iwt5ys/report.json`
 
 ## License
 

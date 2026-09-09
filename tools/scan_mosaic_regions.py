@@ -265,8 +265,35 @@ def active_frame_intervals(spec, source_fps, frame_count):
     return intervals
 
 
-def samples_in_intervals(indices, intervals):
-    return [index for index in indices if any(start <= index < end for start, end in intervals)]
+def samples_in_intervals(indices, intervals, ensure_each_interval=False):
+    indices = list(indices)
+    selected = [
+        index for index in indices if any(start <= index < end for start, end in intervals)
+    ]
+    if ensure_each_interval:
+        for start, end in intervals:
+            if end > start and not any(start <= index < end for index in selected):
+                selected.append(start)
+    return sorted(set(selected))
+
+
+def samples_without(indices, already_scanned):
+    """Remove temporal samples that the coarse gate has already inferred."""
+    already_scanned = set(already_scanned)
+    return [index for index in indices if index not in already_scanned]
+
+
+def reusable_gate_boxes(boxes_by_eye, final_confidence):
+    """Keep gate detections that already satisfy the final quality threshold.
+
+    RF-DETR inference is independent of its score threshold. A coarse result at
+    or above the final threshold is therefore the same observation a second
+    dense inference would produce, including its segmentation polygon.
+    """
+    return {
+        eye: [box for box in boxes if float(box[4]) >= final_confidence]
+        for eye, boxes in boxes_by_eye.items()
+    }
 
 
 def stereo_sample_eyes(sample_ordinal, mode):
@@ -938,6 +965,8 @@ def main() -> int:
         phase_inference_seconds = 0.0
         phase_boxes = {eye: [] for eye in scan_eyes}
         phase_scanned_samples = 0
+        if not sample_indices:
+            return phase_boxes, 0, 0.0, time.perf_counter() - phase_started
         total_sample_images = len(sample_indices) * len(scan_eyes)
         if args.crop_eye == "both" and args.stereo_sample_mode == "alternating":
             total_sample_images = len(sample_indices)
@@ -1066,7 +1095,9 @@ def main() -> int:
 
     if not args.adaptive_scan:
         sample_indices = samples_in_intervals(
-            range(0, frame_count, stride_frames), allowed_intervals
+            range(0, frame_count, stride_frames),
+            allowed_intervals,
+            ensure_each_interval=True,
         )
         boxes, scanned_samples, inference_seconds, dense_seconds = scan_samples(
             sample_indices, "Dense", args.confidence
@@ -1079,7 +1110,9 @@ def main() -> int:
         coarse_indices = coarse_sample_indices(
             frame_count, source_fps, args.coarse_stride
         )
-        coarse_indices = samples_in_intervals(coarse_indices, allowed_intervals)
+        coarse_indices = samples_in_intervals(
+            coarse_indices, allowed_intervals, ensure_each_interval=True
+        )
         coarse_boxes, coarse_sample_count, coarse_inference, coarse_seconds = (
             scan_samples(coarse_indices, "Coarse", args.coarse_confidence)
         )
@@ -1101,6 +1134,14 @@ def main() -> int:
         refinement_indices = samples_in_intervals(
             refinement_indices, allowed_intervals
         )
+        reusable_boxes = reusable_gate_boxes(coarse_boxes, args.confidence)
+        reusable_sample_indices = set(refinement_indices).intersection(coarse_indices)
+        # The score threshold only filters RF-DETR's completed prediction. Every
+        # coarse frame has therefore already performed the identical graph used
+        # by refinement, even when no box passes the final threshold.
+        refinement_indices = samples_without(
+            refinement_indices, coarse_indices
+        )
         if refinement_indices:
             (
                 refined_boxes,
@@ -1113,7 +1154,9 @@ def main() -> int:
             refinement_sample_count = 0
             refine_inference = 0.0
             dense_seconds = 0.0
-        boxes = refined_boxes
+        boxes = reusable_boxes
+        for eye, eye_boxes in refined_boxes.items():
+            boxes[eye].extend(eye_boxes)
         scanned_samples = coarse_sample_count + refinement_sample_count
         inference_seconds = coarse_inference + refine_inference
 
@@ -1266,6 +1309,13 @@ def main() -> int:
         print(
             f"Detector refinement: {dense_seconds:.3f}s, "
             f"{refinement_sample_count} dense {sample_label} around flagged seconds",
+            flush=True,
+        )
+        reused_gate_boxes = sum(len(eye_boxes) for eye_boxes in reusable_boxes.values())
+        print(
+            f"Detector gate reuse: {len(reusable_sample_indices)} temporal samples, "
+            f"{reused_gate_boxes} final-threshold detections reused without "
+            "duplicate inference",
             flush=True,
         )
     print(

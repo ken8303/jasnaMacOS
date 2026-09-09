@@ -34,6 +34,53 @@ private func fillPixelBuffer(_ pixelBuffer: CVPixelBuffer, color: (UInt8, UInt8,
     }
 }
 
+@Test func parallelFisheyeExtractionExactlyMatchesSerialOutput() throws {
+    let width = 97
+    let height = 73
+    var optionalBuffer: CVPixelBuffer?
+    let status = CVPixelBufferCreate(
+        nil, width, height, kCVPixelFormatType_32BGRA, nil, &optionalBuffer
+    )
+    #expect(status == kCVReturnSuccess)
+    let pixelBuffer = try #require(optionalBuffer)
+    CVPixelBufferLockBaseAddress(pixelBuffer, [])
+    do {
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, []) }
+        let bytes = try #require(CVPixelBufferGetBaseAddress(pixelBuffer))
+            .assumingMemoryBound(to: UInt8.self)
+        let rowBytes = CVPixelBufferGetBytesPerRow(pixelBuffer)
+        for y in 0..<height {
+            for x in 0..<width {
+                let offset = y * rowBytes + x * 4
+                bytes[offset] = UInt8(truncatingIfNeeded: x * 3 + y * 5)
+                bytes[offset + 1] = UInt8(truncatingIfNeeded: x * 7 + y * 11)
+                bytes[offset + 2] = UInt8(truncatingIfNeeded: x * 13 + y * 17)
+                bytes[offset + 3] = 255
+            }
+        }
+    }
+    let map = MosaicCropSamplingMap(
+        region: MosaicRegion(
+            startFrame: 0, endFrame: 1,
+            x: 11, y: 9, width: 71, height: 53, confidence: 1
+        ),
+        eyeWidth: width,
+        eyeHeight: height,
+        modelSize: 33,
+        projection: .fisheye
+    )
+
+    let serial = try map.extractPlanarRGBSerial(from: pixelBuffer)
+    let parallel = try map.extractPlanarRGBParallel(from: pixelBuffer)
+
+    #expect(serial == parallel)
+    #expect(parallel.count == 33 * 33 * 3)
+    #expect(MosaicCropSamplingMap.parallelExtractionEnabled(environment: [:]))
+    #expect(!MosaicCropSamplingMap.parallelExtractionEnabled(environment: [
+        "JASNA_PARALLEL_CROP_EXTRACTION": "0"
+    ]))
+}
+
 @Test func mosaicDetailResidualLimitIsBoundedAndConfigurable() {
     #expect(MosaicCompositeQuality.detailResidualLimit(environment: [:]) == 0.03)
     #expect(MosaicCompositeQuality.detailResidualLimit(environment: [

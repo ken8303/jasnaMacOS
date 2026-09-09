@@ -35,7 +35,7 @@ case "$DETECTOR" in
     exit 1
     ;;
 esac
-DETECT_BATCH_SIZE="${JASNA_DETECT_BATCH_SIZE:-2}"
+DETECT_BATCH_SIZE="${JASNA_DETECT_BATCH_SIZE:-1}"
 DETECT_DEVICE="${JASNA_DETECT_DEVICE:-auto}"
 DETECT_DECODE_MODE="${JASNA_DETECT_DECODE_MODE:-sequential}"
 DETECT_SAMPLE_STRIDE="${JASNA_DETECT_SAMPLE_STRIDE:-0.1}"
@@ -53,10 +53,8 @@ MASK_SIZE="${JASNA_MASK_SIZE:-128}"
 RFDETR_MAX_DETECTIONS="${JASNA_RFDETR_MAX_DETECTIONS:-64}"
 if [[ $# -eq 3 ]]; then
   CROP_EYE=both
-  STEREO_ARGUMENTS=(--stereo-right-manifest "$3")
 else
   CROP_EYE="${JASNA_DETECT_EYE:-none}"
-  STEREO_ARGUMENTS=()
 fi
 
 [[ "$DETECT_BATCH_SIZE" =~ ^[1-9][0-9]*$ ]] || {
@@ -169,22 +167,34 @@ fi
 if [[ "$ADAPTIVE_DETECT" == "1" ]]; then
   ADAPTIVE_ARGUMENTS+=(--adaptive-scan)
 fi
-"$PYTHON_PATH" "$ROOT_DIR/tools/scan_mosaic_regions.py" \
-  "$1" "$2" --model "$MODEL_PATH" \
-  --backend "$DETECTOR_BACKEND" \
-  --rfdetr-variant "$RFDETR_VARIANT" \
-  --crop-eye "$CROP_EYE" \
-  --stereo-sample-mode "$STEREO_SAMPLE_MODE" \
-  "${STEREO_ARGUMENTS[@]}" \
-  --device "$DETECT_DEVICE" \
-  --batch-size "$DETECT_BATCH_SIZE" \
-  --max-detections "$RFDETR_MAX_DETECTIONS" \
-  --decode-mode "$DETECT_DECODE_MODE" \
-  --sample-stride "$DETECT_SAMPLE_STRIDE" \
-  --region-duration "$REGION_DURATION" \
-  --confidence "$DETECT_CONFIDENCE" \
-  --temporal-padding "$TEMPORAL_PADDING" \
-  --region-nms-iou "$REGION_NMS_IOU" \
-  --mask-expansion "$MASK_EXPANSION" \
-  --mask-size "$MASK_SIZE" \
-  "${ADAPTIVE_ARGUMENTS[@]}"
+
+# Build one non-empty command array. macOS's Bash 3.2 reports an empty
+# "${array[@]}" expansion as unbound under `set -u`, which broke physical
+# single-eye scans because they intentionally have no stereo manifest.
+DETECT_COMMAND=(
+  "$PYTHON_PATH" "$ROOT_DIR/tools/scan_mosaic_regions.py"
+  "$1" "$2"
+  --model "$MODEL_PATH"
+  --backend "$DETECTOR_BACKEND"
+  --rfdetr-variant "$RFDETR_VARIANT"
+  --crop-eye "$CROP_EYE"
+  --stereo-sample-mode "$STEREO_SAMPLE_MODE"
+)
+if [[ $# -eq 3 ]]; then
+  DETECT_COMMAND+=(--stereo-right-manifest "$3")
+fi
+DETECT_COMMAND+=(
+  --device "$DETECT_DEVICE"
+  --batch-size "$DETECT_BATCH_SIZE"
+  --max-detections "$RFDETR_MAX_DETECTIONS"
+  --decode-mode "$DETECT_DECODE_MODE"
+  --sample-stride "$DETECT_SAMPLE_STRIDE"
+  --region-duration "$REGION_DURATION"
+  --confidence "$DETECT_CONFIDENCE"
+  --temporal-padding "$TEMPORAL_PADDING"
+  --region-nms-iou "$REGION_NMS_IOU"
+  --mask-expansion "$MASK_EXPANSION"
+  --mask-size "$MASK_SIZE"
+)
+DETECT_COMMAND+=("${ADAPTIVE_ARGUMENTS[@]}")
+"${DETECT_COMMAND[@]}"

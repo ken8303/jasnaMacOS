@@ -51,6 +51,21 @@ private struct MetalMosaicGroupResolveParams {
 
 @available(macOS 27.0, *)
 final class MetalMosaicCompositor: @unchecked Sendable {
+    private struct ReusableBufferKey: Hashable {
+        let length: Int
+        let options: UInt
+    }
+
+    private struct ReusableBuffer {
+        let key: ReusableBufferKey
+        let buffer: MTLBuffer
+    }
+
+    private struct CachedSampleBuffer {
+        let buffer: MTLBuffer
+        var lastUse: UInt64
+    }
+
     private struct SampleBufferKey: Hashable {
         let frameWidth: Int
         let frameHeight: Int
@@ -76,10 +91,22 @@ final class MetalMosaicCompositor: @unchecked Sendable {
     private let detailResidualLimit: Float
     private let maskRecoveryDeltaThreshold: Float
     private let ordinaryMaskRecoveryEnabled: Bool
+    private let reusableBufferLimitBytes: Int
+    private let sampleBufferLimitBytes: Int
     let prefersTextureSurfaces: Bool
     private let textureCacheLock = NSLock()
+    private let reusableBufferLock = NSLock()
     private let sampleBufferLock = NSLock()
-    private var sampleBuffers = [SampleBufferKey: MTLBuffer]()
+    private var reusableBuffers = [ReusableBufferKey: [MTLBuffer]]()
+    private var reusableBufferBytes = 0
+    private var sampleBuffers = [SampleBufferKey: CachedSampleBuffer]()
+    private var sampleBufferBytes = 0
+    private var sampleBufferUse: UInt64 = 0
+
+    var memoryBudgetDescription: String {
+        "reusable buffers \(reusableBufferLimitBytes / 1_048_576) MiB; "
+            + "sampling maps \(sampleBufferLimitBytes / 1_048_576) MiB"
+    }
 
     init(
         device: MTLDevice,
@@ -90,6 +117,15 @@ final class MetalMosaicCompositor: @unchecked Sendable {
         maskRecoveryDeltaThreshold = MosaicCompositeQuality.maskRecoveryDeltaThreshold()
         ordinaryMaskRecoveryEnabled = override
             ?? MosaicCompositeQuality.ordinaryMaskRecoveryEnabled()
+        let environment = ProcessInfo.processInfo.environment
+        let configuredReusableMiB = Int(
+            environment["JASNA_METAL_COMPOSITOR_BUFFER_POOL_MB"] ?? ""
+        ) ?? 64
+        reusableBufferLimitBytes = min(256, max(0, configuredReusableMiB)) * 1_048_576
+        let configuredSampleMiB = Int(
+            environment["JASNA_METAL_COMPOSITOR_SAMPLE_CACHE_MB"] ?? ""
+        ) ?? 128
+        sampleBufferLimitBytes = min(512, max(0, configuredSampleMiB)) * 1_048_576
         prefersTextureSurfaces = ProcessInfo.processInfo.environment[
             "JASNA_METAL_TEXTURE_COMPOSITOR"
         ] != "0"
@@ -303,9 +339,13 @@ final class MetalMosaicCompositor: @unchecked Sendable {
         inputs: [MetalMosaicCompositeInput]
     ) throws {
         let packedRowBytes = dimensions.width * 4
-        guard let frameBuffer = device.makeBuffer(
+        var reusableBuffers = [ReusableBuffer]()
+        defer { recycleBuffers(reusableBuffers) }
+        let frameReusable = try checkoutBuffer(
             length: packedRowBytes * dimensions.height, options: .storageModeShared
-        ) else { throw DeformConvError.metalUnavailable }
+        )
+        reusableBuffers.append(frameReusable)
+        let frameBuffer = frameReusable.buffer
 
         CVPixelBufferLockBaseAddress(basePixelBuffer, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(basePixelBuffer, .readOnly) }
@@ -325,31 +365,21 @@ final class MetalMosaicCompositor: @unchecked Sendable {
         encoder.setComputePipelineState(pipeline)
         let modelSize = SideBySideVideoPlan.modelTileSize
         let modelElements = 3 * modelSize * modelSize
-        var heldBuffers = [MTLBuffer]()
         for input in mosaicCompositeInputsByVisiblePriority(inputs) {
             guard input.restored.count == modelElements,
                   input.original.count == modelElements,
                   input.samples.count == input.region.width * input.region.height
             else { throw DeformConvError.invalidShape }
-            let restoredBuffer = input.restored.withUnsafeBytes {
-                device.makeBuffer(bytes: $0.baseAddress!, length: $0.count, options: .storageModeShared)
-            }
-            let originalBuffer = input.original.withUnsafeBytes {
-                device.makeBuffer(bytes: $0.baseAddress!, length: $0.count, options: .storageModeShared)
-            }
+            let restoredReusable = try checkoutSharedBuffer(copying: input.restored)
+            reusableBuffers.append(restoredReusable)
+            let originalReusable = try checkoutSharedBuffer(copying: input.original)
+            reusableBuffers.append(originalReusable)
             let sampleBuffer = try cachedSampleBuffer(
                 input: input, dimensions: dimensions
             )
             let mask = input.region.maskData ?? Data([255])
-            let maskBuffer = mask.withUnsafeBytes {
-                device.makeBuffer(
-                    bytes: $0.baseAddress!, length: $0.count, options: .storageModeShared
-                )
-            }
-            guard let restoredBuffer, let originalBuffer, let maskBuffer else {
-                throw DeformConvError.metalUnavailable
-            }
-            heldBuffers += [restoredBuffer, originalBuffer, maskBuffer]
+            let maskReusable = try checkoutSharedBuffer(copying: mask)
+            reusableBuffers.append(maskReusable)
             var params = MetalMosaicCompositeParams(
                 frameWidth: UInt32(dimensions.width),
                 regionX: UInt32(input.region.x),
@@ -367,10 +397,10 @@ final class MetalMosaicCompositor: @unchecked Sendable {
                 maskRecoveryDeltaThreshold: maskRecoveryDeltaThreshold
             )
             encoder.setBuffer(frameBuffer, offset: 0, index: 0)
-            encoder.setBuffer(restoredBuffer, offset: 0, index: 1)
-            encoder.setBuffer(originalBuffer, offset: 0, index: 2)
+            encoder.setBuffer(restoredReusable.buffer, offset: 0, index: 1)
+            encoder.setBuffer(originalReusable.buffer, offset: 0, index: 2)
             encoder.setBuffer(sampleBuffer, offset: 0, index: 3)
-            encoder.setBuffer(maskBuffer, offset: 0, index: 4)
+            encoder.setBuffer(maskReusable.buffer, offset: 0, index: 4)
             encoder.setBytes(
                 &params, length: MemoryLayout<MetalMosaicCompositeParams>.stride, index: 5
             )
@@ -386,7 +416,6 @@ final class MetalMosaicCompositor: @unchecked Sendable {
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
         if let error = commandBuffer.error { throw error }
-        _ = heldBuffers
 
         CVPixelBufferLockBaseAddress(outputPixelBuffer, [])
         defer { CVPixelBufferUnlockBaseAddress(outputPixelBuffer, []) }
@@ -484,7 +513,8 @@ final class MetalMosaicCompositor: @unchecked Sendable {
         encoder.setTexture(destination.texture, index: 0)
         let modelSize = SideBySideVideoPlan.modelTileSize
         let modelElements = 3 * modelSize * modelSize
-        var heldBuffers = [MTLBuffer]()
+        var reusableBuffers = [ReusableBuffer]()
+        defer { recycleBuffers(reusableBuffers) }
         let orderedInputs = mosaicCompositeInputsByVisiblePriority(inputs)
         encoder.setComputePipelineState(texturePipeline)
         for input in orderedInputs where input.region.subdivisionGroup == nil {
@@ -492,25 +522,16 @@ final class MetalMosaicCompositor: @unchecked Sendable {
                   input.original.count == modelElements,
                   input.samples.count == input.region.width * input.region.height
             else { throw DeformConvError.invalidShape }
-            let restoredBuffer = input.restored.withUnsafeBytes {
-                device.makeBuffer(bytes: $0.baseAddress!, length: $0.count, options: .storageModeShared)
-            }
-            let originalBuffer = input.original.withUnsafeBytes {
-                device.makeBuffer(bytes: $0.baseAddress!, length: $0.count, options: .storageModeShared)
-            }
+            let restoredReusable = try checkoutSharedBuffer(copying: input.restored)
+            reusableBuffers.append(restoredReusable)
+            let originalReusable = try checkoutSharedBuffer(copying: input.original)
+            reusableBuffers.append(originalReusable)
             let sampleBuffer = try cachedSampleBuffer(
                 input: input, dimensions: dimensions
             )
             let mask = input.region.maskData ?? Data([255])
-            let maskBuffer = mask.withUnsafeBytes {
-                device.makeBuffer(
-                    bytes: $0.baseAddress!, length: $0.count, options: .storageModeShared
-                )
-            }
-            guard let restoredBuffer, let originalBuffer, let maskBuffer else {
-                throw DeformConvError.metalUnavailable
-            }
-            heldBuffers += [restoredBuffer, originalBuffer, maskBuffer]
+            let maskReusable = try checkoutSharedBuffer(copying: mask)
+            reusableBuffers.append(maskReusable)
             var params = MetalMosaicCompositeParams(
                 frameWidth: UInt32(dimensions.width),
                 regionX: UInt32(input.region.x),
@@ -527,10 +548,10 @@ final class MetalMosaicCompositor: @unchecked Sendable {
                 detailResidualLimit: detailResidualLimit,
                 maskRecoveryDeltaThreshold: maskRecoveryDeltaThreshold
             )
-            encoder.setBuffer(restoredBuffer, offset: 0, index: 0)
-            encoder.setBuffer(originalBuffer, offset: 0, index: 1)
+            encoder.setBuffer(restoredReusable.buffer, offset: 0, index: 0)
+            encoder.setBuffer(originalReusable.buffer, offset: 0, index: 1)
             encoder.setBuffer(sampleBuffer, offset: 0, index: 2)
-            encoder.setBuffer(maskBuffer, offset: 0, index: 3)
+            encoder.setBuffer(maskReusable.buffer, offset: 0, index: 3)
             encoder.setBytes(
                 &params, length: MemoryLayout<MetalMosaicCompositeParams>.stride, index: 4
             )
@@ -554,16 +575,23 @@ final class MetalMosaicCompositor: @unchecked Sendable {
             let groupWidth = groupRight - groupX
             let groupHeight = groupBottom - groupY
             let accumulatorLength = groupWidth * groupHeight * MemoryLayout<SIMD4<Float>>.stride
-            guard let accumulator = device.makeBuffer(
+            let accumulatorReusable = try checkoutBuffer(
                 length: accumulatorLength, options: .storageModePrivate
-            ), let coverage = device.makeBuffer(
+            )
+            reusableBuffers.append(accumulatorReusable)
+            let coverageReusable = try checkoutBuffer(
                 length: groupWidth * groupHeight * MemoryLayout<Float>.stride,
                 options: .storageModePrivate
-            ), let restoredAccumulator = device.makeBuffer(
+            )
+            reusableBuffers.append(coverageReusable)
+            let restoredAccumulatorReusable = try checkoutBuffer(
                 length: groupWidth * groupHeight * MemoryLayout<SIMD4<Float16>>.stride,
                 options: .storageModePrivate
-            ) else { throw DeformConvError.metalUnavailable }
-            heldBuffers += [accumulator, coverage, restoredAccumulator]
+            )
+            reusableBuffers.append(restoredAccumulatorReusable)
+            let accumulator = accumulatorReusable.buffer
+            let coverage = coverageReusable.buffer
+            let restoredAccumulator = restoredAccumulatorReusable.buffer
             let groupPixels = groupWidth * groupHeight
             encoder.setComputePipelineState(groupClearPipeline)
             encoder.setBuffer(accumulator, offset: 0, index: 0)
@@ -584,27 +612,14 @@ final class MetalMosaicCompositor: @unchecked Sendable {
                       input.original.count == modelElements,
                       input.samples.count == input.region.width * input.region.height
                 else { throw DeformConvError.invalidShape }
-                let restoredBuffer = input.restored.withUnsafeBytes {
-                    device.makeBuffer(
-                        bytes: $0.baseAddress!, length: $0.count, options: .storageModeShared
-                    )
-                }
-                let originalBuffer = input.original.withUnsafeBytes {
-                    device.makeBuffer(
-                        bytes: $0.baseAddress!, length: $0.count, options: .storageModeShared
-                    )
-                }
+                let restoredReusable = try checkoutSharedBuffer(copying: input.restored)
+                reusableBuffers.append(restoredReusable)
+                let originalReusable = try checkoutSharedBuffer(copying: input.original)
+                reusableBuffers.append(originalReusable)
                 let sampleBuffer = try cachedSampleBuffer(input: input, dimensions: dimensions)
                 let mask = input.region.maskData ?? Data([255])
-                let maskBuffer = mask.withUnsafeBytes {
-                    device.makeBuffer(
-                        bytes: $0.baseAddress!, length: $0.count, options: .storageModeShared
-                    )
-                }
-                guard let restoredBuffer, let originalBuffer, let maskBuffer else {
-                    throw DeformConvError.metalUnavailable
-                }
-                heldBuffers += [restoredBuffer, originalBuffer, maskBuffer]
+                let maskReusable = try checkoutSharedBuffer(copying: mask)
+                reusableBuffers.append(maskReusable)
                 var params = MetalMosaicCompositeParams(
                     frameWidth: UInt32(dimensions.width),
                     regionX: UInt32(input.region.x),
@@ -623,10 +638,10 @@ final class MetalMosaicCompositor: @unchecked Sendable {
                     maskRecoveryDeltaThreshold: maskRecoveryDeltaThreshold
                 )
                 encoder.setBuffer(accumulator, offset: 0, index: 0)
-                encoder.setBuffer(restoredBuffer, offset: 0, index: 1)
-                encoder.setBuffer(originalBuffer, offset: 0, index: 2)
+                encoder.setBuffer(restoredReusable.buffer, offset: 0, index: 1)
+                encoder.setBuffer(originalReusable.buffer, offset: 0, index: 2)
                 encoder.setBuffer(sampleBuffer, offset: 0, index: 3)
-                encoder.setBuffer(maskBuffer, offset: 0, index: 4)
+                encoder.setBuffer(maskReusable.buffer, offset: 0, index: 4)
                 encoder.setBytes(
                     &params, length: MemoryLayout<MetalMosaicCompositeParams>.stride, index: 5
                 )
@@ -674,7 +689,7 @@ final class MetalMosaicCompositor: @unchecked Sendable {
                 stereoSources?.0.reference,
                 stereoSources?.1.reference,
                 destination.reference,
-                heldBuffers
+                reusableBuffers.map(\.buffer)
             )
         ) {}
         return true
@@ -705,6 +720,67 @@ final class MetalMosaicCompositor: @unchecked Sendable {
         return (reference, texture)
     }
 
+    private func checkoutBuffer(
+        length: Int,
+        options: MTLResourceOptions
+    ) throws -> ReusableBuffer {
+        guard length > 0 else { throw DeformConvError.invalidShape }
+        let alignedLength = (length + 4_095) & ~4_095
+        let key = ReusableBufferKey(length: alignedLength, options: options.rawValue)
+        reusableBufferLock.lock()
+        if var available = reusableBuffers[key], let buffer = available.popLast() {
+            if available.isEmpty {
+                reusableBuffers.removeValue(forKey: key)
+            } else {
+                reusableBuffers[key] = available
+            }
+            reusableBufferBytes -= key.length
+            reusableBufferLock.unlock()
+            return ReusableBuffer(key: key, buffer: buffer)
+        }
+        reusableBufferLock.unlock()
+        guard let buffer = device.makeBuffer(length: alignedLength, options: options) else {
+            throw DeformConvError.metalUnavailable
+        }
+        return ReusableBuffer(key: key, buffer: buffer)
+    }
+
+    private func checkoutSharedBuffer<T>(copying values: [T]) throws -> ReusableBuffer {
+        try values.withUnsafeBytes { bytes in
+            try checkoutSharedBuffer(copying: bytes)
+        }
+    }
+
+    private func checkoutSharedBuffer(copying data: Data) throws -> ReusableBuffer {
+        try data.withUnsafeBytes { bytes in
+            try checkoutSharedBuffer(copying: bytes)
+        }
+    }
+
+    private func checkoutSharedBuffer(
+        copying bytes: UnsafeRawBufferPointer
+    ) throws -> ReusableBuffer {
+        guard let source = bytes.baseAddress, !bytes.isEmpty else {
+            throw DeformConvError.invalidShape
+        }
+        let reusable = try checkoutBuffer(length: bytes.count, options: .storageModeShared)
+        reusable.buffer.contents().copyMemory(from: source, byteCount: bytes.count)
+        return reusable
+    }
+
+    private func recycleBuffers(_ buffers: [ReusableBuffer]) {
+        guard reusableBufferLimitBytes > 0 else { return }
+        reusableBufferLock.lock()
+        defer { reusableBufferLock.unlock() }
+        for reusable in buffers where reusable.key.length <= reusableBufferLimitBytes {
+            guard reusableBufferBytes <= reusableBufferLimitBytes - reusable.key.length else {
+                continue
+            }
+            reusableBuffers[reusable.key, default: []].append(reusable.buffer)
+            reusableBufferBytes += reusable.key.length
+        }
+    }
+
     private func cachedSampleBuffer(
         input: MetalMosaicCompositeInput,
         dimensions: VideoDimensions
@@ -724,7 +800,12 @@ final class MetalMosaicCompositor: @unchecked Sendable {
         )
         sampleBufferLock.lock()
         defer { sampleBufferLock.unlock() }
-        if let buffer = sampleBuffers[key] { return buffer }
+        sampleBufferUse &+= 1
+        if var cached = sampleBuffers[key] {
+            cached.lastUse = sampleBufferUse
+            sampleBuffers[key] = cached
+            return cached.buffer
+        }
         guard let buffer = input.samples.withUnsafeBytes({ bytes in
             device.makeBuffer(
                 bytes: bytes.baseAddress!,
@@ -732,7 +813,17 @@ final class MetalMosaicCompositor: @unchecked Sendable {
                 options: .storageModeShared
             )
         }) else { throw DeformConvError.metalUnavailable }
-        sampleBuffers[key] = buffer
+        guard sampleBufferLimitBytes > 0, buffer.length <= sampleBufferLimitBytes else {
+            return buffer
+        }
+        sampleBuffers[key] = CachedSampleBuffer(buffer: buffer, lastUse: sampleBufferUse)
+        sampleBufferBytes += buffer.length
+        while sampleBufferBytes > sampleBufferLimitBytes,
+              let oldest = sampleBuffers.min(by: { $0.value.lastUse < $1.value.lastUse })
+        {
+            sampleBufferBytes -= oldest.value.buffer.length
+            sampleBuffers.removeValue(forKey: oldest.key)
+        }
         return buffer
     }
 }

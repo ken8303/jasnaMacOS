@@ -5,6 +5,8 @@ MODE="${1:-run}"
 APP_NAME="JasnaMetalPoC"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MODELS_DIR="${JASNA_MODELS_DIR:-$ROOT_DIR/Models/MetalML}"
+PIPELINE_LOAD_ONLY=0
+GRAPH_LIFECYCLE_ONLY=0
 
 validate_metal_model_directory() {
   local directory="$1"
@@ -30,6 +32,34 @@ validate_metal_model_directory() {
   done
 }
 
+cleanup_mpsgraph_temp_for_pid() {
+  local app_pid="$1"
+  local expected_root
+  local candidate
+  local candidate_kib
+  local removed_kib=0
+
+  [[ "$app_pid" =~ ^[0-9]+$ ]] || return 0
+  expected_root="$(getconf DARWIN_USER_TEMP_DIR)com.apple.MetalPerformanceShadersGraph"
+  [[ "${JASNA_MPSGRAPH_TEMP_ROOT:-}" == "$expected_root" ]] || {
+    echo "WARNING: refusing unexpected MPSGraph temporary root: ${JASNA_MPSGRAPH_TEMP_ROOT:-unset}" >&2
+    return 0
+  }
+  [[ -d "$expected_root" ]] || return 0
+
+  while IFS= read -r -d '' candidate; do
+    candidate_kib="$(/usr/bin/du -sk "$candidate" 2>/dev/null | /usr/bin/awk '{print $1}')"
+    [[ "$candidate_kib" =~ ^[0-9]+$ ]] || candidate_kib=0
+    /bin/rm -rf -- "$candidate"
+    removed_kib=$((removed_kib + candidate_kib))
+  done < <(/usr/bin/find "$expected_root" -mindepth 1 -maxdepth 1 -type d \
+    -name "mpsgraph-${app_pid}-*" -print0 2>/dev/null)
+
+  if (( removed_kib > 0 )); then
+    echo "MPSGraph system-temp cleanup: removed $((removed_kib / 1024)) MiB for app PID $app_pid"
+  fi
+}
+
 [[ -d "$MODELS_DIR" ]] || {
   echo "error: Metal ML model directory does not exist: $MODELS_DIR" >&2
   exit 1
@@ -37,6 +67,26 @@ validate_metal_model_directory() {
 MODELS_DIR="$(cd "$MODELS_DIR" && pwd -P)"
 
 case "$MODE" in
+  --metal-ml-load-only|metal-ml-load-only)
+    [[ $# -eq 2 ]] || {
+      echo "error: load-only mode requires a diagnostic output directory" >&2
+      exit 2
+    }
+    mkdir -p "$2"
+    # Reuse the normal persistent log, PID ownership, and per-process temporary
+    # cleanup without invoking any video reader, writer, or model inference.
+    RESTORE_OUTPUT_PATH="$2/load-only.txt"
+    PIPELINE_LOAD_ONLY=1
+    ;;
+  --metal-ml-graph-lifecycle|metal-ml-graph-lifecycle)
+    [[ $# -eq 2 ]] || {
+      echo "error: graph-lifecycle mode requires a diagnostic output directory" >&2
+      exit 2
+    }
+    mkdir -p "$2"
+    RESTORE_OUTPUT_PATH="$2/graph-lifecycle.txt"
+    GRAPH_LIFECYCLE_ONLY=1
+    ;;
   --restore-sbs-video|restore-sbs-video|--restore-sbs-window|restore-sbs-window)
     [[ $# -ge 3 ]] || {
       echo "error: restore mode requires input and output video paths" >&2
@@ -85,14 +135,14 @@ case "$MODE" in
 esac
 
 case "$MODE" in
-  --restore-sbs-video|restore-sbs-video|--restore-sbs-window|restore-sbs-window|--restore-sbs-eye|restore-sbs-eye|--restore-eye-video|restore-eye-video|--restore-eye-windows|restore-eye-windows|--restore-eye-windows-sparse|restore-eye-windows-sparse|--restore-eye-windows-sparse-batch|restore-eye-windows-sparse-batch|--restore-stereo-sparse-batch|restore-stereo-sparse-batch)
+  --metal-ml-load-only|metal-ml-load-only|--metal-ml-graph-lifecycle|metal-ml-graph-lifecycle|--restore-sbs-video|restore-sbs-video|--restore-sbs-window|restore-sbs-window|--restore-sbs-eye|restore-sbs-eye|--restore-eye-video|restore-eye-video|--restore-eye-windows|restore-eye-windows|--restore-eye-windows-sparse|restore-eye-windows-sparse|--restore-eye-windows-sparse-batch|restore-eye-windows-sparse-batch|--restore-stereo-sparse-batch|restore-stereo-sparse-batch)
     RESTORE_OUTPUT_DIR="$(cd "$(dirname "$RESTORE_OUTPUT_PATH")" && pwd)"
     RESTORE_OUTPUT_NAME="$(basename "$RESTORE_OUTPUT_PATH")"
     RESTORE_OUTPUT_STEM="${RESTORE_OUTPUT_NAME%.*}"
     export JASNA_WORK_DIR="${JASNA_WORK_DIR:-$RESTORE_OUTPUT_DIR/${RESTORE_OUTPUT_STEM}.jasna-work}"
     export JASNA_LOG_PEAK_MEMORY="${JASNA_LOG_PEAK_MEMORY:-1}"
     validate_metal_model_directory "$MODELS_DIR" "Metal ML model"
-    if [[ "${JASNA_MODEL_BATCH:-1}" == "2" ]]; then
+    if [[ "$PIPELINE_LOAD_ONLY" == "0" && "${JASNA_MODEL_BATCH:-1}" == "2" ]]; then
       if [[ -n "${JASNA_BATCH2_MODELS_DIR:-}" ]]; then
         validate_metal_model_directory "$JASNA_BATCH2_MODELS_DIR" "batch-2 Metal ML model"
         EXPECTED_BATCH2_MODELS_DIR="${MODELS_DIR%/}Batch2"
@@ -135,6 +185,7 @@ case "$MODE" in
     fi
     JASNA_LOG_PATH="$RESTORE_OUTPUT_DIR/${RESTORE_OUTPUT_STEM}.jasna.log"
     mkdir -p "$JASNA_WORK_DIR"
+    export JASNA_MPSGRAPH_TEMP_ROOT="$(getconf DARWIN_USER_TEMP_DIR)com.apple.MetalPerformanceShadersGraph"
     JASNA_PROCESS_LOCK="$JASNA_WORK_DIR/.jasna-process-lock"
     if ! mkdir "$JASNA_PROCESS_LOCK" 2>/dev/null; then
       EXISTING_PID="$(/bin/cat "$JASNA_PROCESS_LOCK/pid" 2>/dev/null || true)"
@@ -143,17 +194,29 @@ case "$MODE" in
         echo "work dir: $JASNA_WORK_DIR" >&2
         exit 1
       fi
+      EXISTING_APP_PID="$(/bin/cat "$JASNA_PROCESS_LOCK/app-pid" 2>/dev/null || true)"
+      if [[ "$EXISTING_APP_PID" =~ ^[0-9]+$ ]] \
+        && kill -0 "$EXISTING_APP_PID" 2>/dev/null; then
+        echo "error: a restoration child from the stale launcher is still active (PID $EXISTING_APP_PID)" >&2
+        echo "work dir: $JASNA_WORK_DIR" >&2
+        exit 1
+      fi
+      cleanup_mpsgraph_temp_for_pid "$EXISTING_APP_PID"
       STALE_LOCK="$JASNA_WORK_DIR/.jasna-process-lock.stale-$(date '+%Y%m%d-%H%M%S')-$$"
       mv "$JASNA_PROCESS_LOCK" "$STALE_LOCK"
       mkdir "$JASNA_PROCESS_LOCK"
     fi
     printf '%s\n' "$$" > "$JASNA_PROCESS_LOCK/pid"
+    export JASNA_RUNTIME_PID_FILE="$JASNA_PROCESS_LOCK/app-pid"
     cleanup_jasna_process_lock() {
       [[ -d "$JASNA_PROCESS_LOCK" ]] || return 0
       local owner_pid
+      local app_pid
       owner_pid="$(/bin/cat "$JASNA_PROCESS_LOCK/pid" 2>/dev/null || true)"
       [[ "$owner_pid" == "$$" ]] || return 0
-      rm -f "$JASNA_PROCESS_LOCK/pid"
+      app_pid="$(/bin/cat "$JASNA_RUNTIME_PID_FILE" 2>/dev/null || true)"
+      cleanup_mpsgraph_temp_for_pid "$app_pid"
+      rm -f "$JASNA_RUNTIME_PID_FILE" "$JASNA_PROCESS_LOCK/pid"
       rmdir "$JASNA_PROCESS_LOCK" 2>/dev/null || true
     }
     trap cleanup_jasna_process_lock EXIT
@@ -164,9 +227,19 @@ case "$MODE" in
     echo "===== Jasna restoration session $(date -u '+%Y-%m-%dT%H:%M:%SZ') ====="
     echo "Log:      $JASNA_LOG_PATH"
     echo "Work dir: $JASNA_WORK_DIR"
-    echo "Output:   $RESTORE_OUTPUT_PATH"
+    if [[ "$PIPELINE_LOAD_ONLY" == "1" || "$GRAPH_LIFECYCLE_ONLY" == "1" ]]; then
+      echo "Diagnostic directory: $RESTORE_OUTPUT_DIR (no video output)"
+    else
+      echo "Output:   $RESTORE_OUTPUT_PATH"
+    fi
     echo "Models:   $MODELS_DIR"
-    if [[ -n "${JASNA_BATCH2_MODELS_DIR:-}" ]]; then
+    echo "Runtime temporary/cache files: output-local"
+    echo "Apple MPSGraph system temporary files: cleaned after this process"
+    if [[ "$PIPELINE_LOAD_ONLY" == "1" ]]; then
+      echo "Pipeline-load diagnostics: no model inference"
+    elif [[ "$GRAPH_LIFECYCLE_ONLY" == "1" ]]; then
+      echo "Graph-lifecycle diagnostics: generated input, batch 2"
+    elif [[ -n "${JASNA_BATCH2_MODELS_DIR:-}" ]]; then
       echo "Model batch: 2 ($JASNA_BATCH2_MODELS_DIR)"
     else
       echo "Model batch: 1"
@@ -180,7 +253,7 @@ export CLANG_MODULE_CACHE_PATH="$ROOT_DIR/.build/ModuleCache"
 export SWIFTPM_MODULECACHE_OVERRIDE="$ROOT_DIR/.build/ModuleCache"
 BUILD_ARGUMENTS=(--disable-sandbox)
 case "$MODE" in
-  --restore-sbs-video|restore-sbs-video|--restore-sbs-window|restore-sbs-window|--restore-sbs-eye|restore-sbs-eye|--restore-eye-video|restore-eye-video|--restore-eye-windows|restore-eye-windows|--restore-eye-windows-sparse|restore-eye-windows-sparse|--restore-eye-windows-sparse-batch|restore-eye-windows-sparse-batch|--restore-stereo-sparse-batch|restore-stereo-sparse-batch|--core-ml-comparison|core-ml-comparison|--core-ml-spynet|core-ml-spynet)
+  --metal-ml-load-only|metal-ml-load-only|--metal-ml-graph-lifecycle|metal-ml-graph-lifecycle|--restore-sbs-video|restore-sbs-video|--restore-sbs-window|restore-sbs-window|--restore-sbs-eye|restore-sbs-eye|--restore-eye-video|restore-eye-video|--restore-eye-windows|restore-eye-windows|--restore-eye-windows-sparse|restore-eye-windows-sparse|--restore-eye-windows-sparse-batch|restore-eye-windows-sparse-batch|--restore-stereo-sparse-batch|restore-stereo-sparse-batch|--core-ml-comparison|core-ml-comparison|--core-ml-spynet|core-ml-spynet)
     BUILD_ARGUMENTS+=(-c release)
     echo "Building optimized restoration binary..."
     ;;
@@ -217,6 +290,14 @@ case "$MODE" in
     ;;
   --metal-ml-probe|metal-ml-probe)
     "$APP_BINARY" --metal-ml-probe "$MODELS_DIR/feature_extract.mtlpackage"
+    ;;
+  --metal-ml-load-only|metal-ml-load-only)
+    "$APP_BINARY" --metal-ml-load-only "$MODELS_DIR"
+    ;;
+  --metal-ml-graph-lifecycle|metal-ml-graph-lifecycle)
+    "$APP_BINARY" --metal-ml-graph-lifecycle \
+      "$MODELS_DIR" "$ROOT_DIR/Models/DeformConv" \
+      "$RESTORE_OUTPUT_DIR/graph-lifecycle-report.json" 2
     ;;
   --metal-ml-benchmark|metal-ml-benchmark)
     "$APP_BINARY" --metal-ml-benchmark "$MODELS_DIR/feature_extract.mtlpackage"
@@ -352,7 +433,9 @@ case "$MODE" in
     done
     ;;
   *)
-    echo "usage: $0 [run|--debug|--logs|--telemetry|--verify|--metal-ml-probe|--metal-ml-benchmark|--metal-ml-interop|--core-ml-comparison|--core-ml-spynet|--core-ai-feature-extract|--propagation-smoke|--propagation-suite|--reconstruct-frame|--zero-copy-frame|--zero-copy-frame-grouped|--zero-copy-frame-staged|--zero-copy-frame-fused|--spynet-pair|--frame-with-spynet|--temporal-inputs|--three-frame-recurrence|--three-frame-first-pass|--three-frame-four-pass|--variable-clip [frames]|--single-run-clip [frames]|--plan-sbs-video [width height source-fps duration]|--inspect-sbs-video input|--transcode-sbs-30 input output.mov|--transcode-sbs-30-tiled input output.mov|--restore-sbs-video input output.mov|--restore-sbs-eye input left|right output.mov|--restore-eye-video input output.mov|--restore-eye-windows input output-directory|--restore-stereo-sparse-batch paired-job...|--diagnose-sbs-tile input tile-number|--metal-ml-suite|--schedule [frames]|--validate-package-graph|--allocate-frame-graph [frames]|--validate-deform-weights|--benchmark-real-weights]" >&2
+    echo "usage: $0 [run|--debug|--logs|--telemetry|--verify|--metal-ml-probe|--metal-ml-load-only|--metal-ml-graph-lifecycle|--metal-ml-benchmark|--metal-ml-interop|--core-ml-comparison|--core-ml-spynet|--core-ai-feature-extract|--propagation-smoke|--propagation-suite|--reconstruct-frame|--zero-copy-frame|--zero-copy-frame-grouped|--zero-copy-frame-staged|--zero-copy-frame-fused|--spynet-pair|--frame-with-spynet|--temporal-inputs|--three-frame-recurrence|--three-frame-first-pass|--three-frame-four-pass|--variable-clip [frames]|--single-run-clip [frames]|--plan-sbs-video [width height source-fps duration]|--inspect-sbs-video input|--transcode-sbs-30 input output.mov|--transcode-sbs-30-tiled input output.mov|--restore-sbs-video input output.mov|--restore-sbs-eye input left|right output.mov|--restore-eye-video input output.mov|--restore-eye-windows input output-directory|--restore-stereo-sparse-batch paired-job...|--diagnose-sbs-tile input tile-number|--metal-ml-suite|--schedule [frames]|--validate-package-graph|--allocate-frame-graph [frames]|--validate-deform-weights|--benchmark-real-weights]" >&2
+    echo "load diagnostic: $0 --metal-ml-load-only output-directory" >&2
+    echo "graph diagnostic: $0 --metal-ml-graph-lifecycle output-directory" >&2
     exit 2
     ;;
 esac

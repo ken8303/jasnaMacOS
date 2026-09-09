@@ -74,6 +74,22 @@ class StereoManifestReconciliationTests(unittest.TestCase):
         self.assertEqual((inferred_left, inferred_right), (0, 0))
         self.assertEqual((len(left["regions"]), len(right["regions"])), (1, 1))
 
+    def test_infers_legacy_region_without_explicit_blend_coordinates(self):
+        legacy = region(0, 30, 1000, 2000)
+        for key in ("blendX", "blendY", "blendWidth", "blendHeight"):
+            legacy.pop(key)
+        right = region(30, 60, 920, 1995)
+
+        _, reconciled_right, _, _, _, inferred_right = reconcile_manifests(
+            manifest([legacy, region(30, 60, 1000, 2000)]),
+            manifest([right]),
+        )
+
+        self.assertEqual(inferred_right, 1)
+        inferred = reconciled_right["regions"][-1]
+        self.assertEqual((inferred["x"], inferred["y"]), (920, 1995))
+        self.assertEqual((inferred["blendX"], inferred["blendY"]), (920, 1995))
+
 
 if __name__ == "__main__":
     unittest.main()
