@@ -441,7 +441,9 @@ extension SideBySideRestoration {
             let urls = resumed?.urls ?? (0..<outputCount).map {
                 directory.appendingPathComponent("frame-\($0).fp16")
             }
-            var handles = try useInMemoryCache ? [] : urls.map { url -> FileHandle in
+            // Always keep disk handles so Fast/in-memory handoff can still checkpoint
+            // and resume mid-window after Stop.
+            var handles = try urls.map { url -> FileHandle in
                 if resumed == nil {
                     guard FileManager.default.createFile(atPath: url.path, contents: nil) else {
                         throw DeformConvError.commandFailed("failed creating crop cache: \(url.path)")
@@ -493,7 +495,9 @@ extension SideBySideRestoration {
                     + "\(regions.count) tight mosaic crops; cache "
                     + "\(String(format: "%.2f", Double(cacheBytes) / 1_073_741_824)) GiB; "
                     + "model batch \(regionBatchSize); handoff "
-                    + (useInMemoryCache ? "bounded memory" : "restartable disk")
+                    + (useInMemoryCache
+                        ? "bounded memory + disk checkpoints"
+                        : "restartable disk")
             )
             report(
                 "Window \(windowIndex + 1)/\(windowCount): crop preparation pipeline "
@@ -620,12 +624,17 @@ extension SideBySideRestoration {
                                 try inMemoryCache.store(
                                     values, frame: frame, region: prepared.regionIndex
                                 )
-                            } else {
-                                try values.withUnsafeBytes { bytes in
-                                    try handles[frame].write(contentsOf: Data(bytes))
-                                }
                             }
-                        } else if inMemoryCache == nil {
+                            try values.withUnsafeBytes { bytes in
+                                guard let base = bytes.baseAddress else { return }
+                                let view = Data(
+                                    bytesNoCopy: UnsafeMutableRawPointer(mutating: base),
+                                    count: bytes.count,
+                                    deallocator: .none
+                                )
+                                try handles[frame].write(contentsOf: view)
+                            }
+                        } else {
                             try handles[frame].seek(
                                 toOffset: UInt64((prepared.regionIndex + 1) * tileBytes)
                             )
@@ -640,7 +649,7 @@ extension SideBySideRestoration {
                     let completedCount = prepared.regionIndex + 1
                     let shouldCheckpoint = completedCount == regions.count
                         || completedCount.isMultiple(of: checkpointInterval)
-                    if shouldCheckpoint, inMemoryCache == nil {
+                    if shouldCheckpoint {
                         let completedBytes = UInt64(completedCount * tileBytes)
                         for handle in handles {
                             try handle.truncate(atOffset: completedBytes)
@@ -878,10 +887,19 @@ extension SideBySideRestoration {
         }
         return work.indices.map { sample in
             let start = sample * tileElements
-            let end = start + tileElements
             return CompletedRegionRestoration(
                 prepared: work[sample],
-                frames: frames.map { Array($0[start..<end]) },
+                frames: frames.map { frame in
+                    Array(unsafeUninitializedCapacity: tileElements) { buffer, count in
+                        frame.withUnsafeBufferPointer { source in
+                            buffer.baseAddress!.update(
+                                from: source.baseAddress! + start,
+                                count: tileElements
+                            )
+                        }
+                        count = tileElements
+                    }
+                },
                 gpuMilliseconds: gpuMilliseconds / Double(work.count),
                 wallMilliseconds: wallMilliseconds / Double(work.count),
                 inputPackingMilliseconds: inputPackingMilliseconds / Double(work.count),

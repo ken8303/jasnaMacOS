@@ -97,6 +97,8 @@ final class MetalMosaicCompositor: @unchecked Sendable {
     private let textureCacheLock = NSLock()
     private let reusableBufferLock = NSLock()
     private let sampleBufferLock = NSLock()
+    private let commandBufferLock = NSLock()
+    private var pendingCommandBuffer: MTLCommandBuffer?
     private var reusableBuffers = [ReusableBufferKey: [MTLBuffer]]()
     private var reusableBufferBytes = 0
     private var sampleBuffers = [SampleBufferKey: CachedSampleBuffer]()
@@ -176,7 +178,8 @@ final class MetalMosaicCompositor: @unchecked Sendable {
         basePixelBuffer: CVPixelBuffer,
         outputPixelBuffer: CVPixelBuffer,
         dimensions: VideoDimensions,
-        inputs: [MetalMosaicCompositeInput]
+        inputs: [MetalMosaicCompositeInput],
+        waitUntilCompleted: Bool = true
     ) throws {
         guard CVPixelBufferGetPixelFormatType(basePixelBuffer) == kCVPixelFormatType_32BGRA,
               CVPixelBufferGetPixelFormatType(outputPixelBuffer) == kCVPixelFormatType_32BGRA,
@@ -193,7 +196,8 @@ final class MetalMosaicCompositor: @unchecked Sendable {
                 basePixelBuffer: basePixelBuffer,
                 outputPixelBuffer: outputPixelBuffer,
                 dimensions: dimensions,
-                inputs: inputs
+                inputs: inputs,
+                waitUntilCompleted: waitUntilCompleted
             ) {
                 return
             }
@@ -214,7 +218,8 @@ final class MetalMosaicCompositor: @unchecked Sendable {
     func compositeInPlace(
         pixelBuffer: CVPixelBuffer,
         dimensions: VideoDimensions,
-        inputs: [MetalMosaicCompositeInput]
+        inputs: [MetalMosaicCompositeInput],
+        waitUntilCompleted: Bool = true
     ) throws {
         guard prefersTextureSurfaces,
               CVPixelBufferGetPixelFormatType(pixelBuffer) == kCVPixelFormatType_32BGRA,
@@ -224,7 +229,8 @@ final class MetalMosaicCompositor: @unchecked Sendable {
                   basePixelBuffer: nil,
                   outputPixelBuffer: pixelBuffer,
                   dimensions: dimensions,
-                  inputs: inputs
+                  inputs: inputs,
+                  waitUntilCompleted: waitUntilCompleted
               )
         else {
             throw DeformConvError.commandFailed(
@@ -237,7 +243,8 @@ final class MetalMosaicCompositor: @unchecked Sendable {
         leftPixelBuffer: CVPixelBuffer,
         rightPixelBuffer: CVPixelBuffer,
         outputPixelBuffer: CVPixelBuffer,
-        dimensions: VideoDimensions
+        dimensions: VideoDimensions,
+        waitUntilCompleted: Bool = true
     ) throws {
         let eyeDimensions = VideoDimensions(
             width: dimensions.width / 2,
@@ -291,9 +298,7 @@ final class MetalMosaicCompositor: @unchecked Sendable {
             destinationOrigin: .init(x: eyeDimensions.width, y: 0, z: 0)
         )
         encoder.endEncoding()
-        commandBuffer.commit()
-        commandBuffer.waitUntilCompleted()
-        if let error = commandBuffer.error { throw error }
+        try finishCommandBuffer(commandBuffer, waitUntilCompleted: waitUntilCompleted)
         withExtendedLifetime((left.reference, right.reference, destination.reference)) {}
     }
 
@@ -302,7 +307,8 @@ final class MetalMosaicCompositor: @unchecked Sendable {
         rightPixelBuffer: CVPixelBuffer,
         outputPixelBuffer: CVPixelBuffer,
         dimensions: VideoDimensions,
-        inputs: [MetalMosaicCompositeInput]
+        inputs: [MetalMosaicCompositeInput],
+        waitUntilCompleted: Bool = true
     ) throws {
         let eyeDimensions = VideoDimensions(
             width: dimensions.width / 2, height: dimensions.height
@@ -323,7 +329,8 @@ final class MetalMosaicCompositor: @unchecked Sendable {
                   stereoBasePixelBuffers: (leftPixelBuffer, rightPixelBuffer),
                   outputPixelBuffer: outputPixelBuffer,
                   dimensions: dimensions,
-                  inputs: inputs
+                  inputs: inputs,
+                  waitUntilCompleted: waitUntilCompleted
               )
         else {
             throw DeformConvError.commandFailed(
@@ -413,9 +420,8 @@ final class MetalMosaicCompositor: @unchecked Sendable {
             encoder.memoryBarrier(scope: .buffers)
         }
         encoder.endEncoding()
-        commandBuffer.commit()
-        commandBuffer.waitUntilCompleted()
-        if let error = commandBuffer.error { throw error }
+        // Buffer-path readback requires the GPU to finish before the CPU copy.
+        try finishCommandBuffer(commandBuffer, waitUntilCompleted: true)
 
         CVPixelBufferLockBaseAddress(outputPixelBuffer, [])
         defer { CVPixelBufferUnlockBaseAddress(outputPixelBuffer, []) }
@@ -436,7 +442,8 @@ final class MetalMosaicCompositor: @unchecked Sendable {
         stereoBasePixelBuffers: (CVPixelBuffer, CVPixelBuffer)? = nil,
         outputPixelBuffer: CVPixelBuffer,
         dimensions: VideoDimensions,
-        inputs: [MetalMosaicCompositeInput]
+        inputs: [MetalMosaicCompositeInput],
+        waitUntilCompleted: Bool = true
     ) throws -> Bool {
         let source = basePixelBuffer.flatMap {
             makeTexture(pixelBuffer: $0, dimensions: dimensions)
@@ -680,9 +687,7 @@ final class MetalMosaicCompositor: @unchecked Sendable {
             encoder.memoryBarrier(scope: .textures)
         }
         encoder.endEncoding()
-        commandBuffer.commit()
-        commandBuffer.waitUntilCompleted()
-        if let error = commandBuffer.error { throw error }
+        try finishCommandBuffer(commandBuffer, waitUntilCompleted: waitUntilCompleted)
         withExtendedLifetime(
             (
                 source?.reference,
@@ -693,6 +698,39 @@ final class MetalMosaicCompositor: @unchecked Sendable {
             )
         ) {}
         return true
+    }
+
+
+    func synchronize() throws {
+        commandBufferLock.lock()
+        let pending = pendingCommandBuffer
+        pendingCommandBuffer = nil
+        commandBufferLock.unlock()
+        guard let pending else { return }
+        pending.waitUntilCompleted()
+        if let error = pending.error { throw error }
+    }
+
+    private func finishCommandBuffer(
+        _ commandBuffer: MTLCommandBuffer,
+        waitUntilCompleted: Bool
+    ) throws {
+        if waitUntilCompleted {
+            try synchronize()
+            commandBuffer.commit()
+            commandBuffer.waitUntilCompleted()
+            if let error = commandBuffer.error { throw error }
+            return
+        }
+        commandBuffer.commit()
+        commandBufferLock.lock()
+        let previous = pendingCommandBuffer
+        pendingCommandBuffer = commandBuffer
+        commandBufferLock.unlock()
+        if let previous {
+            previous.waitUntilCompleted()
+            if let error = previous.error { throw error }
+        }
     }
 
     private func makeTexture(

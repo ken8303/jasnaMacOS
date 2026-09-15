@@ -507,7 +507,13 @@ enum SideBySideRestoration {
                     )
                     for frame in 0..<outputCount {
                         try restored.frames[frame].withUnsafeBytes { bytes in
-                            try handles[frame].write(contentsOf: Data(bytes))
+                            guard let base = bytes.baseAddress else { return }
+                            let view = Data(
+                                bytesNoCopy: UnsafeMutableRawPointer(mutating: base),
+                                count: bytes.count,
+                                deallocator: .none
+                            )
+                            try handles[frame].write(contentsOf: view)
                         }
                     }
                     return restored.gpuMilliseconds
@@ -567,7 +573,7 @@ enum SideBySideRestoration {
 
 
     static func report(_ message: String) {
-        let timestamp = ISO8601DateFormatter().string(from: Date())
+        let timestamp = Date.now.formatted(.iso8601)
         FileHandle.standardOutput.write(Data("[\(timestamp)] \(message)\n".utf8))
     }
 

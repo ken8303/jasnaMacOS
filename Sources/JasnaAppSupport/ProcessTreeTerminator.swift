@@ -128,20 +128,24 @@ public enum ProcessTreeTerminator {
     }
 
     static func processIdentities() -> [ProcessIdentity] {
-        let estimatedCount = proc_listallpids(nil, 0)
-        guard estimatedCount > 0 else { return [] }
+        // proc_listallpids returns a byte count, not a pid count.
+        let estimatedBytes = proc_listallpids(nil, 0)
+        guard estimatedBytes > 0 else { return [] }
+        let pidStride = MemoryLayout<pid_t>.stride
+        let estimatedCount = Int(estimatedBytes) / pidStride
         // Leave headroom for processes created between the sizing and fill calls.
         var identifiers = [pid_t](
             repeating: 0,
-            count: Int(estimatedCount) + 64
+            count: estimatedCount + 64
         )
-        let returnedCount = identifiers.withUnsafeMutableBytes { buffer in
+        let returnedBytes = identifiers.withUnsafeMutableBytes { buffer in
             proc_listallpids(buffer.baseAddress, Int32(buffer.count))
         }
-        guard returnedCount > 0 else { return [] }
+        guard returnedBytes > 0 else { return [] }
+        let returnedCount = Int(returnedBytes) / pidStride
 
         let infoSize = Int32(MemoryLayout<proc_bsdinfo>.stride)
-        return identifiers.prefix(Int(returnedCount)).compactMap { identifier in
+        return identifiers.prefix(returnedCount).compactMap { identifier in
             guard identifier > 1 else { return nil }
             var info = proc_bsdinfo()
             let bytes = withUnsafeMutablePointer(to: &info) { pointer in

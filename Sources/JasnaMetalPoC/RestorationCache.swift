@@ -13,9 +13,18 @@ extension SideBySideRestoration {
             }
             self.frameCount = frameCount
             self.regionCount = regionCount
-            frames = (0..<frameCount).map { _ in
-                NSMutableData(length: regionCount * tileBytes)!
+            var allocated = [NSMutableData]()
+            allocated.reserveCapacity(frameCount)
+            for _ in 0..<frameCount {
+                guard let data = NSMutableData(length: regionCount * tileBytes) else {
+                    throw DeformConvError.commandFailed(
+                        "failed allocating in-memory crop cache "
+                            + "(\(frameCount)x\(regionCount) tiles)"
+                    )
+                }
+                allocated.append(data)
             }
+            frames = allocated
         }
 
         func store(_ values: [Float16], frame: Int, region: Int) throws {
@@ -30,17 +39,21 @@ extension SideBySideRestoration {
         }
 
         func values(frame: Int, region: Int) throws -> [Float16] {
-            guard frames.indices.contains(frame), region >= 0, region < regionCount else {
-                throw DeformConvError.invalidShape
-            }
             var result = [Float16](repeating: 0, count: tileElements)
-            result.withUnsafeMutableBytes { destination in
-                destination.baseAddress!.copyMemory(
+            try copyValues(frame: frame, region: region, into: &result)
+            return result
+        }
+
+        func copyValues(frame: Int, region: Int, into destination: inout [Float16]) throws {
+            guard frames.indices.contains(frame), region >= 0, region < regionCount,
+                  destination.count == tileElements
+            else { throw DeformConvError.invalidShape }
+            destination.withUnsafeMutableBytes { buffer in
+                buffer.baseAddress!.copyMemory(
                     from: frames[frame].bytes.advanced(by: region * tileBytes),
                     byteCount: tileBytes
                 )
             }
-            return result
         }
     }
 
@@ -256,6 +269,19 @@ extension SideBySideRestoration {
         let sizes = try cacheURLs.map {
             try $0.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
         }
-        return min(tileCount, (sizes.min() ?? 0) / bytesPerTile)
+        let sizeBased = min(tileCount, (sizes.min() ?? 0) / bytesPerTile)
+        guard let directory = cacheURLs.first?.deletingLastPathComponent() else {
+            return sizeBased
+        }
+        let markerURL = directory.appendingPathComponent("completed-tiles.txt")
+        guard let markerData = try? Data(contentsOf: markerURL),
+              let markerText = String(data: markerData, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+              let markerCount = Int(markerText), markerCount >= 0
+        else {
+            return sizeBased
+        }
+        // Prefer the atomic marker, but never claim more tiles than every frame file holds.
+        return min(tileCount, markerCount, sizeBased)
     }
 }

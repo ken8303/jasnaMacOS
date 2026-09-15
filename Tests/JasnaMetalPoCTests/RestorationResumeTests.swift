@@ -66,6 +66,38 @@ import Testing
     #expect(completed == 3)
 }
 
+
+@available(macOS 27.0, *)
+@Test func restorationResumePrefersCompletedTilesMarkerClampedBySize() throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+        "jasna-resume-marker-test-\(UUID().uuidString)", isDirectory: true
+    )
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    let bytesPerTile = 16
+    // Size says 5 complete tiles; marker claims 4.
+    let url = directory.appendingPathComponent("frame-0.fp16")
+    try Data(repeating: 0, count: bytesPerTile * 5).write(to: url)
+    try Data("4\n".utf8).write(to: directory.appendingPathComponent("completed-tiles.txt"))
+
+    let completed = try SideBySideRestoration.recoverableTileCount(
+        cacheURLs: [url],
+        bytesPerTile: bytesPerTile,
+        tileCount: 100
+    )
+    #expect(completed == 4)
+
+    // Marker above size must clamp to size-based count.
+    try Data("9\n".utf8).write(to: directory.appendingPathComponent("completed-tiles.txt"))
+    let clamped = try SideBySideRestoration.recoverableTileCount(
+        cacheURLs: [url],
+        bytesPerTile: bytesPerTile,
+        tileCount: 100
+    )
+    #expect(clamped == 5)
+}
+
 @available(macOS 27.0, *)
 @Test func restorationResumeCapsCompletedTilesAtPlanSize() throws {
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
@@ -187,6 +219,22 @@ import Testing
             environment: ["JASNA_WINDOW_START": "0", "JASNA_WINDOW_COUNT": "0"]
         )
     }
+}
+
+
+@available(macOS 27.0, *)
+@Test func inMemoryRegionFrameCacheCopyValuesReusesCallerBuffer() throws {
+    let cache = try SideBySideRestoration.InMemoryRegionFrameCache(
+        frameCount: 1, regionCount: 1
+    )
+    var stored = [Float16](repeating: 0, count: SideBySideRestoration.tileElements)
+    stored[0] = 9.5
+    stored[stored.count - 1] = -1.25
+    try cache.store(stored, frame: 0, region: 0)
+
+    var scratch = [Float16](repeating: 7, count: SideBySideRestoration.tileElements)
+    try cache.copyValues(frame: 0, region: 0, into: &scratch)
+    #expect(scratch == stored)
 }
 
 @available(macOS 27.0, *)

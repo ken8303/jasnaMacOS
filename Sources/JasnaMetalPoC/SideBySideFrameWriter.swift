@@ -108,6 +108,9 @@ extension SideBySideRestoration {
                     let cache = try inMemoryCache == nil
                         ? FileHandle(forReadingFrom: cacheURLs[index]) : nil
                     defer { try? cache?.close() }
+                    var restoredScratch = (0..<regions.count).map { _ in
+                        [Float16](repeating: 0, count: tileElements)
+                    }
                     var compositeInputs = [MetalMosaicCompositeInput]()
                     compositeInputs.reserveCapacity(regions.count)
                     for (regionIndex, region) in regions.enumerated() {
@@ -116,10 +119,11 @@ extension SideBySideRestoration {
                             try cache?.seek(toOffset: UInt64((regionIndex + 1) * tileBytes))
                             continue
                         }
-                        let values: [Float16]
                         if let inMemoryCache {
-                            values = try inMemoryCache.values(
-                                frame: localFrame, region: regionIndex
+                            try inMemoryCache.copyValues(
+                                frame: localFrame,
+                                region: regionIndex,
+                                into: &restoredScratch[regionIndex]
                             )
                         } else {
                             guard let data = try cache?.read(upToCount: tileBytes),
@@ -129,9 +133,9 @@ extension SideBySideRestoration {
                                     "restored mosaic-crop cache is truncated"
                                 )
                             }
-                            var decoded = [Float16](repeating: 0, count: tileElements)
-                            _ = decoded.withUnsafeMutableBytes { data.copyBytes(to: $0) }
-                            values = decoded
+                            _ = restoredScratch[regionIndex].withUnsafeMutableBytes {
+                                data.copyBytes(to: $0)
+                            }
                         }
                         let original = projection == .fisheye
                             ? try samplingMaps[regionIndex].extractPlanarRGB(
@@ -141,7 +145,7 @@ extension SideBySideRestoration {
                         compositeInputs.append(
                             MetalMosaicCompositeInput(
                                 region: region.resolvingSegmentationMask(at: absoluteFrame),
-                                restored: values,
+                                restored: restoredScratch[regionIndex],
                                 original: original ?? [],
                                 samples: samplingMaps[regionIndex].compositeSamples
                             )
@@ -410,14 +414,15 @@ extension SideBySideRestoration {
                 let cache = try FileHandle(forReadingFrom: cacheURLs[localFrame])
                 var restoredTiles = [(VideoTile, [Float16])]()
                 restoredTiles.reserveCapacity(compositeTiles.count)
+                var tileScratch = [Float16](repeating: 0, count: tileElements)
                 for tile in compositeTiles {
                     guard let data = try cache.read(upToCount: tileBytes), data.count == tileBytes else {
                         try? cache.close()
                         throw DeformConvError.commandFailed("restored tile cache is truncated")
                     }
-                    var values = [Float16](repeating: 0, count: tileElements)
-                    _ = values.withUnsafeMutableBytes { data.copyBytes(to: $0) }
-                    restoredTiles.append((tile, values))
+                    _ = tileScratch.withUnsafeMutableBytes { data.copyBytes(to: $0) }
+                    // Copy-on-write keeps this tile's values stable after the next overwrite.
+                    restoredTiles.append((tile, tileScratch))
                 }
                 try cache.close()
                 var optionalBuffer: CVPixelBuffer?
@@ -654,6 +659,9 @@ extension SideBySideRestoration {
                 let presentationTime = CMTime(
                     value: CMTimeValue(presentationStartFrame + localFrame), timescale: 30
                 )
+                if let metalCompositor {
+                    try metalCompositor.synchronize()
+                }
                 let appendStarted = ContinuousClock.now
                 try await append(
                     FinishedPixelBuffer(value: prepared.outputBuffer), at: presentationTime,
@@ -726,7 +734,8 @@ extension SideBySideRestoration {
                 regions: input.leftRegions,
                 samplingMaps: input.leftSamplingMaps,
                 absoluteFrame: input.absoluteFrame,
-                xOffset: 0
+                xOffset: 0,
+                projection: input.projection
             )
             let rightRead = try Self.readCompositeInputs(
                 cacheURL: input.rightCacheURL,
@@ -736,7 +745,8 @@ extension SideBySideRestoration {
                 regions: input.rightRegions,
                 samplingMaps: input.rightSamplingMaps,
                 absoluteFrame: input.absoluteFrame,
-                xOffset: input.plan.eyeDimensions.width
+                xOffset: input.plan.eyeDimensions.width,
+                projection: input.projection
             )
             let compositeInputs = leftRead.inputs + rightRead.inputs
             let compositeStarted = ContinuousClock.now
@@ -749,7 +759,8 @@ extension SideBySideRestoration {
                         rightPixelBuffer: input.rightBaseFrame,
                         outputPixelBuffer: outputBuffer,
                         dimensions: input.plan.dimensions,
-                        inputs: compositeInputs
+                        inputs: compositeInputs,
+                        waitUntilCompleted: false
                     )
                 } catch {
                     fusedFallbackMessage = "WARNING: Fused Metal stereo composite failed; "
@@ -759,7 +770,8 @@ extension SideBySideRestoration {
                             leftPixelBuffer: input.leftBaseFrame,
                             rightPixelBuffer: input.rightBaseFrame,
                             outputPixelBuffer: outputBuffer,
-                            dimensions: input.plan.dimensions
+                            dimensions: input.plan.dimensions,
+                            waitUntilCompleted: false
                         )
                     } catch {
                         cpuFallbackMessage = "WARNING: Metal stereo copy failed; using CPU for frame "
@@ -774,7 +786,8 @@ extension SideBySideRestoration {
                     try metalCompositor.compositeInPlace(
                         pixelBuffer: outputBuffer,
                         dimensions: input.plan.dimensions,
-                        inputs: compositeInputs
+                        inputs: compositeInputs,
+                        waitUntilCompleted: false
                     )
                 }
             } else {
@@ -835,7 +848,8 @@ extension SideBySideRestoration {
             regions: [MosaicRegion],
             samplingMaps: [MosaicCropSamplingMap],
             absoluteFrame: Int,
-            xOffset: Int
+            xOffset: Int,
+            projection: VRMosaicProjection
         ) throws -> CompositeInputReadResult {
             let totalStarted = ContinuousClock.now
             var cacheMilliseconds = 0.0
@@ -848,6 +862,9 @@ extension SideBySideRestoration {
             defer { try? cache?.close() }
             var result = [MetalMosaicCompositeInput]()
             result.reserveCapacity(regions.count)
+            var restoredScratch = (0..<regions.count).map { _ in
+                [Float16](repeating: 0, count: tileElements)
+            }
             for (index, region) in regions.enumerated() {
                 guard region.frameRange.contains(absoluteFrame) else {
                     let seekStarted = ContinuousClock.now
@@ -857,10 +874,11 @@ extension SideBySideRestoration {
                     )
                     continue
                 }
-                let restored: [Float16]
                 let cacheReadStarted = ContinuousClock.now
                 if let inMemoryCache {
-                    restored = try inMemoryCache.values(frame: cacheFrame, region: index)
+                    try inMemoryCache.copyValues(
+                        frame: cacheFrame, region: index, into: &restoredScratch[index]
+                    )
                 } else {
                     guard let data = try cache?.read(upToCount: tileBytes),
                           data.count == tileBytes
@@ -869,24 +887,29 @@ extension SideBySideRestoration {
                             "direct SBS mosaic-crop cache is truncated"
                         )
                     }
-                    var decoded = [Float16](repeating: 0, count: tileElements)
-                    _ = decoded.withUnsafeMutableBytes { data.copyBytes(to: $0) }
-                    restored = decoded
+                    _ = restoredScratch[index].withUnsafeMutableBytes {
+                        data.copyBytes(to: $0)
+                    }
                 }
                 cacheMilliseconds += SideBySideRestoration.elapsedMilliseconds(
                     since: cacheReadStarted
                 )
-                let extractionStarted = ContinuousClock.now
-                let original = try samplingMaps[index].extractPlanarRGB(from: baseFrame)
-                extractionMilliseconds += SideBySideRestoration.elapsedMilliseconds(
-                    since: extractionStarted
-                )
+                let original: [Float16]
+                if projection == .fisheye {
+                    let extractionStarted = ContinuousClock.now
+                    original = try samplingMaps[index].extractPlanarRGB(from: baseFrame)
+                    extractionMilliseconds += SideBySideRestoration.elapsedMilliseconds(
+                        since: extractionStarted
+                    )
+                } else {
+                    original = []
+                }
                 result.append(MetalMosaicCompositeInput(
                     region: translated(
                         region.resolvingSegmentationMask(at: absoluteFrame),
                         xOffset: xOffset
                     ),
-                    restored: restored,
+                    restored: restoredScratch[index],
                     original: original,
                     samples: samplingMaps[index].compositeSamples
                 ))

@@ -348,7 +348,7 @@ final class RestorationSession {
             // A child may exit successfully just as Stop is requested. User cancellation
             // still takes precedence over success-triggered actions such as shutdown.
             state = .ready
-            activity = "Restoration stopped. Existing work files are preserved for resume."
+            activity = "Restoration stopped. Checkpointed crop work is preserved for resume."
         } else if status == 0 {
             state = .completed
             progress = progressTracker.markCompleted()

@@ -17,8 +17,8 @@ public enum RestorationPerformanceProfile: String, CaseIterable, Identifiable, S
         switch self {
         case .fast:
             "Uses eight Metal windows, detector batch 2, and keeps up to 512 MiB of "
-                + "restored crops in memory while preparing the next crop during Metal work. "
-                + "Recommended for a 16 GB or larger Mac."
+                + "restored crops in memory for handoff while still writing disk checkpoints "
+                + "so Stop mid-window can resume. Recommended for a 16 GB or larger Mac."
         case .balanced:
             "Uses detector batch 1 and disk-backed crop handoff to reduce memory pressure."
         }
@@ -28,7 +28,8 @@ public enum RestorationPerformanceProfile: String, CaseIterable, Identifiable, S
         switch self {
         case .fast:
             "fast: BasicVSR++ batch 2, eight Metal windows, detector batch 2, "
-                + "512 MiB in-memory crop handoff, overlapped crop preparation"
+                + "512 MiB in-memory crop handoff with disk checkpoints, "
+                + "overlapped crop preparation"
         case .balanced:
             "balanced: BasicVSR++ batch 2, two Metal windows, detector batch 1, "
                 + "disk-backed crop handoff"
