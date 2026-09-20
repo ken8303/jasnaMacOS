@@ -5,6 +5,9 @@ struct SPyNetPairResult {
     let medianMilliseconds: Double
     let minimumMilliseconds: Double
     let maximumMilliseconds: Double
+    let wallMedianMilliseconds: Double
+    let wallMinimumMilliseconds: Double
+    let wallMaximumMilliseconds: Double
     let iterations: Int
     let elementCount: Int
     let backwardMaximum: Float
@@ -276,7 +279,8 @@ func verifySPyNetPair(
         }
     }
 
-    func execute() throws -> (Double, [[Float16]]) {
+    func execute() throws -> (gpu: Double, wall: Double, outputs: [[Float16]]) {
+        let wallStart = DispatchTime.now().uptimeNanoseconds
         initializeBuffers()
         guard let allocator = device.makeCommandAllocator(),
               let commandBuffer = device.makeCommandBuffer()
@@ -366,6 +370,9 @@ func verifySPyNetPair(
         semaphore.wait()
         let (milliseconds, error) = result.load()
         if let error { throw error }
+        let wallMilliseconds = Double(
+            DispatchTime.now().uptimeNanoseconds - wallStart
+        ) / 1_000_000
         let outputs = directions.map { direction -> [Float16] in
             let runtime = direction[5]
             let pointer = runtime.outputFlowBuffer.contents().bindMemory(
@@ -389,20 +396,24 @@ func verifySPyNetPair(
             }
             return packed
         }
-        return (milliseconds, outputs)
+        return (milliseconds, wallMilliseconds, outputs)
     }
 
     _ = try execute()
     _ = try execute()
-    let (firstMilliseconds, first) = try execute()
-    var samples = [firstMilliseconds]
+    let firstRun = try execute()
+    let first = firstRun.outputs
+    var samples = [firstRun.gpu]
+    var wallSamples = [firstRun.wall]
     var last = first
     for _ in 1..<7 {
-        let (milliseconds, outputs) = try execute()
-        samples.append(milliseconds)
-        last = outputs
+        let run = try execute()
+        samples.append(run.gpu)
+        wallSamples.append(run.wall)
+        last = run.outputs
     }
     samples.sort()
+    wallSamples.sort()
     var maxima = [Float](repeating: 0, count: 2)
     var checksums = [Double](repeating: 0, count: 2)
     var repeatError: Float = 0
@@ -448,6 +459,9 @@ func verifySPyNetPair(
         medianMilliseconds: samples[samples.count / 2],
         minimumMilliseconds: samples[0],
         maximumMilliseconds: samples[samples.count - 1],
+        wallMedianMilliseconds: wallSamples[wallSamples.count / 2],
+        wallMinimumMilliseconds: wallSamples[0],
+        wallMaximumMilliseconds: wallSamples[wallSamples.count - 1],
         iterations: samples.count,
         elementCount: batch * 2 * 2 * 4096,
         backwardMaximum: maxima[0],

@@ -9,6 +9,7 @@ storage on the Metal command timeline.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import sys
 from pathlib import Path
 
@@ -113,6 +114,15 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="fixed batch dimension compiled into every converted package",
     )
+    parser.add_argument(
+        "--minimum-deployment-target",
+        choices=("ios18", "ios26"),
+        default="ios18",
+        help=(
+            "Core ML operation-set target; ios18 remains the validated Metal ML "
+            "default while ios26 is available for Xcode beta probes"
+        ),
+    )
     parser.add_argument("--validate", action="store_true")
     return parser.parse_args()
 
@@ -124,6 +134,7 @@ def convert(
     input_names: tuple[str, ...],
     output_dir: Path,
     validate: bool,
+    minimum_deployment_target: ct.target,
 ) -> None:
     output = output_dir / f"{name}.mlpackage"
     module = module.cpu().eval()
@@ -137,7 +148,7 @@ def convert(
             for input_name, example in zip(input_names, examples)
         ],
         outputs=[ct.TensorType(name="output")],
-        minimum_deployment_target=ct.target.iOS18,
+        minimum_deployment_target=minimum_deployment_target,
         compute_precision=ct.precision.FLOAT16,
     )
     model.author = "Jasna Metal PoC"
@@ -167,7 +178,16 @@ def main() -> None:
     model = load_model(None, str(args.weights), torch.device("cpu"), False)
     generator = model.generator_ema if model.generator_ema is not None else model.generator
     args.output.mkdir(parents=True, exist_ok=True)
+    weights_hash = hashlib.sha256(args.weights.read_bytes()).hexdigest()
+    (args.output / "model-family.txt").write_text(
+        f"jasna-model-family-v1\nweights-sha256={weights_hash}\n",
+        encoding="utf-8",
+    )
     selected = set(args.only)
+    minimum_deployment_target = {
+        "ios18": ct.target.iOS18,
+        "ios26": ct.target.iOS26,
+    }[args.minimum_deployment_target]
 
     jobs: list[tuple[str, nn.Module, tuple[torch.Tensor, ...], tuple[str, ...]]] = [
         (
@@ -219,7 +239,12 @@ def main() -> None:
         if selected and job[0] not in selected:
             continue
         try:
-            convert(*job, output_dir=args.output, validate=args.validate)
+            convert(
+                *job,
+                output_dir=args.output,
+                validate=args.validate,
+                minimum_deployment_target=minimum_deployment_target,
+            )
         except Exception as error:
             failures.append((job[0], error))
             print(f"FAILED {job[0]}: {error}", file=sys.stderr)

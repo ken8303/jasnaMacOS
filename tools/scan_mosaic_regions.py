@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import argparse
 import base64
+import copy
+import gc
 import json
 import math
 import os
@@ -17,8 +19,64 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("input_video", type=Path)
     parser.add_argument("output_manifest", type=Path)
+    parser.add_argument(
+        "--stereo-right-manifest",
+        type=Path,
+        help="with --crop-eye both, write the right-eye manifest here",
+    )
     parser.add_argument("--model", type=Path, required=True)
+    parser.add_argument(
+        "--backend", choices=("yolo", "rfdetr"), default="yolo"
+    )
+    parser.add_argument(
+        "--rfdetr-variant",
+        choices=("medium", "large"),
+        default="large",
+        help="RF-DETR architecture matching the selected checkpoint",
+    )
     parser.add_argument("--sample-stride", type=float, default=0.1)
+    parser.add_argument(
+        "--crop-eye",
+        choices=("none", "left", "right", "both"),
+        default="none",
+        help="scan one or both halves of an SBS source without intermediate eye videos",
+    )
+    parser.add_argument(
+        "--stereo-sample-mode",
+        choices=("paired", "alternating"),
+        default="paired",
+        help=(
+            "with --crop-eye both, scan both eyes at every sample or alternate "
+            "eyes between consecutive samples"
+        ),
+    )
+    parser.add_argument(
+        "--active-ranges",
+        help="optional comma-separated segment-relative start/end seconds",
+    )
+    parser.add_argument(
+        "--coarse-stride",
+        type=float,
+        default=1.0,
+        help="seconds between coarse gate samples before dense refinement",
+    )
+    parser.add_argument(
+        "--coarse-confidence",
+        type=float,
+        default=0.05,
+        help="sensitive gate threshold; final regions still use --confidence",
+    )
+    parser.add_argument(
+        "--refine-padding",
+        type=float,
+        default=1.0,
+        help="seconds added around coarse detections for dense temporal tracking",
+    )
+    parser.add_argument(
+        "--adaptive-scan",
+        action="store_true",
+        help="use a once-per-second gate before dense temporal refinement",
+    )
     parser.add_argument(
         "--region-duration",
         type=float,
@@ -46,8 +104,14 @@ def parse_args() -> argparse.Namespace:
         default=128,
         help="square segmentation-mask resolution; power of two from 32 through 256",
     )
-    parser.add_argument("--device", default="auto")
+    parser.add_argument("--device", choices=("auto", "mps", "cpu"), default="auto")
     parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument(
+        "--max-detections",
+        type=int,
+        default=64,
+        help="maximum RF-DETR object queries retained per sampled frame",
+    )
     parser.add_argument(
         "--decode-mode",
         choices=("sequential", "seek"),
@@ -55,6 +119,21 @@ def parse_args() -> argparse.Namespace:
         help="sequential avoids expensive random seeks in HEVC video",
     )
     return parser.parse_args()
+
+
+def write_manifest(path, width, height, frame_count, regions):
+    manifest = {
+        "version": 1,
+        "width": width,
+        "height": height,
+        "framesPerSecond": 30.0,
+        "frameCount": frame_count,
+        "regions": regions,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    os.replace(temporary, path)
 
 
 def aligned_rect(boxes, frame_width, frame_height, expand, minimum, alignment=16):
@@ -103,6 +182,151 @@ def tracking_distance(left, right):
     )
     scale = max(left_width, left_height, right_width, right_height, 1.0)
     return distance / scale
+
+
+def detector_coverage_metrics(regions, frame_width, frame_height, frame_count):
+    """Return normalized scheduling load without rasterizing full-resolution masks."""
+    if frame_width <= 0 or frame_height <= 0 or frame_count <= 0:
+        return 0.0, 0.0
+    active_region_frames = 0
+    scheduled_blend_pixel_frames = 0
+    for region in regions:
+        start = max(0, min(frame_count, int(region.get("startFrame", 0))))
+        end = max(start, min(frame_count, int(region.get("endFrame", start))))
+        duration = end - start
+        blend_width = max(0, int(region.get("blendWidth", region.get("width", 0))))
+        blend_height = max(0, int(region.get("blendHeight", region.get("height", 0))))
+        active_region_frames += duration
+        scheduled_blend_pixel_frames += blend_width * blend_height * duration
+    average_active_regions = active_region_frames / frame_count
+    scheduled_blend_percent = (
+        100.0
+        * scheduled_blend_pixel_frames
+        / (frame_width * frame_height * frame_count)
+    )
+    return average_active_regions, scheduled_blend_percent
+
+
+def coarse_sample_indices(frame_count, source_fps, coarse_stride):
+    """Choose one representative center frame from each coarse time interval."""
+    if frame_count <= 0 or source_fps <= 0 or coarse_stride <= 0:
+        return []
+    interval_frames = max(1, int(round(coarse_stride * source_fps)))
+    first_frame = min(frame_count - 1, interval_frames // 2)
+    return list(range(first_frame, frame_count, interval_frames))
+
+
+def refinement_sample_indices(
+    frame_count, source_fps, dense_stride, detected_frame_indices, padding_seconds
+):
+    """Return dense samples only in whole seconds surrounding coarse detections."""
+    if frame_count <= 0 or source_fps <= 0 or dense_stride <= 0:
+        return []
+    dense_frames = max(1, int(round(dense_stride * source_fps)))
+    second_frames = max(1, int(round(source_fps)))
+    padding_frames = max(0, int(round(padding_seconds * source_fps)))
+    intervals = []
+    for frame_index in sorted(set(int(frame) for frame in detected_frame_indices)):
+        second_start = max(0, (frame_index // second_frames) * second_frames)
+        intervals.append(
+            (
+                max(0, second_start - padding_frames),
+                min(frame_count, second_start + second_frames + padding_frames),
+            )
+        )
+    if not intervals:
+        return []
+    merged = []
+    for start, end in intervals:
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    samples = []
+    for start, end in merged:
+        first = ((start + dense_frames - 1) // dense_frames) * dense_frames
+        samples.extend(range(first, end, dense_frames))
+    return samples
+
+
+def active_frame_intervals(spec, source_fps, frame_count):
+    if spec is None:
+        return [(0, frame_count)]
+    intervals = []
+    for item in filter(None, spec.split(",")):
+        try:
+            start_text, end_text = item.split("/")
+            start = max(0, int(math.floor(float(start_text) * source_fps)))
+            end = min(frame_count, int(math.ceil(float(end_text) * source_fps)))
+        except (ValueError, TypeError) as error:
+            raise ValueError(f"invalid active range: {item}") from error
+        if end > start:
+            intervals.append((start, end))
+    return intervals
+
+
+def samples_in_intervals(indices, intervals, ensure_each_interval=False):
+    indices = list(indices)
+    selected = [
+        index for index in indices if any(start <= index < end for start, end in intervals)
+    ]
+    if ensure_each_interval:
+        for start, end in intervals:
+            if end > start and not any(start <= index < end for index in selected):
+                selected.append(start)
+    return sorted(set(selected))
+
+
+def samples_without(indices, already_scanned):
+    """Remove temporal samples that the coarse gate has already inferred."""
+    already_scanned = set(already_scanned)
+    return [index for index in indices if index not in already_scanned]
+
+
+def reusable_gate_boxes(boxes_by_eye, final_confidence):
+    """Keep gate detections that already satisfy the final quality threshold.
+
+    RF-DETR inference is independent of its score threshold. A coarse result at
+    or above the final threshold is therefore the same observation a second
+    dense inference would produce, including its segmentation polygon.
+    """
+    return {
+        eye: [box for box in boxes if float(box[4]) >= final_confidence]
+        for eye, boxes in boxes_by_eye.items()
+    }
+
+
+def stereo_sample_eyes(sample_ordinal, mode):
+    """Return the SBS eye crops scheduled for one temporal detector sample."""
+    if mode == "paired":
+        return ("left", "right")
+    if mode == "alternating":
+        return ("left",) if sample_ordinal % 2 == 0 else ("right",)
+    raise ValueError(f"unsupported stereo sample mode: {mode}")
+
+
+def clip_regions_to_intervals(regions, intervals):
+    clipped = []
+    for region in regions:
+        for start, end in intervals:
+            clipped_start = max(int(region["startFrame"]), start)
+            clipped_end = min(int(region["endFrame"]), end)
+            if clipped_end <= clipped_start:
+                continue
+            item = copy.deepcopy(region)
+            item["startFrame"] = clipped_start
+            item["endFrame"] = clipped_end
+            if "maskKeyframes" in item:
+                keyframes = [
+                    keyframe for keyframe in item["maskKeyframes"]
+                    if clipped_start <= int(keyframe["frame"]) < clipped_end
+                ]
+                if keyframes:
+                    item["maskKeyframes"] = keyframes
+                else:
+                    item.pop("maskKeyframes")
+            clipped.append(item)
+    return clipped
 
 
 def track_boxes(boxes):
@@ -191,6 +415,80 @@ def blend_iou(left, right):
     return intersection / union if union > 0 else 0.0
 
 
+def decoded_mask_payload(region, payload):
+    width = region.get("maskWidth")
+    height = region.get("maskHeight")
+    if not width or not height or not payload:
+        return None
+    try:
+        data = base64.b64decode(payload, validate=True)
+    except (ValueError, TypeError):
+        return None
+    if len(data) != width * height:
+        return None
+    return width, height, data
+
+
+def decoded_region_mask(region):
+    return decoded_mask_payload(region, region.get("maskData"))
+
+
+def mask_support_coverage(small, small_mask, large, large_mask, threshold=128):
+    small_width, small_height, small_data = small_mask
+    large_width, large_height, large_data = large_mask
+    active = 0
+    covered = 0
+    sample_step = max(1, min(small_width, small_height) // 32)
+    sample_offset = sample_step // 2
+    for mask_y in range(sample_offset, small_height, sample_step):
+        for mask_x in range(sample_offset, small_width, sample_step):
+            if small_data[mask_y * small_width + mask_x] < threshold:
+                continue
+            active += 1
+            pixel_x = small["x"] + mask_x * max(small["width"] - 1, 0) / max(
+                small_width - 1, 1
+            )
+            pixel_y = small["y"] + mask_y * max(small["height"] - 1, 0) / max(
+                small_height - 1, 1
+            )
+            large_x = round(
+                (pixel_x - large["x"])
+                * max(large_width - 1, 0)
+                / max(large["width"] - 1, 1)
+            )
+            large_y = round(
+                (pixel_y - large["y"])
+                * max(large_height - 1, 0)
+                / max(large["height"] - 1, 1)
+            )
+            if (
+                0 <= large_x < large_width
+                and 0 <= large_y < large_height
+                and large_data[large_y * large_width + large_x] >= threshold
+            ):
+                covered += 1
+    return covered / active if active else None
+
+
+def nested_mask_coverage(small, large, threshold=128):
+    """Measure how much of a small mask is covered by a containing mask.
+
+    ``None`` means rectangle-only legacy suppression remains appropriate. An
+    unmasked outer region blends its complete rectangle, while an unmasked
+    inner region cannot safely be discarded in favour of a masked outer one.
+    """
+    small_mask = decoded_region_mask(small)
+    large_mask = decoded_region_mask(large)
+    if large_mask is None:
+        return None
+    if small_mask is None:
+        return 0.0
+    aggregate_coverage = mask_support_coverage(
+        small, small_mask, large, large_mask, threshold
+    )
+    return aggregate_coverage or 0.0
+
+
 def suppress_nested_regions(regions, coverage=0.8, area_ratio=1.5):
     """Drop duplicate inner crops that would overwrite a larger restoration.
 
@@ -216,6 +514,9 @@ def suppress_nested_regions(regions, coverage=0.8, area_ratio=1.5):
                 and large_area >= area_ratio * small_area
                 and intersection_fraction_of_smaller(small, large) >= coverage
             ):
+                mask_coverage = nested_mask_coverage(small, large)
+                if mask_coverage is not None and mask_coverage < coverage:
+                    continue
                 nested = True
                 break
         if not nested:
@@ -245,12 +546,18 @@ def suppress_duplicate_regions(regions, overlap=0.45):
     )
     kept = []
     for original_index, candidate in ranked:
-        duplicate = any(
-            winner["startFrame"] <= candidate["startFrame"]
-            and winner["endFrame"] >= candidate["endFrame"]
-            and blend_iou(candidate, winner) >= overlap
-            for _, winner in kept
-        )
+        duplicate = False
+        for _, winner in kept:
+            if not (
+                winner["startFrame"] <= candidate["startFrame"]
+                and winner["endFrame"] >= candidate["endFrame"]
+                and blend_iou(candidate, winner) >= overlap
+            ):
+                continue
+            mask_coverage = nested_mask_coverage(candidate, winner)
+            if mask_coverage is None or mask_coverage >= 0.8:
+                duplicate = True
+                break
         if not duplicate:
             kept.append((original_index, candidate))
     return [region for _, region in sorted(kept)]
@@ -295,11 +602,37 @@ def mask_expansion_radius(size, expansion_fraction):
     return max(1, int(math.ceil(size * expansion_fraction)))
 
 
+def box_polygon_groups(box):
+    """Normalize one legacy polygon or several RF-DETR mask islands."""
+    if len(box) <= 6 or not box[6]:
+        return []
+    payload = box[6]
+    first = payload[0]
+    if (
+        isinstance(first, (list, tuple))
+        and len(first) == 2
+        and all(isinstance(value, (int, float)) for value in first)
+    ):
+        return [payload]
+    return [
+        polygon
+        for polygon in payload
+        if isinstance(polygon, (list, tuple)) and len(polygon) >= 3
+    ]
+
+
+def has_box_polygons(box):
+    return any(len(polygon) >= 3 for polygon in box_polygon_groups(box))
+
+
 def segmentation_alpha_mask(
     boxes, rectangle, cv2, np, size=64, expansion_fraction=0.10
 ):
     """Rasterize tracked YOLO polygons into a compact soft region mask."""
-    polygons = [box[6] for box in boxes if len(box) > 6 and len(box[6]) >= 3]
+    polygons = [
+        polygon for box in boxes for polygon in box_polygon_groups(box)
+        if len(polygon) >= 3
+    ]
     if not polygons:
         return None
     x, y, width, height = rectangle
@@ -333,9 +666,9 @@ def segmentation_alpha_mask(
 
 def mask_source_boxes(cluster, nearby, start_frame, end_frame):
     """Ensure padded/interpolated segments inherit the nearest real polygon."""
-    if any(len(box) > 6 and len(box[6]) >= 3 for box in nearby):
+    if any(has_box_polygons(box) for box in nearby):
         return nearby
-    polygon_boxes = [box for box in cluster if len(box) > 6 and len(box[6]) >= 3]
+    polygon_boxes = [box for box in cluster if has_box_polygons(box)]
     if not polygon_boxes:
         return nearby
     midpoint = (start_frame + end_frame - 1) / 2
@@ -344,7 +677,7 @@ def mask_source_boxes(cluster, nearby, start_frame, end_frame):
 
 def mask_keyframe_box_groups(cluster, start_frame, end_frame, stride_frames):
     """Group real detector polygons into ordered, clamped mask keyframes."""
-    polygon_boxes = [box for box in cluster if len(box) > 6 and len(box[6]) >= 3]
+    polygon_boxes = [box for box in cluster if has_box_polygons(box)]
     selected = [
         box for box in polygon_boxes
         if start_frame - stride_frames <= int(box[5]) < end_frame + stride_frames
@@ -359,6 +692,56 @@ def mask_keyframe_box_groups(cluster, start_frame, end_frame, stride_frames):
     return sorted(groups.items())
 
 
+def interpolated_polygon_box(boxes, frame_index):
+    """Move the nearest real polygon onto an interpolated tracked box."""
+    polygon_boxes = [box for box in boxes if has_box_polygons(box)]
+    if not polygon_boxes:
+        return None
+    target = interpolated_box(polygon_boxes, frame_index)
+    source = min(
+        polygon_boxes,
+        key=lambda box: abs(float(box[5]) - frame_index),
+    )
+    source_width = max(float(source[2]) - float(source[0]), 1.0)
+    source_height = max(float(source[3]) - float(source[1]), 1.0)
+    target_width = max(float(target[2]) - float(target[0]), 1.0)
+    target_height = max(float(target[3]) - float(target[1]), 1.0)
+    transformed = []
+    for polygon in box_polygon_groups(source):
+        transformed.append([
+            [
+                float(target[0])
+                + (float(point[0]) - float(source[0])) * target_width / source_width,
+                float(target[1])
+                + (float(point[1]) - float(source[1])) * target_height / source_height,
+            ]
+            for point in polygon
+        ])
+    payload = transformed[0] if len(transformed) == 1 else transformed
+    return tuple(target) + (payload,)
+
+
+def dense_mask_keyframe_box_groups(cluster, start_frame, end_frame, stride_frames):
+    """Create a polygon mask at every output frame along the tracked motion."""
+    sparse_groups = mask_keyframe_box_groups(
+        cluster, start_frame, end_frame, stride_frames
+    )
+    if not sparse_groups:
+        return []
+    exact_by_frame = dict(sparse_groups)
+    polygon_boxes = [box for _, boxes in sparse_groups for box in boxes]
+    groups = []
+    for frame in range(start_frame, end_frame):
+        exact = exact_by_frame.get(frame)
+        if exact:
+            groups.append((frame, exact))
+            continue
+        interpolated = interpolated_polygon_box(polygon_boxes, frame)
+        if interpolated is not None:
+            groups.append((frame, [interpolated]))
+    return groups
+
+
 def segmentation_mask_keyframes(
     cluster,
     rectangle,
@@ -371,7 +754,7 @@ def segmentation_mask_keyframes(
     expansion_fraction,
 ):
     keyframes = []
-    for frame, boxes in mask_keyframe_box_groups(
+    for frame, boxes in dense_mask_keyframe_box_groups(
         cluster, start_frame, end_frame, stride_frames
     ):
         mask = segmentation_alpha_mask(
@@ -405,6 +788,10 @@ def main() -> int:
         raise SystemExit(f"mosaic detector not found: {args.model}")
     if (
         args.sample_stride <= 0
+        or args.coarse_stride <= 0
+        or args.coarse_confidence <= 0
+        or args.coarse_confidence > 1
+        or args.refine_padding < 0
         or args.region_duration <= 0
         or args.region_duration > 1.0
         or args.temporal_padding < 0
@@ -417,279 +804,523 @@ def main() -> int:
         or args.mask_size & (args.mask_size - 1) != 0
     ):
         raise SystemExit(
-            "sample stride must be positive, region duration must be in (0, 1], "
+            "sample and coarse strides must be positive, coarse confidence must be "
+            "in (0, 1], refinement padding cannot be negative, region duration must "
+            "be in (0, 1], "
             "temporal padding cannot be negative, region NMS IoU must be in (0, 1], "
             "mask expansion must be in (0, 0.25], and mask size must be a power "
             "of two from 32 through 256"
         )
-    if args.batch_size <= 0:
-        raise SystemExit("batch size must be positive")
+    if args.batch_size <= 0 or args.max_detections <= 0 or args.max_detections > 200:
+        raise SystemExit("batch size must be positive and max detections must be from 1 to 200")
+    if args.crop_eye == "both" and args.stereo_right_manifest is None:
+        raise SystemExit("--crop-eye both requires --stereo-right-manifest")
+    if args.crop_eye != "both" and args.stereo_right_manifest is not None:
+        raise SystemExit("--stereo-right-manifest requires --crop-eye both")
+    if args.stereo_sample_mode == "alternating" and args.crop_eye != "both":
+        raise SystemExit("--stereo-sample-mode alternating requires --crop-eye both")
+    if args.stereo_sample_mode == "alternating" and args.adaptive_scan:
+        raise SystemExit(
+            "--stereo-sample-mode alternating cannot be combined with --adaptive-scan"
+        )
 
     try:
         import cv2
         import numpy as np
         import torch
-        from ultralytics import YOLO
     except ImportError as error:
         raise SystemExit(
             "mosaic detector dependencies are missing; run script/setup_mosaic_detector.sh"
         ) from error
 
+    if args.backend == "yolo":
+        try:
+            from ultralytics import YOLO
+        except ImportError as error:
+            raise SystemExit(
+                "YOLO detector dependencies are missing; run "
+                "script/setup_mosaic_detector.sh"
+            ) from error
+    else:
+        try:
+            from rfdetr_mps_detector import RFDetrMPSDetector
+        except ImportError as error:
+            raise SystemExit(
+                "RF-DETR dependencies are missing from .venv-rfdetr"
+            ) from error
+
     capture = cv2.VideoCapture(str(args.input_video))
     if not capture.isOpened():
         raise SystemExit(f"unable to decode video: {args.input_video}")
-    width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+    source_width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
     source_fps = float(capture.get(cv2.CAP_PROP_FPS))
     frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
-    if width <= 0 or height <= 0 or source_fps <= 0 or frame_count <= 0:
+    if source_width <= 0 or height <= 0 or source_fps <= 0 or frame_count <= 0:
         raise SystemExit("video metadata is incomplete")
+    if args.crop_eye != "none" and source_width % 2 != 0:
+        raise SystemExit("side-by-side eye cropping requires an even source width")
+    width = source_width // 2 if args.crop_eye != "none" else source_width
     if abs(source_fps - 30.0) > 0.05:
         raise SystemExit(f"sparse restoration requires a 30 fps eye video, got {source_fps:.3f}")
+    capture.release()
+    try:
+        allowed_intervals = active_frame_intervals(
+            args.active_ranges, source_fps, frame_count
+        )
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
+    if args.active_ranges is not None:
+        print(
+            f"Manual range gate: {len(allowed_intervals)} active interval(s)",
+            flush=True,
+        )
+    if not allowed_intervals:
+        write_manifest(args.output_manifest, width, height, frame_count, [])
+        if args.stereo_right_manifest is not None:
+            write_manifest(args.stereo_right_manifest, width, height, frame_count, [])
+        print(
+            f"Manual range gate: clean segment, detector bypassed; saved "
+            f"{args.output_manifest}"
+            + (
+                f" and {args.stereo_right_manifest}"
+                if args.stereo_right_manifest is not None
+                else ""
+            ),
+            flush=True,
+        )
+        return 0
 
     device = choose_device(torch, args.device)
+    detector_description = args.backend
+    if args.backend == "rfdetr":
+        detector_description += f"/{args.rfdetr_variant}"
     print(
         f"Scanning {width}x{height}, {frame_count} frames at {source_fps:.3f} fps "
-        f"on {device}; {args.decode_mode} decode, batch {args.batch_size}",
+        f"on {device}; {detector_description} detector, {args.decode_mode} decode, "
+        f"batch {args.batch_size}"
+        + (
+            f"; shared stereo model/decode, {args.stereo_sample_mode} eye sampling"
+            if args.crop_eye == "both"
+            else ""
+        ),
         flush=True,
     )
-    # Exported Core ML packages do not reliably retain enough metadata for
-    # Ultralytics to infer that this checkpoint is a segmentation model.
-    model = YOLO(str(args.model), task="segment")
+    if args.backend == "yolo":
+        # Exported Core ML packages do not reliably retain enough metadata for
+        # Ultralytics to infer that this checkpoint is a segmentation model.
+        model = YOLO(str(args.model), task="segment")
+    else:
+        model = RFDetrMPSDetector(
+            args.model,
+            device=device,
+            variant=args.rfdetr_variant,
+            max_select=args.max_detections,
+        )
     stride_frames = max(1, int(round(args.sample_stride * source_fps)))
     region_frames = max(stride_frames, int(round(args.region_duration * source_fps)))
     padding_frames = int(round(args.temporal_padding * source_fps))
     window_frames = 30
-    window_boxes: dict[int, list[tuple[float, float, float, float, float]]] = {}
-    sample_indices = list(range(0, frame_count, stride_frames))
+    scan_eyes = ("left", "right") if args.crop_eye == "both" else ("single",)
     scan_started = time.perf_counter()
 
-    def predict(frames):
-        nonlocal device
-        source = frames if len(frames) > 1 else frames[0]
+    def predict(frames, confidence):
+        nonlocal device, model
         try:
+            if args.backend == "rfdetr":
+                return model.predict(frames, score_threshold=confidence)
+            source = frames if len(frames) > 1 else frames[0]
             return model.predict(
-                source,
-                imgsz=args.image_size,
-                conf=args.confidence,
-                device=device,
-                verbose=False,
+                source, imgsz=args.image_size, conf=confidence,
+                device=device, verbose=False,
             )
         except Exception:
             if device != "mps":
                 raise
             print("MPS detector failed; retrying the scan on CPU", file=sys.stderr, flush=True)
+            model = None
+            gc.collect()
+            torch.mps.empty_cache()
             device = "cpu"
+            if args.backend == "rfdetr":
+                model = RFDetrMPSDetector(
+                    args.model,
+                    device=device,
+                    variant=args.rfdetr_variant,
+                    max_select=args.max_detections,
+                )
+                return model.predict(frames, score_threshold=confidence)
+            model = YOLO(str(args.model), task="segment")
+            source = frames if len(frames) > 1 else frames[0]
             return model.predict(
                 source,
                 imgsz=args.image_size,
-                conf=args.confidence,
+                conf=confidence,
                 device=device,
                 verbose=False,
             )
 
-    scanned_samples = 0
-    inference_seconds = 0.0
+    def scan_samples(sample_indices, phase_name, confidence):
+        phase_started = time.perf_counter()
+        phase_inference_seconds = 0.0
+        phase_boxes = {eye: [] for eye in scan_eyes}
+        phase_scanned_samples = 0
+        if not sample_indices:
+            return phase_boxes, 0, 0.0, time.perf_counter() - phase_started
+        total_sample_images = len(sample_indices) * len(scan_eyes)
+        if args.crop_eye == "both" and args.stereo_sample_mode == "alternating":
+            total_sample_images = len(sample_indices)
+        phase_capture = cv2.VideoCapture(str(args.input_video))
+        if not phase_capture.isOpened():
+            raise RuntimeError(f"unable to reopen video for {phase_name} scan")
 
-    def process_batch(frames, frame_indices):
-        nonlocal inference_seconds, scanned_samples
-        inference_started = time.perf_counter()
-        predictions = predict(frames)
-        inference_seconds += time.perf_counter() - inference_started
-        if len(predictions) != len(frame_indices):
-            raise RuntimeError(
-                f"detector returned {len(predictions)} results for "
-                f"{len(frame_indices)} frames"
-            )
-        for result, frame_index in zip(predictions, frame_indices):
-            boxes = []
-            if result.boxes is not None:
-                coordinates = result.boxes.xyxy.detach().cpu().tolist()
-                confidences = result.boxes.conf.detach().cpu().tolist()
-                polygons = result.masks.xy if result.masks is not None else []
-                boxes = [
-                    tuple(coords)
-                    + (
-                        float(conf),
-                        frame_index,
-                        polygons[index].tolist() if index < len(polygons) else [],
-                    )
-                    for index, (coords, conf) in enumerate(zip(coordinates, confidences))
-                ]
-            if boxes:
-                first_window = max(0, frame_index - padding_frames) // window_frames
-                last_window = min(frame_count - 1, frame_index + padding_frames) // window_frames
-                for window_index in range(first_window, last_window + 1):
-                    window_boxes.setdefault(window_index, []).extend(boxes)
-            scanned_samples += 1
-            if (
-                scanned_samples == 1
-                or scanned_samples == len(sample_indices)
-                or scanned_samples % 10 == 0
-            ):
-                print(
-                    f"Scanned sample {scanned_samples}/{len(sample_indices)} at "
-                    f"{frame_index / source_fps:.2f}s; detections {len(boxes)}",
-                    flush=True,
+        def process_batch(frames, frame_samples):
+            nonlocal phase_inference_seconds, phase_scanned_samples
+            inference_started = time.perf_counter()
+            predictions = predict(frames, confidence)
+            phase_inference_seconds += time.perf_counter() - inference_started
+            if len(predictions) != len(frame_samples):
+                raise RuntimeError(
+                    f"detector returned {len(predictions)} results for "
+                    f"{len(frame_samples)} frames"
                 )
+            for result, (frame_index, eye) in zip(predictions, frame_samples):
+                boxes = []
+                if args.backend == "rfdetr":
+                    boxes = [
+                        tuple(coords) + (float(conf), frame_index, polygon)
+                        for coords, conf, polygon in zip(
+                            result.boxes_xyxy, result.confidences, result.polygons
+                        )
+                    ]
+                elif result.boxes is not None:
+                    coordinates = result.boxes.xyxy.detach().cpu().tolist()
+                    confidences = result.boxes.conf.detach().cpu().tolist()
+                    polygons = result.masks.xy if result.masks is not None else []
+                    boxes = [
+                        tuple(coords)
+                        + (
+                            float(conf),
+                            frame_index,
+                            polygons[index].tolist() if index < len(polygons) else [],
+                        )
+                        for index, (coords, conf) in enumerate(
+                            zip(coordinates, confidences)
+                        )
+                    ]
+                phase_boxes[eye].extend(boxes)
+                phase_scanned_samples += 1
+                if (
+                    phase_scanned_samples == 1
+                    or phase_scanned_samples == total_sample_images
+                    or phase_scanned_samples % 10 == 0
+                ):
+                    print(
+                        f"{phase_name} sample {phase_scanned_samples}/"
+                        f"{total_sample_images} at {frame_index / source_fps:.2f}s"
+                        + (f" ({eye})" if args.crop_eye == "both" else "")
+                        + f"; detections {len(boxes)}",
+                        flush=True,
+                    )
 
-    batch_frames = []
-    batch_indices = []
+        batch_frames = []
+        batch_samples = []
 
-    def append_sample(frame, frame_index):
-        batch_frames.append(frame)
-        batch_indices.append(frame_index)
-        if len(batch_frames) >= args.batch_size:
-            process_batch(batch_frames, batch_indices)
-            batch_frames.clear()
-            batch_indices.clear()
+        def append_sample(frame, frame_index, eye="single"):
+            if args.crop_eye == "left":
+                frame = frame[:, :width]
+            elif args.crop_eye == "right":
+                frame = frame[:, source_width - width:]
+            batch_frames.append(frame)
+            batch_samples.append((frame_index, eye))
+            if len(batch_frames) >= args.batch_size:
+                process_batch(batch_frames, batch_samples)
+                batch_frames.clear()
+                batch_samples.clear()
 
-    if args.decode_mode == "seek":
-        for frame_index in sample_indices:
-            capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
-            ok, frame = capture.read()
-            if not ok:
-                print(f"warning: unable to decode sampled frame {frame_index}", file=sys.stderr)
-                continue
-            append_sample(frame, frame_index)
-    else:
-        next_sample = iter(sample_indices)
-        target_frame = next(next_sample, None)
-        for frame_index in range(frame_count):
-            ok = capture.grab()
-            if not ok:
-                print(f"warning: decoding stopped at frame {frame_index}", file=sys.stderr)
-                break
-            if frame_index != target_frame:
-                continue
-            ok, frame = capture.retrieve()
-            if not ok:
-                print(f"warning: unable to retrieve sampled frame {frame_index}", file=sys.stderr)
+        def append_source_sample(frame, frame_index, sample_ordinal):
+            if args.crop_eye == "both":
+                for eye in stereo_sample_eyes(sample_ordinal, args.stereo_sample_mode):
+                    if eye == "left":
+                        append_sample(frame[:, :width], frame_index, eye)
+                    else:
+                        append_sample(frame[:, source_width - width:], frame_index, eye)
             else:
                 append_sample(frame, frame_index)
-            target_frame = next(next_sample, None)
-            if target_frame is None:
-                break
 
-    if batch_frames:
-        process_batch(batch_frames, batch_indices)
-    capture.release()
+        if args.decode_mode == "seek":
+            for sample_ordinal, frame_index in enumerate(sample_indices):
+                phase_capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+                ok, frame = phase_capture.read()
+                if not ok:
+                    print(
+                        f"warning: unable to decode sampled frame {frame_index}",
+                        file=sys.stderr,
+                    )
+                    continue
+                append_source_sample(frame, frame_index, sample_ordinal)
+        else:
+            next_sample = iter(enumerate(sample_indices))
+            target_sample = next(next_sample, None)
+            for frame_index in range(frame_count):
+                ok = phase_capture.grab()
+                if not ok:
+                    print(
+                        f"warning: decoding stopped at frame {frame_index}",
+                        file=sys.stderr,
+                    )
+                    break
+                if target_sample is None or frame_index != target_sample[1]:
+                    continue
+                ok, frame = phase_capture.retrieve()
+                if not ok:
+                    print(
+                        f"warning: unable to retrieve sampled frame {frame_index}",
+                        file=sys.stderr,
+                    )
+                else:
+                    append_source_sample(frame, frame_index, target_sample[0])
+                target_sample = next(next_sample, None)
+                if target_sample is None:
+                    break
+        if batch_frames:
+            process_batch(batch_frames, batch_samples)
+        phase_capture.release()
+        return (
+            phase_boxes,
+            phase_scanned_samples,
+            phase_inference_seconds,
+            time.perf_counter() - phase_started,
+        )
+
+    if not args.adaptive_scan:
+        sample_indices = samples_in_intervals(
+            range(0, frame_count, stride_frames),
+            allowed_intervals,
+            ensure_each_interval=True,
+        )
+        boxes, scanned_samples, inference_seconds, dense_seconds = scan_samples(
+            sample_indices, "Dense", args.confidence
+        )
+        coarse_seconds = 0.0
+        coarse_sample_count = 0
+        active_coarse_seconds = 0
+        refinement_sample_count = scanned_samples
+    else:
+        coarse_indices = coarse_sample_indices(
+            frame_count, source_fps, args.coarse_stride
+        )
+        coarse_indices = samples_in_intervals(
+            coarse_indices, allowed_intervals, ensure_each_interval=True
+        )
+        coarse_boxes, coarse_sample_count, coarse_inference, coarse_seconds = (
+            scan_samples(coarse_indices, "Coarse", args.coarse_confidence)
+        )
+        detected_frames = [
+            int(box[5])
+            for eye_boxes in coarse_boxes.values()
+            for box in eye_boxes
+        ]
+        active_coarse_seconds = len(
+            {frame_index // window_frames for frame_index in detected_frames}
+        )
+        refinement_indices = refinement_sample_indices(
+            frame_count,
+            source_fps,
+            args.sample_stride,
+            detected_frames,
+            args.refine_padding,
+        )
+        refinement_indices = samples_in_intervals(
+            refinement_indices, allowed_intervals
+        )
+        reusable_boxes = reusable_gate_boxes(coarse_boxes, args.confidence)
+        reusable_sample_indices = set(refinement_indices).intersection(coarse_indices)
+        # The score threshold only filters RF-DETR's completed prediction. Every
+        # coarse frame has therefore already performed the identical graph used
+        # by refinement, even when no box passes the final threshold.
+        refinement_indices = samples_without(
+            refinement_indices, coarse_indices
+        )
+        if refinement_indices:
+            (
+                refined_boxes,
+                refinement_sample_count,
+                refine_inference,
+                dense_seconds,
+            ) = scan_samples(refinement_indices, "Refine", args.confidence)
+        else:
+            refined_boxes = {eye: [] for eye in scan_eyes}
+            refinement_sample_count = 0
+            refine_inference = 0.0
+            dense_seconds = 0.0
+        boxes = reusable_boxes
+        for eye, eye_boxes in refined_boxes.items():
+            boxes[eye].extend(eye_boxes)
+        scanned_samples = coarse_sample_count + refinement_sample_count
+        inference_seconds = coarse_inference + refine_inference
+
     scan_seconds = time.perf_counter() - scan_started
 
-    regions = []
-    for window_index, boxes in sorted(window_boxes.items()):
-        start_frame = window_index * window_frames
-        end_frame = min(frame_count, start_frame + window_frames)
-        for cluster in track_boxes(boxes):
-            active_start = max(start_frame, int(min(box[5] for box in cluster)) - padding_frames)
-            active_end = min(
-                end_frame, int(max(box[5] for box in cluster)) + padding_frames + 1
-            )
-            first_segment = (active_start // region_frames) * region_frames
-            for segment_start in range(first_segment, active_end, region_frames):
-                segment_end = min(end_frame, active_end, segment_start + region_frames)
-                clipped_start = max(start_frame, active_start, segment_start)
-                if segment_end <= clipped_start:
-                    continue
-                nearby = [
-                    box for box in cluster
-                    if clipped_start - stride_frames <= int(box[5]) < segment_end + stride_frames
-                ]
-                nearby.extend(
-                    [
-                        interpolated_box(cluster, clipped_start),
-                        interpolated_box(cluster, segment_end - 1),
-                    ]
+    def build_regions(detected_boxes):
+        window_boxes = {}
+        for box in detected_boxes:
+            frame_index = int(box[5])
+            first_window = max(0, frame_index - padding_frames) // window_frames
+            last_window = min(frame_count - 1, frame_index + padding_frames) // window_frames
+            for window_index in range(first_window, last_window + 1):
+                window_boxes.setdefault(window_index, []).append(box)
+        regions = []
+        for window_index, window_detections in sorted(window_boxes.items()):
+            start_frame = window_index * window_frames
+            end_frame = min(frame_count, start_frame + window_frames)
+            for cluster in track_boxes(window_detections):
+                regions.extend(
+                    regions_for_cluster(cluster, start_frame, end_frame)
                 )
-                rectangle = vr_model_crop(nearby, width, height)
-                blend_rectangle = tight_rect(nearby, width, height)
-                confidence = max(box[4] for box in nearby)
-                x, y, region_width, region_height = rectangle
-                blend_x, blend_y, blend_width, blend_height = blend_rectangle
-                region = {
-                        "startFrame": clipped_start,
-                        "endFrame": segment_end,
-                        "x": x,
-                        "y": y,
-                        "width": region_width,
-                        "height": region_height,
-                        "confidence": confidence,
-                        "blendX": blend_x,
-                        "blendY": blend_y,
-                        "blendWidth": blend_width,
-                        "blendHeight": blend_height,
-                    }
-                mask_boxes = mask_source_boxes(cluster, nearby, clipped_start, segment_end)
-                mask = segmentation_alpha_mask(
-                    mask_boxes,
+        return regions
+
+    def regions_for_cluster(cluster, start_frame, end_frame):
+        cluster_regions = []
+        active_start = max(start_frame, int(min(box[5] for box in cluster)) - padding_frames)
+        active_end = min(
+            end_frame, int(max(box[5] for box in cluster)) + padding_frames + 1
+        )
+        first_segment = (active_start // region_frames) * region_frames
+        for segment_start in range(first_segment, active_end, region_frames):
+            segment_end = min(end_frame, active_end, segment_start + region_frames)
+            clipped_start = max(start_frame, active_start, segment_start)
+            if segment_end <= clipped_start:
+                continue
+            nearby = [
+                box for box in cluster
+                if clipped_start - stride_frames <= int(box[5]) < segment_end + stride_frames
+            ]
+            nearby.extend(
+                [
+                    interpolated_box(cluster, clipped_start),
+                    interpolated_box(cluster, segment_end - 1),
+                ]
+            )
+            rectangle = vr_model_crop(nearby, width, height)
+            blend_rectangle = tight_rect(nearby, width, height)
+            confidence = max(box[4] for box in nearby)
+            x, y, region_width, region_height = rectangle
+            blend_x, blend_y, blend_width, blend_height = blend_rectangle
+            region = {
+                    "startFrame": clipped_start,
+                    "endFrame": segment_end,
+                    "x": x,
+                    "y": y,
+                    "width": region_width,
+                    "height": region_height,
+                    "confidence": confidence,
+                    "blendX": blend_x,
+                    "blendY": blend_y,
+                    "blendWidth": blend_width,
+                    "blendHeight": blend_height,
+                }
+            mask_boxes = mask_source_boxes(cluster, nearby, clipped_start, segment_end)
+            mask = segmentation_alpha_mask(
+                mask_boxes,
+                rectangle,
+                cv2,
+                np,
+                size=args.mask_size,
+                expansion_fraction=args.mask_expansion,
+            )
+            if mask is not None:
+                region.update(mask)
+                keyframes = segmentation_mask_keyframes(
+                    cluster,
                     rectangle,
+                    clipped_start,
+                    segment_end,
+                    stride_frames,
                     cv2,
                     np,
                     size=args.mask_size,
                     expansion_fraction=args.mask_expansion,
                 )
-                if mask is not None:
-                    region.update(mask)
-                    keyframes = segmentation_mask_keyframes(
-                        cluster,
-                        rectangle,
-                        clipped_start,
-                        segment_end,
-                        stride_frames,
-                        cv2,
-                        np,
-                        size=args.mask_size,
-                        expansion_fraction=args.mask_expansion,
-                    )
-                    if keyframes:
-                        region["maskKeyframes"] = keyframes
-                regions.append(region)
+                if keyframes:
+                    region["maskKeyframes"] = keyframes
+            cluster_regions.append(region)
+        return cluster_regions
 
-    unsuppressed_region_count = len(regions)
-    regions = suppress_duplicate_regions(regions, overlap=args.region_nms_iou)
-    suppressed_region_count = unsuppressed_region_count - len(regions)
-    masked_region_count = sum("maskData" in region for region in regions)
-    temporal_mask_region_count = sum("maskKeyframes" in region for region in regions)
-    temporal_mask_count = sum(
-        len(region.get("maskKeyframes", [])) for region in regions
-    )
+    regions_by_eye = {eye: build_regions(boxes[eye]) for eye in scan_eyes}
 
-    manifest = {
-        "version": 1,
-        "width": width,
-        "height": height,
-        "framesPerSecond": 30.0,
-        "frameCount": frame_count,
-        "regions": regions,
-    }
-    args.output_manifest.parent.mkdir(parents=True, exist_ok=True)
-    temporary = args.output_manifest.with_suffix(args.output_manifest.suffix + ".tmp")
-    temporary.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-    os.replace(temporary, args.output_manifest)
+    for eye, regions in regions_by_eye.items():
+        regions = clip_regions_to_intervals(regions, allowed_intervals)
+        unsuppressed_region_count = len(regions)
+        regions = suppress_duplicate_regions(regions, overlap=args.region_nms_iou)
+        suppressed_region_count = unsuppressed_region_count - len(regions)
+        masked_region_count = sum("maskData" in region for region in regions)
+        temporal_mask_region_count = sum("maskKeyframes" in region for region in regions)
+        temporal_mask_count = sum(
+            len(region.get("maskKeyframes", [])) for region in regions
+        )
+        average_active_regions, scheduled_blend_percent = detector_coverage_metrics(
+            regions, width, height, frame_count
+        )
+        output_manifest = (
+            args.stereo_right_manifest
+            if eye == "right"
+            else args.output_manifest
+        )
+        write_manifest(output_manifest, width, height, frame_count, regions)
+        total_windows = math.ceil(frame_count / window_frames)
+        affected_windows = len({region["startFrame"] // window_frames for region in regions})
+        eye_suffix = f" ({eye} eye)" if args.crop_eye == "both" else ""
+        print(
+            f"Saved {len(regions)} regions across {affected_windows} affected windows "
+            f"out of {total_windows} to {output_manifest}",
+            flush=True,
+        )
+        print(
+            f"Suppressed {suppressed_region_count} nested/overlapping duplicate "
+            f"regions{eye_suffix}",
+            flush=True,
+        )
+        print(
+            f"Segmentation masks: {masked_region_count}/{len(regions)} "
+            f"regions{eye_suffix}",
+            flush=True,
+        )
+        print(
+            f"Temporal masks: {temporal_mask_count} keyframes across "
+            f"{temporal_mask_region_count}/{len(regions)} regions{eye_suffix}",
+            flush=True,
+        )
+        print(
+            f"Detector coverage: {average_active_regions:.2f} active regions/frame, "
+            f"{scheduled_blend_percent:.3f}% scheduled blend area/eye-frame"
+            f"{eye_suffix}",
+            flush=True,
+        )
     total_windows = math.ceil(frame_count / window_frames)
-    affected_windows = len({region["startFrame"] // window_frames for region in regions})
-    print(
-        f"Saved {len(regions)} regions across {affected_windows} affected windows "
-        f"out of {total_windows} to "
-        f"{args.output_manifest}",
-        flush=True,
-    )
-    print(
-        f"Suppressed {suppressed_region_count} nested/overlapping duplicate regions",
-        flush=True,
-    )
-    print(
-        f"Segmentation masks: {masked_region_count}/{len(regions)} regions",
-        flush=True,
-    )
-    print(
-        f"Temporal masks: {temporal_mask_count} keyframes across "
-        f"{temporal_mask_region_count}/{len(regions)} regions",
-        flush=True,
-    )
+    sample_label = "eye-images" if args.crop_eye == "both" else "frames"
+    if args.adaptive_scan:
+        print(
+            f"Detector coarse gate: {coarse_seconds:.3f}s, "
+            f"{coarse_sample_count} gate {sample_label}, "
+            f"{active_coarse_seconds}/{total_windows} seconds flagged",
+            flush=True,
+        )
+        print(
+            f"Detector refinement: {dense_seconds:.3f}s, "
+            f"{refinement_sample_count} dense {sample_label} around flagged seconds",
+            flush=True,
+        )
+        reused_gate_boxes = sum(len(eye_boxes) for eye_boxes in reusable_boxes.values())
+        print(
+            f"Detector gate reuse: {len(reusable_sample_indices)} temporal samples, "
+            f"{reused_gate_boxes} final-threshold detections reused without "
+            "duplicate inference",
+            flush=True,
+        )
     print(
         f"Detector scan: {scan_seconds:.3f}s, "
-        f"{scanned_samples / scan_seconds:.2f} sampled frames/s",
+        f"{scanned_samples / scan_seconds:.2f} sampled {sample_label}/s",
         flush=True,
     )
     print(

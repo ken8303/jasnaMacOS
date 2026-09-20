@@ -2,11 +2,81 @@ import Foundation
 
 @available(macOS 27.0, *)
 extension SideBySideRestoration {
+    final class InMemoryRegionFrameCache: @unchecked Sendable {
+        let frameCount: Int
+        let regionCount: Int
+        private let frames: [NSMutableData]
+
+        init(frameCount: Int, regionCount: Int) throws {
+            guard frameCount > 0, regionCount >= 0 else {
+                throw DeformConvError.invalidShape
+            }
+            self.frameCount = frameCount
+            self.regionCount = regionCount
+            var allocated = [NSMutableData]()
+            allocated.reserveCapacity(frameCount)
+            for _ in 0..<frameCount {
+                guard let data = NSMutableData(length: regionCount * tileBytes) else {
+                    throw DeformConvError.commandFailed(
+                        "failed allocating in-memory crop cache "
+                            + "(\(frameCount)x\(regionCount) tiles)"
+                    )
+                }
+                allocated.append(data)
+            }
+            frames = allocated
+        }
+
+        func store(_ values: [Float16], frame: Int, region: Int) throws {
+            guard frames.indices.contains(frame), region >= 0, region < regionCount,
+                  values.count == tileElements
+            else { throw DeformConvError.invalidShape }
+            values.withUnsafeBytes { source in
+                frames[frame].mutableBytes
+                    .advanced(by: region * tileBytes)
+                    .copyMemory(from: source.baseAddress!, byteCount: tileBytes)
+            }
+        }
+
+        func values(frame: Int, region: Int) throws -> [Float16] {
+            var result = [Float16](repeating: 0, count: tileElements)
+            try copyValues(frame: frame, region: region, into: &result)
+            return result
+        }
+
+        func copyValues(frame: Int, region: Int, into destination: inout [Float16]) throws {
+            guard frames.indices.contains(frame), region >= 0, region < regionCount,
+                  destination.count == tileElements
+            else { throw DeformConvError.invalidShape }
+            destination.withUnsafeMutableBytes { buffer in
+                buffer.baseAddress!.copyMemory(
+                    from: frames[frame].bytes.advanced(by: region * tileBytes),
+                    byteCount: tileBytes
+                )
+            }
+        }
+    }
+
     struct WindowResult {
         let cacheDirectory: URL
         let cacheURLs: [URL]
         let gpuMilliseconds: Double
         let cacheBytes: Int
+        let inMemoryRegionCache: InMemoryRegionFrameCache?
+
+        init(
+            cacheDirectory: URL,
+            cacheURLs: [URL],
+            gpuMilliseconds: Double,
+            cacheBytes: Int,
+            inMemoryRegionCache: InMemoryRegionFrameCache? = nil
+        ) {
+            self.cacheDirectory = cacheDirectory
+            self.cacheURLs = cacheURLs
+            self.gpuMilliseconds = gpuMilliseconds
+            self.cacheBytes = cacheBytes
+            self.inMemoryRegionCache = inMemoryRegionCache
+        }
     }
 
     struct ResumableWindowCache {
@@ -113,10 +183,14 @@ extension SideBySideRestoration {
     static func sparseRegionCacheVariant(
         regions: [MosaicRegion],
         projection: VRMosaicProjection = .raw,
-        restorationIdentity: String = ""
+        restorationIdentity: String = "",
+        temporalWarmupFrames: Int = 0,
+        allowPassthrough: Bool = false
     ) -> String {
         var hash: UInt64 = 14_695_981_039_346_656_037
-        for byte in "\(projection.rawValue):\(restorationIdentity)".utf8 {
+        let configuration = "\(projection.rawValue):\(restorationIdentity):"
+            + "warmup=\(temporalWarmupFrames):passthrough=\(allowPassthrough ? 1 : 0)"
+        for byte in configuration.utf8 {
             hash ^= UInt64(byte)
             hash &*= 1_099_511_628_211
         }
@@ -138,17 +212,18 @@ extension SideBySideRestoration {
                 }
             }
         }
-        return String(format: "crop-v4-%@-%016llx", projection.rawValue, hash)
+        return String(format: "crop-v5-%@-%016llx", projection.rawValue, hash)
     }
 
     static func restorationCacheIdentity(
         sourceURLs: [URL],
         modelsURL: URL,
-        weightsURL: URL
+        weightsURL: URL,
+        additionalModelURLs: [URL] = []
     ) -> String {
         var hash: UInt64 = 14_695_981_039_346_656_037
         let fileManager = FileManager.default
-        let roots = sourceURLs + [modelsURL, weightsURL]
+        let roots = sourceURLs + [modelsURL, weightsURL] + additionalModelURLs
         var entries = [URL]()
         for root in roots {
             entries.append(root.standardizedFileURL)
@@ -178,6 +253,15 @@ extension SideBySideRestoration {
         return String(format: "%016llx", hash)
     }
 
+    static func configuredAdditionalModelURLs(
+        environment: [String: String]
+    ) -> [URL] {
+        guard let path = environment["JASNA_BATCH2_MODELS_DIR"], !path.isEmpty else {
+            return []
+        }
+        return [URL(fileURLWithPath: path, isDirectory: true)]
+    }
+
     static func recoverableTileCount(
         cacheURLs: [URL], bytesPerTile: Int, tileCount: Int
     ) throws -> Int {
@@ -185,6 +269,19 @@ extension SideBySideRestoration {
         let sizes = try cacheURLs.map {
             try $0.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
         }
-        return min(tileCount, (sizes.min() ?? 0) / bytesPerTile)
+        let sizeBased = min(tileCount, (sizes.min() ?? 0) / bytesPerTile)
+        guard let directory = cacheURLs.first?.deletingLastPathComponent() else {
+            return sizeBased
+        }
+        let markerURL = directory.appendingPathComponent("completed-tiles.txt")
+        guard let markerData = try? Data(contentsOf: markerURL),
+              let markerText = String(data: markerData, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+              let markerCount = Int(markerText), markerCount >= 0
+        else {
+            return sizeBased
+        }
+        // Prefer the atomic marker, but never claim more tiles than every frame file holds.
+        return min(tileCount, markerCount, sizeBased)
     }
 }

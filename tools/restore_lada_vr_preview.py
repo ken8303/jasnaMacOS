@@ -35,6 +35,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--clip-frames", type=int, default=5)
     parser.add_argument("--max-frames", type=int, default=30)
+    parser.add_argument("--start-frame", type=int, default=0)
+    parser.add_argument(
+        "--device", choices=("auto", "mps", "cpu"), default="auto"
+    )
     parser.add_argument("--bitrate", type=int, default=20_000_000)
     parser.add_argument("--ffmpeg", default="ffmpeg")
     return parser.parse_args()
@@ -120,7 +124,8 @@ def start_encoder(args: argparse.Namespace, width: int, height: int, fps: float)
 
 def main() -> None:
     args = parse_args()
-    if args.clip_frames <= 0 or args.max_frames <= 0 or args.bitrate <= 0:
+    if (args.clip_frames <= 0 or args.max_frames <= 0 or args.bitrate <= 0
+            or args.start_frame < 0):
         raise ValueError("clip frames, max frames, and bitrate must be positive")
     manifest = json.loads(args.manifest.read_text())
     width, height = int(manifest["width"]), int(manifest["height"])
@@ -132,18 +137,31 @@ def main() -> None:
     from jasna.models.basicvsrpp.inference import load_model
     from jasna.vr_projection import build_vr_projector
 
-    device = torch.device("cpu")
-    model = load_model(None, str(args.weights), device, False)
+    if args.device == "auto":
+        device_name = "mps" if torch.backends.mps.is_available() else "cpu"
+    else:
+        device_name = args.device
+    if device_name == "mps" and not torch.backends.mps.is_available():
+        raise RuntimeError("MPS was requested but is unavailable")
+    model_device = torch.device(device_name)
+    crop_device = torch.device("cpu")
+    model = load_model(None, str(args.weights), model_device, False)
     generator = model.generator_ema if model.generator_ema is not None else model.generator
     generator.eval()
     projector = build_vr_projector(
-        args.projection, eye_width=width, height=height, device=device
+        args.projection, eye_width=width, height=height, device=crop_device
     )
 
     temporary, encoder = start_encoder(args, width, height, fps)
     capture = cv2.VideoCapture(str(args.video))
+    capture.set(cv2.CAP_PROP_POS_FRAMES, args.start_frame)
     written = 0
     started = time.monotonic()
+    print(
+        f"Restoring frames {args.start_frame}-"
+        f"{args.start_frame + args.max_frames - 1} on {model_device}",
+        flush=True,
+    )
     try:
         assert encoder.stdin is not None
         while written < args.max_frames:
@@ -156,16 +174,21 @@ def main() -> None:
                 frames.append(torch.from_numpy(rgb.copy()).permute(2, 0, 1))
             if not frames:
                 break
-            for region in active_regions(manifest, written, written + len(frames)):
+            absolute_start = args.start_frame + written
+            for region in active_regions(
+                manifest, absolute_start, absolute_start + len(frames)
+            ):
                 raw_crops = extract_raw_crops(
                     frames, region, projector, extract_crop
                 )
                 prepared, pad_offsets, resize_shapes = prepare_crops_for_restoration(
-                    raw_crops, device, torch.float32
+                    raw_crops, crop_device, torch.float32
                 )
-                inputs = torch.stack(prepared).div_(255.0).unsqueeze(0)
+                inputs = (
+                    torch.stack(prepared).div_(255.0).unsqueeze(0).to(model_device)
+                )
                 with torch.inference_mode():
-                    restored = generator(inputs).squeeze(0).clamp(0, 1)
+                    restored = generator(inputs).squeeze(0).clamp(0, 1).cpu()
                 composite_result(
                     frames, restored, raw_crops, pad_offsets, resize_shapes,
                     region, projector,

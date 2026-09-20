@@ -416,10 +416,14 @@ enum SideBySideRestoration {
         cacheVariant: String?
     ) throws -> WindowResult {
         let cacheBytes = tiles.count * outputCount * tileBytes
-        let configuredWorkPath = ProcessInfo.processInfo.environment["JASNA_WORK_DIR"]
-        let temporaryURL = configuredWorkPath.map {
-            URL(fileURLWithPath: $0, isDirectory: true)
-        } ?? FileManager.default.temporaryDirectory
+        guard let configuredWorkPath = ProcessInfo.processInfo.environment["JASNA_WORK_DIR"],
+              !configuredWorkPath.isEmpty
+        else {
+            throw DeformConvError.commandFailed(
+                "restoration requires JASNA_WORK_DIR on the output volume"
+            )
+        }
+        let temporaryURL = URL(fileURLWithPath: configuredWorkPath, isDirectory: true)
         try FileManager.default.createDirectory(
             at: temporaryURL, withIntermediateDirectories: true
         )
@@ -432,7 +436,7 @@ enum SideBySideRestoration {
                     + "\(cacheBytes + 1_073_741_824) bytes, available \(available)"
             )
         }
-        let resumed = configuredWorkPath == nil ? nil : try resumableWindowCache(
+        let resumed = try resumableWindowCache(
             in: temporaryURL,
             windowIndex: windowIndex,
             outputCount: outputCount,
@@ -503,7 +507,13 @@ enum SideBySideRestoration {
                     )
                     for frame in 0..<outputCount {
                         try restored.frames[frame].withUnsafeBytes { bytes in
-                            try handles[frame].write(contentsOf: Data(bytes))
+                            guard let base = bytes.baseAddress else { return }
+                            let view = Data(
+                                bytesNoCopy: UnsafeMutableRawPointer(mutating: base),
+                                count: bytes.count,
+                                deallocator: .none
+                            )
+                            try handles[frame].write(contentsOf: view)
                         }
                     }
                     return restored.gpuMilliseconds
@@ -536,11 +546,7 @@ enum SideBySideRestoration {
                 cacheBytes: cacheBytes
             )
         } catch {
-            if configuredWorkPath == nil {
-                try? FileManager.default.removeItem(at: directory)
-            } else {
-                report("Preserving failed window cache at \(directory.path)")
-            }
+            report("Preserving failed window cache at \(directory.path)")
             throw error
         }
     }
@@ -567,7 +573,7 @@ enum SideBySideRestoration {
 
 
     static func report(_ message: String) {
-        let timestamp = ISO8601DateFormatter().string(from: Date())
+        let timestamp = Date.now.formatted(.iso8601)
         FileHandle.standardOutput.write(Data("[\(timestamp)] \(message)\n".utf8))
     }
 

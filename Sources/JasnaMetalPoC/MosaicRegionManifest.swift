@@ -1,5 +1,31 @@
 import Foundation
 
+enum MosaicCompositeQuality {
+    static func detailResidualLimit(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> Float {
+        guard let text = environment["JASNA_MOSAIC_DETAIL_RESIDUAL_LIMIT"],
+              let value = Float(text), value.isFinite
+        else { return 0.03 }
+        return min(1, max(0, value))
+    }
+
+    static func maskRecoveryDeltaThreshold(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> Float {
+        guard let text = environment["JASNA_MOSAIC_MASK_RECOVERY_THRESHOLD"],
+              let value = Float(text), value.isFinite
+        else { return 0.025 }
+        return min(1, max(0.001, value))
+    }
+
+    static func ordinaryMaskRecoveryEnabled(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> Bool {
+        environment["JASNA_MOSAIC_MASK_RECOVERY_ALL_REGIONS"] == "1"
+    }
+}
+
 struct MosaicMaskKeyframe: Codable, Equatable, Sendable {
     let frame: Int
     let maskData: Data
@@ -22,6 +48,7 @@ struct MosaicRegion: Codable, Equatable, Sendable {
     let maskData: Data?
     let maskKeyframes: [MosaicMaskKeyframe]?
     let subdivisionGroup: Int?
+    let detailBlendFeather: Int?
 
     init(
         startFrame: Int,
@@ -39,7 +66,8 @@ struct MosaicRegion: Codable, Equatable, Sendable {
         maskHeight: Int? = nil,
         maskData: Data? = nil,
         maskKeyframes: [MosaicMaskKeyframe]? = nil,
-        subdivisionGroup: Int? = nil
+        subdivisionGroup: Int? = nil,
+        detailBlendFeather: Int? = nil
     ) {
         self.startFrame = startFrame
         self.endFrame = endFrame
@@ -57,6 +85,7 @@ struct MosaicRegion: Codable, Equatable, Sendable {
         self.maskData = maskData
         self.maskKeyframes = maskKeyframes
         self.subdivisionGroup = subdivisionGroup
+        self.detailBlendFeather = detailBlendFeather
     }
 
     var frameRange: Range<Int> { startFrame..<endFrame }
@@ -113,7 +142,29 @@ struct MosaicRegion: Codable, Equatable, Sendable {
             maskWidth: maskWidth,
             maskHeight: maskHeight,
             maskData: resolvedData,
-            subdivisionGroup: subdivisionGroup
+            subdivisionGroup: subdivisionGroup,
+            detailBlendFeather: detailBlendFeather
+        )
+    }
+
+    /// Diagnostic coverage mode that applies the restored delta throughout the
+    /// complete detected crop. This isolates model quality from segmentation-
+    /// mask coverage; normal restoration should retain the softer mask path.
+    func usingFullDetectedRegionBlend() -> MosaicRegion {
+        MosaicRegion(
+            startFrame: startFrame,
+            endFrame: endFrame,
+            x: x,
+            y: y,
+            width: width,
+            height: height,
+            confidence: confidence,
+            blendX: x,
+            blendY: y,
+            blendWidth: width,
+            blendHeight: height,
+            subdivisionGroup: subdivisionGroup,
+            detailBlendFeather: detailBlendFeather
         )
     }
 

@@ -1,4 +1,5 @@
 import CoreVideo
+import Dispatch
 import Foundation
 
 enum VRMosaicProjection: String, CaseIterable, Sendable {
@@ -69,6 +70,9 @@ struct MosaicCompositeSample: Sendable {
 }
 
 struct MosaicCropSamplingMap: Sendable {
+    private static let defaultParallelExtractionEnabled =
+        ProcessInfo.processInfo.environment["JASNA_PARALLEL_CROP_EXTRACTION"] != "0"
+
     private struct Sample: Sendable {
         let x0: Int32
         let y0: Int32
@@ -78,11 +82,58 @@ struct MosaicCropSamplingMap: Sendable {
         let fy: Float
     }
 
+    private struct ParallelExtractionStorage: @unchecked Sendable {
+        let source: UnsafePointer<UInt8>
+        let samples: UnsafePointer<Sample>
+        let output: UnsafeMutablePointer<Float16>
+        let bytesPerRow: Int
+        let plane: Int
+
+        @inline(__always)
+        func extract(_ range: Range<Int>) {
+            for destination in range {
+                let sample = samples[destination]
+                let x0 = Int(sample.x0)
+                let y0 = Int(sample.y0)
+                let x1 = Int(sample.x1)
+                let y1 = Int(sample.y1)
+                let topLeft = y0 * bytesPerRow + x0 * 4
+                let topRight = y0 * bytesPerRow + x1 * 4
+                let bottomLeft = y1 * bytesPerRow + x0 * 4
+                let bottomRight = y1 * bytesPerRow + x1 * 4
+                let topWeight = 1 - sample.fy
+                let leftWeight = 1 - sample.fx
+                let w00 = leftWeight * topWeight
+                let w10 = sample.fx * topWeight
+                let w01 = leftWeight * sample.fy
+                let w11 = sample.fx * sample.fy
+                @inline(__always) func channel(_ offset: Int) -> Float16 {
+                    let value = Float(source[topLeft + offset]) * w00
+                        + Float(source[topRight + offset]) * w10
+                        + Float(source[bottomLeft + offset]) * w01
+                        + Float(source[bottomRight + offset]) * w11
+                    return Float16(value / 255)
+                }
+                output[destination] = channel(2)
+                output[plane + destination] = channel(1)
+                output[2 * plane + destination] = channel(0)
+            }
+        }
+    }
+
     let eyeWidth: Int
     let eyeHeight: Int
     let modelSize: Int
     let compositeSamples: [MosaicCompositeSample]
     private let samples: [Sample]
+
+    func sourceCoordinate(modelX: Int, modelY: Int) -> (x: Float, y: Float) {
+        guard modelX >= 0, modelX < modelSize, modelY >= 0, modelY < modelSize else {
+            return (0, 0)
+        }
+        let sample = samples[modelY * modelSize + modelX]
+        return (Float(sample.x0) + sample.fx, Float(sample.y0) + sample.fy)
+    }
 
     init(
         region: MosaicRegion,
@@ -145,7 +196,13 @@ struct MosaicCropSamplingMap: Sendable {
                         max(top - pixelY, pixelY - bottom)
                     )
                     let alpha: Float
-                    if outside > 0 {
+                    if let detailFeather = region.detailBlendFeather {
+                        alpha = region.featherAlpha(
+                            x: pixelX,
+                            y: pixelY,
+                            feather: detailFeather
+                        )
+                    } else if outside > 0 {
                         alpha = max(0, 0.5 * (1 - Float(outside) / feather))
                     } else {
                         let inside = min(
@@ -167,7 +224,21 @@ struct MosaicCropSamplingMap: Sendable {
         }
     }
 
+    static func parallelExtractionEnabled(
+        environment: [String: String]? = nil
+    ) -> Bool {
+        guard let environment else { return defaultParallelExtractionEnabled }
+        return environment["JASNA_PARALLEL_CROP_EXTRACTION"] != "0"
+    }
+
     func extractPlanarRGB(from pixelBuffer: CVPixelBuffer) throws -> [Float16] {
+        if Self.parallelExtractionEnabled() {
+            return try extractPlanarRGBParallel(from: pixelBuffer)
+        }
+        return try extractPlanarRGBSerial(from: pixelBuffer)
+    }
+
+    func extractPlanarRGBSerial(from pixelBuffer: CVPixelBuffer) throws -> [Float16] {
         guard CVPixelBufferGetPixelFormatType(pixelBuffer) == kCVPixelFormatType_32BGRA,
               CVPixelBufferGetWidth(pixelBuffer) == eyeWidth,
               CVPixelBufferGetHeight(pixelBuffer) == eyeHeight
@@ -208,6 +279,41 @@ struct MosaicCropSamplingMap: Sendable {
             result[2 * plane + destination] = channel(0)
         }
         return result
+    }
+
+    /// Four-worker application-path sampler. Its disjoint output ranges retain
+    /// the serial implementation's operation order and exact FP16 output.
+    func extractPlanarRGBParallel(from pixelBuffer: CVPixelBuffer) throws -> [Float16] {
+        guard CVPixelBufferGetPixelFormatType(pixelBuffer) == kCVPixelFormatType_32BGRA,
+              CVPixelBufferGetWidth(pixelBuffer) == eyeWidth,
+              CVPixelBufferGetHeight(pixelBuffer) == eyeHeight
+        else { throw DeformConvError.invalidShape }
+        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+        guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else {
+            throw DeformConvError.commandFailed("pixel buffer has no base address")
+        }
+        let source = baseAddress.assumingMemoryBound(to: UInt8.self)
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
+        let plane = modelSize * modelSize
+        return Array<Float16>(unsafeUninitializedCapacity: 3 * plane) {
+            result, initializedCount in
+            samples.withUnsafeBufferPointer { sampleBuffer in
+                let storage = ParallelExtractionStorage(
+                    source: source,
+                    samples: sampleBuffer.baseAddress!,
+                    output: result.baseAddress!,
+                    bytesPerRow: bytesPerRow,
+                    plane: plane
+                )
+                DispatchQueue.concurrentPerform(iterations: 4) { worker in
+                    let start = worker * plane / 4
+                    let end = (worker + 1) * plane / 4
+                    storage.extract(start..<end)
+                }
+            }
+            initializedCount = 3 * plane
+        }
     }
 }
 
@@ -281,8 +387,8 @@ struct FisheyeMosaicCropTransform: Equatable, Sendable {
         let u = longitude / .pi + 0.5
         let v = 0.5 - latitude / .pi
         return (
-            Float(u * Double(eyeWidth - 1)),
-            Float(v * Double(eyeHeight - 1))
+            Float(u * Double(eyeWidth) - 0.5),
+            Float(v * Double(eyeHeight) - 0.5)
         )
     }
 
@@ -293,8 +399,8 @@ struct FisheyeMosaicCropTransform: Equatable, Sendable {
         let patchU = (fisheye.u - fisheyeMinU) / (fisheyeMaxU - fisheyeMinU)
         let patchV = (fisheye.v - fisheyeMinV) / (fisheyeMaxV - fisheyeMinV)
         return (
-            Float(patchU * Double(modelSize - 1)),
-            Float(patchV * Double(modelSize - 1))
+            Float(patchU * Double(modelSize) - 0.5),
+            Float(patchV * Double(modelSize) - 0.5)
         )
     }
 
@@ -425,20 +531,23 @@ struct MosaicRegionFrameAccumulator {
         let endY = projection == .fisheye
             ? region.y + region.height
             : region.effectiveBlendY + region.effectiveBlendHeight
+        let detailResidualLimit = MosaicCompositeQuality.detailResidualLimit()
+        let recoverOrdinaryMaskHoles = projection == .fisheye
+            && region.subdivisionGroup == nil
+            && MosaicCompositeQuality.ordinaryMaskRecoveryEnabled()
+        let maskRecoveryThreshold = MosaicCompositeQuality.maskRecoveryDeltaThreshold()
         for pixelY in startY..<endY {
             for pixelX in startX..<endX {
                 let alpha = projection == .fisheye
-                    ? Self.expandedFeatherAlpha(
+                    ? region.detailBlendFeather.map {
+                        region.featherAlpha(x: pixelX, y: pixelY, feather: $0)
+                    } ?? Self.expandedFeatherAlpha(
                         region: region,
                         x: pixelX,
                         y: pixelY,
                         feather: region.recommendedFeather
                     )
                     : region.featherAlpha(x: pixelX, y: pixelY, feather: 12)
-                let maskedAlpha = alpha * region.segmentationMaskAlpha(
-                    x: pixelX, y: pixelY
-                )
-                guard maskedAlpha > 0 else { continue }
                 let model = fisheyeTransform?.modelCoordinate(
                     pixelX: pixelX, pixelY: pixelY
                 ) ?? rawTransform.modelCoordinate(pixelX: pixelX, pixelY: pixelY)
@@ -446,19 +555,51 @@ struct MosaicRegionFrameAccumulator {
                 let baseBlue = Float(bytes[destination]) / 255
                 let baseGreen = Float(bytes[destination + 1]) / 255
                 let baseRed = Float(bytes[destination + 2]) / 255
-                func restored(_ offset: Int, base: Float) -> Float {
-                    let value = Self.bilinearPlane(
+                func sampled(_ offset: Int) -> (restored: Float, original: Float?) {
+                    let restored = Self.bilinearPlane(
                         planarRGB, offset: offset, x: model.x, y: model.y
                     )
-                    guard let originalPlanarRGB else { return value }
-                    let original = Self.bilinearPlane(
+                    guard let originalPlanarRGB else { return (restored, nil) }
+                    return (restored, Self.bilinearPlane(
                         originalPlanarRGB, offset: offset, x: model.x, y: model.y
-                    )
-                    return base + value - original
+                    ))
                 }
-                let red = restored(0, base: baseRed)
-                let green = restored(plane, base: baseGreen)
-                let blue = restored(2 * plane, base: baseBlue)
+                let redSample = sampled(0)
+                let greenSample = sampled(plane)
+                let blueSample = sampled(2 * plane)
+                var maskAlpha = region.segmentationMaskAlpha(x: pixelX, y: pixelY)
+                if recoverOrdinaryMaskHoles,
+                   let originalRed = redSample.original,
+                   let originalGreen = greenSample.original,
+                   let originalBlue = blueSample.original
+                {
+                    let deltaStrength = max(
+                        abs(redSample.restored - originalRed),
+                        abs(greenSample.restored - originalGreen),
+                        abs(blueSample.restored - originalBlue)
+                    )
+                    maskAlpha = max(
+                        maskAlpha,
+                        Self.smoothstep(
+                            edge0: maskRecoveryThreshold,
+                            edge1: maskRecoveryThreshold * 2.5,
+                            value: deltaStrength
+                        )
+                    )
+                }
+                let maskedAlpha = alpha * maskAlpha
+                guard maskedAlpha > 0 else { continue }
+                func restored(_ sample: (restored: Float, original: Float?), base: Float) -> Float {
+                    guard let original = sample.original else { return sample.restored }
+                    let detail = min(
+                        detailResidualLimit,
+                        max(-detailResidualLimit, base - original)
+                    )
+                    return sample.restored + detail
+                }
+                let red = restored(redSample, base: baseRed)
+                let green = restored(greenSample, base: baseGreen)
+                let blue = restored(blueSample, base: baseBlue)
                 bytes[destination] = Self.blend(
                     base: bytes[destination], restored: blue, alpha: maskedAlpha
                 )
@@ -470,6 +611,12 @@ struct MosaicRegionFrameAccumulator {
                 )
             }
         }
+    }
+
+    private static func smoothstep(edge0: Float, edge1: Float, value: Float) -> Float {
+        guard edge1 > edge0 else { return value >= edge1 ? 1 : 0 }
+        let t = min(1, max(0, (value - edge0) / (edge1 - edge0)))
+        return t * t * (3 - 2 * t)
     }
 
     private static func expandedFeatherAlpha(

@@ -5,7 +5,7 @@ import Metal
 
 @available(macOS 27.0, *)
 extension SideBySideRestoration {
-    final class RestoredFrameWriter {
+    final class RestoredFrameWriter: @unchecked Sendable {
         // Created only after all CPU/Metal writes finish; the receiver gets read-only ownership.
         private struct FinishedPixelBuffer: @unchecked Sendable {
             let value: CVPixelBuffer
@@ -17,9 +17,50 @@ extension SideBySideRestoration {
             let wallSeconds: Double
         }
 
+        private struct CompositeInputReadResult {
+            let inputs: [MetalMosaicCompositeInput]
+            let totalMilliseconds: Double
+            let cacheMilliseconds: Double
+            let extractionMilliseconds: Double
+        }
+
+        /// Owns everything needed to prepare one frame away from the caller's executor.
+        /// Core Video pixel buffers are reference-counted and each preparation uses distinct
+        /// source/output surfaces; the finished output is handed read-only to AVFoundation.
+        private struct StereoFramePreparationInput: @unchecked Sendable {
+            let localFrame: Int
+            let absoluteFrame: Int
+            let leftCacheURL: URL
+            let rightCacheURL: URL
+            let leftInMemoryCache: InMemoryRegionFrameCache?
+            let rightInMemoryCache: InMemoryRegionFrameCache?
+            let leftBaseFrame: CVPixelBuffer
+            let rightBaseFrame: CVPixelBuffer
+            let leftRegions: [MosaicRegion]
+            let rightRegions: [MosaicRegion]
+            let leftSamplingMaps: [MosaicCropSamplingMap]
+            let rightSamplingMaps: [MosaicCropSamplingMap]
+            let plan: SideBySideVideoPlan
+            let projection: VRMosaicProjection
+        }
+
+        private struct PreparedStereoFrame: @unchecked Sendable {
+            let localFrame: Int
+            let absoluteFrame: Int
+            let outputBuffer: CVPixelBuffer
+            let preparationMilliseconds: Double
+            let inputMilliseconds: Double
+            let cacheMilliseconds: Double
+            let extractionMilliseconds: Double
+            let compositeMilliseconds: Double
+            let fusedFallbackMessage: String?
+            let cpuFallbackMessage: String?
+        }
+
         private final class RegionFrameCompositeBatch: @unchecked Sendable {
             private let localFrames: [Int]
             private let cacheURLs: [URL]
+            private let inMemoryCache: InMemoryRegionFrameCache?
             private let baseFrames: [CVPixelBuffer]
             private let outputBuffers: [CVPixelBuffer]
             private let dimensions: VideoDimensions
@@ -35,6 +76,7 @@ extension SideBySideRestoration {
             init(
                 localFrames: [Int],
                 cacheURLs: [URL],
+                inMemoryCache: InMemoryRegionFrameCache?,
                 baseFrames: [CVPixelBuffer],
                 outputBuffers: [CVPixelBuffer],
                 dimensions: VideoDimensions,
@@ -46,6 +88,7 @@ extension SideBySideRestoration {
             ) {
                 self.localFrames = localFrames
                 self.cacheURLs = cacheURLs
+                self.inMemoryCache = inMemoryCache
                 self.baseFrames = baseFrames
                 self.outputBuffers = outputBuffers
                 self.dimensions = dimensions
@@ -62,25 +105,38 @@ extension SideBySideRestoration {
                 do {
                     let started = Date()
                     let localFrame = localFrames[index]
-                    let cache = try FileHandle(forReadingFrom: cacheURLs[index])
-                    defer { try? cache.close() }
+                    let cache = try inMemoryCache == nil
+                        ? FileHandle(forReadingFrom: cacheURLs[index]) : nil
+                    defer { try? cache?.close() }
+                    var restoredScratch = (0..<regions.count).map { _ in
+                        [Float16](repeating: 0, count: tileElements)
+                    }
                     var compositeInputs = [MetalMosaicCompositeInput]()
                     compositeInputs.reserveCapacity(regions.count)
                     for (regionIndex, region) in regions.enumerated() {
                         let absoluteFrame = progressStartFrame + localFrame
                         guard region.frameRange.contains(absoluteFrame) else {
-                            try cache.seek(toOffset: UInt64((regionIndex + 1) * tileBytes))
+                            try cache?.seek(toOffset: UInt64((regionIndex + 1) * tileBytes))
                             continue
                         }
-                        guard let data = try cache.read(upToCount: tileBytes),
-                              data.count == tileBytes
-                        else {
-                            throw DeformConvError.commandFailed(
-                                "restored mosaic-crop cache is truncated"
+                        if let inMemoryCache {
+                            try inMemoryCache.copyValues(
+                                frame: localFrame,
+                                region: regionIndex,
+                                into: &restoredScratch[regionIndex]
                             )
+                        } else {
+                            guard let data = try cache?.read(upToCount: tileBytes),
+                                  data.count == tileBytes
+                            else {
+                                throw DeformConvError.commandFailed(
+                                    "restored mosaic-crop cache is truncated"
+                                )
+                            }
+                            _ = restoredScratch[regionIndex].withUnsafeMutableBytes {
+                                data.copyBytes(to: $0)
+                            }
                         }
-                        var values = [Float16](repeating: 0, count: tileElements)
-                        _ = values.withUnsafeMutableBytes { data.copyBytes(to: $0) }
                         let original = projection == .fisheye
                             ? try samplingMaps[regionIndex].extractPlanarRGB(
                                 from: baseFrames[index]
@@ -89,7 +145,7 @@ extension SideBySideRestoration {
                         compositeInputs.append(
                             MetalMosaicCompositeInput(
                                 region: region.resolvingSegmentationMask(at: absoluteFrame),
-                                restored: values,
+                                restored: restoredScratch[regionIndex],
                                 original: original ?? [],
                                 samples: samplingMaps[regionIndex].compositeSamples
                             )
@@ -263,6 +319,9 @@ extension SideBySideRestoration {
         private let receiver: AVAssetWriterInput.PixelBufferReceiver
         private let pixelBufferPool: CVPixelBufferPool
         private let metalCompositor: MetalMosaicCompositor?
+        private var directStereoFrameCount = 0
+        private var fusedStereoFallbackCount = 0
+        private var cpuStereoFallbackCount = 0
 
         init(device: MTLDevice, outputURL: URL, plan: SideBySideVideoPlan) throws {
             metalCompositor = ProcessInfo.processInfo.environment["JASNA_METAL_COMPOSITOR"] == "0"
@@ -289,6 +348,9 @@ extension SideBySideRestoration {
                     ],
                 ]
             )
+            // Match the packet time base used by clean bypass segments so the
+            // grouped output can be concatenated without a second file rewrite.
+            input.mediaTimeScale = 600
             guard writer.canAdd(input) else {
                 throw DeformConvError.commandFailed("video writer rejected restored frames")
             }
@@ -352,14 +414,15 @@ extension SideBySideRestoration {
                 let cache = try FileHandle(forReadingFrom: cacheURLs[localFrame])
                 var restoredTiles = [(VideoTile, [Float16])]()
                 restoredTiles.reserveCapacity(compositeTiles.count)
+                var tileScratch = [Float16](repeating: 0, count: tileElements)
                 for tile in compositeTiles {
                     guard let data = try cache.read(upToCount: tileBytes), data.count == tileBytes else {
                         try? cache.close()
                         throw DeformConvError.commandFailed("restored tile cache is truncated")
                     }
-                    var values = [Float16](repeating: 0, count: tileElements)
-                    _ = values.withUnsafeMutableBytes { data.copyBytes(to: $0) }
-                    restoredTiles.append((tile, values))
+                    _ = tileScratch.withUnsafeMutableBytes { data.copyBytes(to: $0) }
+                    // Copy-on-write keeps this tile's values stable after the next overwrite.
+                    restoredTiles.append((tile, tileScratch))
                 }
                 try cache.close()
                 var optionalBuffer: CVPixelBuffer?
@@ -401,6 +464,7 @@ extension SideBySideRestoration {
 
         func appendRegionCachedFrames(
             cacheURLs: [URL],
+            inMemoryCache: InMemoryRegionFrameCache? = nil,
             attachments: [CFDictionary?],
             startFrame: Int,
             progressStartFrame: Int,
@@ -422,10 +486,8 @@ extension SideBySideRestoration {
             let configuredConcurrency = Int(
                 ProcessInfo.processInfo.environment["JASNA_COMPOSITE_CONCURRENCY"] ?? ""
             )
-            let automaticConcurrency = ProcessInfo.processInfo.physicalMemory
-                >= UInt64(16 * 1_073_741_824) ? 2 : 1
             let compositeConcurrency = min(
-                2, max(1, configuredConcurrency ?? automaticConcurrency)
+                2, max(1, configuredConcurrency ?? 1)
             )
             report("Frame compositing concurrency: \(compositeConcurrency)")
             report(
@@ -438,6 +500,9 @@ extension SideBySideRestoration {
                             ? "Metal zero-copy texture" : "Metal buffer-copy fallback"
                     }()
             )
+            if projection == .fisheye, let metalCompositor {
+                report("Metal compositor cache limits: \(metalCompositor.memoryBudgetDescription)")
+            }
             var nextFrame = 0
             while nextFrame < cacheURLs.count {
                 let batchEnd = min(cacheURLs.count, nextFrame + compositeConcurrency)
@@ -462,6 +527,7 @@ extension SideBySideRestoration {
                 let batch = RegionFrameCompositeBatch(
                     localFrames: localFrames,
                     cacheURLs: localFrames.map { cacheURLs[$0] },
+                    inMemoryCache: inMemoryCache,
                     baseFrames: localFrames.map { baseFrames[$0] },
                     outputBuffers: outputBuffers,
                     dimensions: plan.dimensions,
@@ -499,6 +565,8 @@ extension SideBySideRestoration {
         func appendStereoRegionCachedFrames(
             leftCacheURLs: [URL],
             rightCacheURLs: [URL],
+            leftInMemoryCache: InMemoryRegionFrameCache? = nil,
+            rightInMemoryCache: InMemoryRegionFrameCache? = nil,
             leftBaseFrames: [CVPixelBuffer],
             rightBaseFrames: [CVPixelBuffer],
             leftRegions: [MosaicRegion],
@@ -523,123 +591,340 @@ extension SideBySideRestoration {
                 "Direct SBS compositing \(frameCount) frame(s), left/right regions "
                     + "\(leftRegions.count)/\(rightRegions.count)"
             )
+            guard frameCount > 0 else { return }
+            let writerStarted = ContinuousClock.now
+            var totalPreparationMilliseconds = 0.0
+            var totalEncoderWaitMilliseconds = 0.0
+            var totalInputMilliseconds = 0.0
+            var totalCacheMilliseconds = 0.0
+            var totalExtractionMilliseconds = 0.0
+            var totalCompositeMilliseconds = 0.0
+            let configuredDepth = Int(
+                ProcessInfo.processInfo.environment["JASNA_STEREO_WRITER_DEPTH"] ?? ""
+            ) ?? 2
+            let pipelineDepth = min(2, max(1, configuredDepth))
+            report("Direct SBS writer pipeline depth: \(pipelineDepth)")
+
+            func preparationInput(_ localFrame: Int) -> StereoFramePreparationInput {
+                StereoFramePreparationInput(
+                    localFrame: localFrame,
+                    absoluteFrame: absoluteStartFrame + localFrame,
+                    leftCacheURL: leftCacheURLs[localFrame],
+                    rightCacheURL: rightCacheURLs[localFrame],
+                    leftInMemoryCache: leftInMemoryCache,
+                    rightInMemoryCache: rightInMemoryCache,
+                    leftBaseFrame: leftBaseFrames[localFrame],
+                    rightBaseFrame: rightBaseFrames[localFrame],
+                    leftRegions: leftRegions,
+                    rightRegions: rightRegions,
+                    leftSamplingMaps: leftSamplingMaps,
+                    rightSamplingMaps: rightSamplingMaps,
+                    plan: plan,
+                    projection: projection
+                )
+            }
+
+            var pendingPreparation: Task<PreparedStereoFrame, Error>?
+            if pipelineDepth == 2 {
+                let first = preparationInput(0)
+                pendingPreparation = Task.detached { [self] in
+                    try prepareStereoFrame(first)
+                }
+            }
             for localFrame in 0..<frameCount {
-                let frameStarted = ContinuousClock.now
-                var optionalOutput: CVPixelBuffer?
-                let status = CVPixelBufferPoolCreatePixelBuffer(
-                    nil, pixelBufferPool, &optionalOutput
-                )
-                guard status == kCVReturnSuccess, let outputBuffer = optionalOutput else {
-                    throw DeformConvError.commandFailed("failed allocating direct SBS frame")
-                }
-                let absoluteFrame = absoluteStartFrame + localFrame
-                let leftInputs = try Self.readCompositeInputs(
-                    cacheURL: leftCacheURLs[localFrame],
-                    baseFrame: leftBaseFrames[localFrame],
-                    regions: leftRegions,
-                    samplingMaps: leftSamplingMaps,
-                    absoluteFrame: absoluteFrame,
-                    xOffset: 0
-                )
-                let rightInputs = try Self.readCompositeInputs(
-                    cacheURL: rightCacheURLs[localFrame],
-                    baseFrame: rightBaseFrames[localFrame],
-                    regions: rightRegions,
-                    samplingMaps: rightSamplingMaps,
-                    absoluteFrame: absoluteFrame,
-                    xOffset: plan.eyeDimensions.width
-                )
-                try Self.copyStereoPixelBuffers(
-                    left: leftBaseFrames[localFrame],
-                    right: rightBaseFrames[localFrame],
-                    destination: outputBuffer,
-                    dimensions: plan.dimensions
-                )
-                if projection == .fisheye, let metalCompositor {
-                    try metalCompositor.compositeInPlace(
-                        pixelBuffer: outputBuffer,
-                        dimensions: plan.dimensions,
-                        inputs: leftInputs + rightInputs
-                    )
+                directStereoFrameCount += 1
+                let prepared: PreparedStereoFrame
+                if let pendingPreparation {
+                    prepared = try await pendingPreparation.value
                 } else {
-                    guard projection == .raw else {
-                        throw DeformConvError.commandFailed(
-                            "direct fisheye SBS output requires the Metal compositor"
-                        )
-                    }
-                    var accumulator = try MosaicRegionFrameAccumulator(
-                        basePixelBuffer: outputBuffer, dimensions: plan.dimensions
-                    )
-                    for composite in leftInputs + rightInputs {
-                        try accumulator.composite(
-                            region: composite.region,
-                            planarRGB: composite.restored,
-                            originalPlanarRGB: projection == .fisheye
-                                ? composite.original : nil,
-                            projection: .raw
-                        )
-                    }
-                    try accumulator.writeBGRA(to: outputBuffer)
+                    prepared = try prepareStereoFrame(preparationInput(localFrame))
                 }
-                if let attachments = CVBufferCopyAttachments(
-                    leftBaseFrames[localFrame], .shouldPropagate
-                ) {
-                    CVBufferSetAttachments(outputBuffer, attachments, .shouldPropagate)
+                let nextFrame = localFrame + 1
+                if pipelineDepth == 2, nextFrame < frameCount {
+                    let next = preparationInput(nextFrame)
+                    pendingPreparation = Task.detached { [self] in
+                        try prepareStereoFrame(next)
+                    }
+                } else {
+                    pendingPreparation = nil
+                }
+                if let message = prepared.fusedFallbackMessage {
+                    fusedStereoFallbackCount += 1
+                    report(message)
+                }
+                if let message = prepared.cpuFallbackMessage {
+                    cpuStereoFallbackCount += 1
+                    report(message)
                 }
                 let presentationTime = CMTime(
                     value: CMTimeValue(presentationStartFrame + localFrame), timescale: 30
                 )
+                if let metalCompositor {
+                    try metalCompositor.synchronize()
+                }
+                let appendStarted = ContinuousClock.now
                 try await append(
-                    FinishedPixelBuffer(value: outputBuffer), at: presentationTime,
+                    FinishedPixelBuffer(value: prepared.outputBuffer), at: presentationTime,
                     frame: presentationStartFrame + localFrame
                 )
-                report(
-                    "Queued direct SBS frame \(absoluteFrame + 1)/"
-                        + "\(progressFrameCount); composite "
-                        + "\(String(format: "%.3f", SideBySideRestoration.elapsedMilliseconds(since: frameStarted))) ms"
+                let appendMilliseconds = SideBySideRestoration.elapsedMilliseconds(
+                    since: appendStarted
                 )
+                totalPreparationMilliseconds += prepared.preparationMilliseconds
+                totalEncoderWaitMilliseconds += appendMilliseconds
+                totalInputMilliseconds += prepared.inputMilliseconds
+                totalCacheMilliseconds += prepared.cacheMilliseconds
+                totalExtractionMilliseconds += prepared.extractionMilliseconds
+                totalCompositeMilliseconds += prepared.compositeMilliseconds
+                if localFrame == frameCount - 1
+                    || (prepared.absoluteFrame + 1).isMultiple(of: 30)
+                    || appendMilliseconds >= 250
+                {
+                    report(
+                        "Queued direct SBS frame \(prepared.absoluteFrame + 1)/"
+                            + "\(progressFrameCount); prepare/composite "
+                            + "\(String(format: "%.3f", prepared.preparationMilliseconds)) ms, "
+                            + "encoder wait \(String(format: "%.3f", appendMilliseconds)) ms"
+                    )
+                }
             }
+            report(
+                "Direct SBS writer phases: \(frameCount) frames, wall "
+                    + "\(String(format: "%.3f", SideBySideRestoration.elapsedMilliseconds(since: writerStarted))) ms, "
+                    + "preparation sum \(String(format: "%.3f", totalPreparationMilliseconds)) ms, "
+                    + "encoder wait sum \(String(format: "%.3f", totalEncoderWaitMilliseconds)) ms"
+            )
+            let inputAssemblyMilliseconds = max(
+                0,
+                totalInputMilliseconds - totalCacheMilliseconds
+                    - totalExtractionMilliseconds
+            )
+            let otherPreparationMilliseconds = max(
+                0,
+                totalPreparationMilliseconds - totalInputMilliseconds
+                    - totalCompositeMilliseconds
+            )
+            report(
+                "Direct SBS preparation detail: inputs "
+                    + "\(String(format: "%.3f", totalInputMilliseconds)) ms "
+                    + "(cache \(String(format: "%.3f", totalCacheMilliseconds)) ms, "
+                    + "crop extraction \(String(format: "%.3f", totalExtractionMilliseconds)) ms, "
+                    + "mask/assembly \(String(format: "%.3f", inputAssemblyMilliseconds)) ms); "
+                    + "composite \(String(format: "%.3f", totalCompositeMilliseconds)) ms; "
+                    + "buffers/attachments \(String(format: "%.3f", otherPreparationMilliseconds)) ms"
+            )
+        }
+
+        private func prepareStereoFrame(
+            _ input: StereoFramePreparationInput
+        ) throws -> PreparedStereoFrame {
+            let frameStarted = ContinuousClock.now
+            var optionalOutput: CVPixelBuffer?
+            let status = CVPixelBufferPoolCreatePixelBuffer(
+                nil, pixelBufferPool, &optionalOutput
+            )
+            guard status == kCVReturnSuccess, let outputBuffer = optionalOutput else {
+                throw DeformConvError.commandFailed("failed allocating direct SBS frame")
+            }
+            let leftRead = try Self.readCompositeInputs(
+                cacheURL: input.leftCacheURL,
+                inMemoryCache: input.leftInMemoryCache,
+                cacheFrame: input.localFrame,
+                baseFrame: input.leftBaseFrame,
+                regions: input.leftRegions,
+                samplingMaps: input.leftSamplingMaps,
+                absoluteFrame: input.absoluteFrame,
+                xOffset: 0,
+                projection: input.projection
+            )
+            let rightRead = try Self.readCompositeInputs(
+                cacheURL: input.rightCacheURL,
+                inMemoryCache: input.rightInMemoryCache,
+                cacheFrame: input.localFrame,
+                baseFrame: input.rightBaseFrame,
+                regions: input.rightRegions,
+                samplingMaps: input.rightSamplingMaps,
+                absoluteFrame: input.absoluteFrame,
+                xOffset: input.plan.eyeDimensions.width,
+                projection: input.projection
+            )
+            let compositeInputs = leftRead.inputs + rightRead.inputs
+            let compositeStarted = ContinuousClock.now
+            var fusedFallbackMessage: String?
+            var cpuFallbackMessage: String?
+            if input.projection == .fisheye, let metalCompositor {
+                do {
+                    try metalCompositor.compositeStereo(
+                        leftPixelBuffer: input.leftBaseFrame,
+                        rightPixelBuffer: input.rightBaseFrame,
+                        outputPixelBuffer: outputBuffer,
+                        dimensions: input.plan.dimensions,
+                        inputs: compositeInputs,
+                        waitUntilCompleted: false
+                    )
+                } catch {
+                    fusedFallbackMessage = "WARNING: Fused Metal stereo composite failed; "
+                        + "using split path for frame \(input.absoluteFrame + 1) (\(error))"
+                    do {
+                        try metalCompositor.copyStereo(
+                            leftPixelBuffer: input.leftBaseFrame,
+                            rightPixelBuffer: input.rightBaseFrame,
+                            outputPixelBuffer: outputBuffer,
+                            dimensions: input.plan.dimensions,
+                            waitUntilCompleted: false
+                        )
+                    } catch {
+                        cpuFallbackMessage = "WARNING: Metal stereo copy failed; using CPU for frame "
+                            + "\(input.absoluteFrame + 1) (\(error))"
+                        try Self.copyStereoPixelBuffers(
+                            left: input.leftBaseFrame,
+                            right: input.rightBaseFrame,
+                            destination: outputBuffer,
+                            dimensions: input.plan.dimensions
+                        )
+                    }
+                    try metalCompositor.compositeInPlace(
+                        pixelBuffer: outputBuffer,
+                        dimensions: input.plan.dimensions,
+                        inputs: compositeInputs,
+                        waitUntilCompleted: false
+                    )
+                }
+            } else {
+                try Self.copyStereoPixelBuffers(
+                    left: input.leftBaseFrame,
+                    right: input.rightBaseFrame,
+                    destination: outputBuffer,
+                    dimensions: input.plan.dimensions
+                )
+                guard input.projection == .raw else {
+                    throw DeformConvError.commandFailed(
+                        "direct fisheye SBS output requires the Metal compositor"
+                    )
+                }
+                var accumulator = try MosaicRegionFrameAccumulator(
+                    basePixelBuffer: outputBuffer, dimensions: input.plan.dimensions
+                )
+                for composite in compositeInputs {
+                    try accumulator.composite(
+                        region: composite.region,
+                        planarRGB: composite.restored,
+                        originalPlanarRGB: nil,
+                        projection: .raw
+                    )
+                }
+                try accumulator.writeBGRA(to: outputBuffer)
+            }
+            let compositeMilliseconds = SideBySideRestoration.elapsedMilliseconds(
+                since: compositeStarted
+            )
+            if let attachments = CVBufferCopyAttachments(
+                input.leftBaseFrame, .shouldPropagate
+            ) {
+                CVBufferSetAttachments(outputBuffer, attachments, .shouldPropagate)
+            }
+            return PreparedStereoFrame(
+                localFrame: input.localFrame,
+                absoluteFrame: input.absoluteFrame,
+                outputBuffer: outputBuffer,
+                preparationMilliseconds: SideBySideRestoration.elapsedMilliseconds(
+                    since: frameStarted
+                ),
+                inputMilliseconds: leftRead.totalMilliseconds + rightRead.totalMilliseconds,
+                cacheMilliseconds: leftRead.cacheMilliseconds + rightRead.cacheMilliseconds,
+                extractionMilliseconds: leftRead.extractionMilliseconds
+                    + rightRead.extractionMilliseconds,
+                compositeMilliseconds: compositeMilliseconds,
+                fusedFallbackMessage: fusedFallbackMessage,
+                cpuFallbackMessage: cpuFallbackMessage
+            )
         }
 
         private static func readCompositeInputs(
             cacheURL: URL,
+            inMemoryCache: InMemoryRegionFrameCache?,
+            cacheFrame: Int,
             baseFrame: CVPixelBuffer,
             regions: [MosaicRegion],
             samplingMaps: [MosaicCropSamplingMap],
             absoluteFrame: Int,
-            xOffset: Int
-        ) throws -> [MetalMosaicCompositeInput] {
-            let cache = try FileHandle(forReadingFrom: cacheURL)
-            defer { try? cache.close() }
+            xOffset: Int,
+            projection: VRMosaicProjection
+        ) throws -> CompositeInputReadResult {
+            let totalStarted = ContinuousClock.now
+            var cacheMilliseconds = 0.0
+            var extractionMilliseconds = 0.0
+            let cacheOpenStarted = ContinuousClock.now
+            let cache = try inMemoryCache == nil ? FileHandle(forReadingFrom: cacheURL) : nil
+            cacheMilliseconds += SideBySideRestoration.elapsedMilliseconds(
+                since: cacheOpenStarted
+            )
+            defer { try? cache?.close() }
             var result = [MetalMosaicCompositeInput]()
             result.reserveCapacity(regions.count)
+            var restoredScratch = (0..<regions.count).map { _ in
+                [Float16](repeating: 0, count: tileElements)
+            }
             for (index, region) in regions.enumerated() {
                 guard region.frameRange.contains(absoluteFrame) else {
-                    try cache.seek(toOffset: UInt64((index + 1) * tileBytes))
+                    let seekStarted = ContinuousClock.now
+                    try cache?.seek(toOffset: UInt64((index + 1) * tileBytes))
+                    cacheMilliseconds += SideBySideRestoration.elapsedMilliseconds(
+                        since: seekStarted
+                    )
                     continue
                 }
-                guard let data = try cache.read(upToCount: tileBytes), data.count == tileBytes else {
-                    throw DeformConvError.commandFailed(
-                        "direct SBS mosaic-crop cache is truncated"
+                let cacheReadStarted = ContinuousClock.now
+                if let inMemoryCache {
+                    try inMemoryCache.copyValues(
+                        frame: cacheFrame, region: index, into: &restoredScratch[index]
                     )
+                } else {
+                    guard let data = try cache?.read(upToCount: tileBytes),
+                          data.count == tileBytes
+                    else {
+                        throw DeformConvError.commandFailed(
+                            "direct SBS mosaic-crop cache is truncated"
+                        )
+                    }
+                    _ = restoredScratch[index].withUnsafeMutableBytes {
+                        data.copyBytes(to: $0)
+                    }
                 }
-                var restored = [Float16](repeating: 0, count: tileElements)
-                _ = restored.withUnsafeMutableBytes { data.copyBytes(to: $0) }
-                let original = try samplingMaps[index].extractPlanarRGB(from: baseFrame)
+                cacheMilliseconds += SideBySideRestoration.elapsedMilliseconds(
+                    since: cacheReadStarted
+                )
+                let original: [Float16]
+                if projection == .fisheye {
+                    let extractionStarted = ContinuousClock.now
+                    original = try samplingMaps[index].extractPlanarRGB(from: baseFrame)
+                    extractionMilliseconds += SideBySideRestoration.elapsedMilliseconds(
+                        since: extractionStarted
+                    )
+                } else {
+                    original = []
+                }
                 result.append(MetalMosaicCompositeInput(
                     region: translated(
                         region.resolvingSegmentationMask(at: absoluteFrame),
                         xOffset: xOffset
                     ),
-                    restored: restored,
+                    restored: restoredScratch[index],
                     original: original,
                     samples: samplingMaps[index].compositeSamples
                 ))
             }
-            return result
+            return CompositeInputReadResult(
+                inputs: result,
+                totalMilliseconds: SideBySideRestoration.elapsedMilliseconds(
+                    since: totalStarted
+                ),
+                cacheMilliseconds: cacheMilliseconds,
+                extractionMilliseconds: extractionMilliseconds
+            )
         }
 
-        private static func translated(_ region: MosaicRegion, xOffset: Int) -> MosaicRegion {
+        static func translated(_ region: MosaicRegion, xOffset: Int) -> MosaicRegion {
             guard xOffset != 0 else { return region }
             return MosaicRegion(
                 startFrame: region.startFrame,
@@ -659,7 +944,8 @@ extension SideBySideRestoration {
                 maskKeyframes: region.maskKeyframes,
                 subdivisionGroup: region.subdivisionGroup.map {
                     xOffset == 0 ? $0 : $0 + 1_000_000
-                }
+                },
+                detailBlendFeather: region.detailBlendFeather
             )
         }
 
@@ -713,6 +999,16 @@ extension SideBySideRestoration {
             }
             guard writer.status == .completed else {
                 throw writer.error ?? DeformConvError.commandFailed("video writer did not complete")
+            }
+            if directStereoFrameCount > 0 {
+                let status = fusedStereoFallbackCount == 0 && cpuStereoFallbackCount == 0
+                    ? "PASS" : "WARNING"
+                report(
+                    "Stereo compositor safety summary: \(status), "
+                        + "\(directStereoFrameCount) frames, fused fallbacks "
+                        + "\(fusedStereoFallbackCount), CPU fallbacks "
+                        + "\(cpuStereoFallbackCount)"
+                )
             }
         }
 

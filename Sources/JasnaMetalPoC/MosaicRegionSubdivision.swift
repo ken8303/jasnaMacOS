@@ -9,6 +9,7 @@ struct MosaicRegionSubdivisionConfiguration: Equatable, Sendable {
     let maskFeatherFraction: Double
     let blockResidualGrowthFraction: Double
     let maskTemporalRadius: Int
+    let maskTemporalStrength: Double
     let detailCropDimension: Int
     let detailCropCount: Int
 
@@ -21,6 +22,7 @@ struct MosaicRegionSubdivisionConfiguration: Equatable, Sendable {
         maskFeatherFraction: 0,
         blockResidualGrowthFraction: 0,
         maskTemporalRadius: 0,
+        maskTemporalStrength: 0.5,
         detailCropDimension: 0,
         detailCropCount: 0
     )
@@ -35,7 +37,7 @@ struct MosaicRegionSubdivisionConfiguration: Equatable, Sendable {
             overlap: max(0, Int(environment["JASNA_LARGE_REGION_OVERLAP"] ?? "") ?? 96),
             splitLimit: max(0, Int(environment["JASNA_LARGE_REGION_SPLIT_LIMIT"] ?? "") ?? 1),
             maximumAxisCrops: min(
-                4, max(2, Int(environment["JASNA_LARGE_REGION_MAX_AXIS_CROPS"] ?? "") ?? 3)
+                4, max(2, Int(environment["JASNA_LARGE_REGION_MAX_AXIS_CROPS"] ?? "") ?? 4)
             ),
             maskGrowthFraction: boundedFraction(
                 environment["JASNA_LARGE_REGION_MASK_GROWTH"], default: 0.05
@@ -52,6 +54,9 @@ struct MosaicRegionSubdivisionConfiguration: Equatable, Sendable {
                     0,
                     Int(environment["JASNA_LARGE_REGION_MASK_TEMPORAL_RADIUS"] ?? "") ?? 1
                 )
+            ),
+            maskTemporalStrength: boundedUnitFraction(
+                environment["JASNA_LARGE_REGION_MASK_TEMPORAL_STRENGTH"], default: 0.5
             ),
             detailCropDimension: min(
                 maximumBlendDimension,
@@ -73,6 +78,44 @@ struct MosaicRegionSubdivisionConfiguration: Equatable, Sendable {
         }
         return min(0.25, max(0, parsed))
     }
+
+    private static func boundedUnitFraction(
+        _ value: String?, default defaultValue: Double
+    ) -> Double {
+        guard let value, let parsed = Double(value), parsed.isFinite else {
+            return defaultValue
+        }
+        return min(1, max(0, parsed))
+    }
+}
+
+struct MosaicTemporalCropConfiguration: Equatable, Sendable {
+    let chunkFrames: Int
+    let padding: Int
+    let minimumDimension: Int
+    let minimumMotionFraction: Double
+
+    static let disabled = Self(
+        chunkFrames: 0,
+        padding: 0,
+        minimumDimension: 0,
+        minimumMotionFraction: 1
+    )
+
+    static func fromEnvironment(_ environment: [String: String]) -> Self {
+        let chunkFrames = Int(environment["JASNA_TEMPORAL_CROP_FRAMES"] ?? "") ?? 0
+        guard chunkFrames >= 3 else { return .disabled }
+        let motion = Double(environment["JASNA_TEMPORAL_CROP_MOTION"] ?? "") ?? 0.08
+        return Self(
+            chunkFrames: chunkFrames,
+            padding: max(0, Int(environment["JASNA_TEMPORAL_CROP_PADDING"] ?? "") ?? 128),
+            minimumDimension: max(
+                256,
+                Int(environment["JASNA_TEMPORAL_CROP_MIN_DIMENSION"] ?? "") ?? 1_024
+            ),
+            minimumMotionFraction: min(0.5, max(0, motion))
+        )
+    }
 }
 
 enum MosaicRegionSubdivision {
@@ -80,6 +123,203 @@ enum MosaicRegionSubdivision {
         let regions: [MosaicRegion]
         let splitRegionCount: Int
         let addedModelCropCount: Int
+        let subdivisionModelCropCount: Int
+        let classifiedMaskCropCount: Int
+        let zeroMaskCropCount: Int
+    }
+
+    struct TemporalResult: Equatable, Sendable {
+        let regions: [MosaicRegion]
+        let movingRegionCount: Int
+        let addedTemporalCropCount: Int
+    }
+
+    static func tightenMovingRegions(
+        _ regions: [MosaicRegion],
+        configuration: MosaicTemporalCropConfiguration
+    ) -> TemporalResult {
+        guard configuration.chunkFrames >= 3, !regions.isEmpty else {
+            return TemporalResult(
+                regions: regions, movingRegionCount: 0, addedTemporalCropCount: 0
+            )
+        }
+        var output = [MosaicRegion]()
+        var movingRegionCount = 0
+        var addedTemporalCropCount = 0
+        for region in regions {
+            guard max(region.width, region.height) >= configuration.minimumDimension,
+                  region.endFrame - region.startFrame > configuration.chunkFrames,
+                  let keyframes = region.maskKeyframes,
+                  keyframes.count >= 3,
+                  temporalMaskMoves(
+                      keyframes,
+                      maskWidth: region.maskWidth,
+                      maskHeight: region.maskHeight,
+                      minimumFraction: configuration.minimumMotionFraction
+                  )
+            else {
+                output.append(region)
+                continue
+            }
+            let ranges = temporalCropRanges(
+                startFrame: region.startFrame,
+                endFrame: region.endFrame,
+                chunkFrames: configuration.chunkFrames
+            )
+            let children = ranges.compactMap { range in
+                tightenedRegion(
+                    region,
+                    frameRange: range,
+                    padding: configuration.padding
+                )
+            }
+            guard children.count == ranges.count else {
+                output.append(region)
+                continue
+            }
+            output.append(contentsOf: children)
+            movingRegionCount += 1
+            addedTemporalCropCount += children.count - 1
+        }
+        return TemporalResult(
+            regions: output,
+            movingRegionCount: movingRegionCount,
+            addedTemporalCropCount: addedTemporalCropCount
+        )
+    }
+
+    static func temporalCropRanges(
+        startFrame: Int,
+        endFrame: Int,
+        chunkFrames: Int
+    ) -> [Range<Int>] {
+        guard startFrame < endFrame, chunkFrames >= 3 else { return [] }
+        var ranges = [Range<Int>]()
+        var start = startFrame
+        while start < endFrame {
+            var end = min(endFrame, start + chunkFrames)
+            if endFrame - end < 3 { end = endFrame }
+            ranges.append(start..<end)
+            start = end
+        }
+        return ranges
+    }
+
+    private static func temporalMaskMoves(
+        _ keyframes: [MosaicMaskKeyframe],
+        maskWidth: Int?,
+        maskHeight: Int?,
+        minimumFraction: Double
+    ) -> Bool {
+        guard let maskWidth, let maskHeight, maskWidth > 1, maskHeight > 1 else {
+            return false
+        }
+        let centres = keyframes.compactMap {
+            maskGridBounds($0.maskData, width: maskWidth, height: maskHeight).map {
+                (x: Double($0.left + $0.right) / 2, y: Double($0.top + $0.bottom) / 2)
+            }
+        }
+        guard let minimumX = centres.map(\.x).min(),
+              let maximumX = centres.map(\.x).max(),
+              let minimumY = centres.map(\.y).min(),
+              let maximumY = centres.map(\.y).max()
+        else { return false }
+        return maximumX - minimumX >= Double(maskWidth) * minimumFraction
+            || maximumY - minimumY >= Double(maskHeight) * minimumFraction
+    }
+
+    private static func tightenedRegion(
+        _ region: MosaicRegion,
+        frameRange: Range<Int>,
+        padding: Int
+    ) -> MosaicRegion? {
+        guard let maskWidth = region.maskWidth,
+              let maskHeight = region.maskHeight,
+              let allKeyframes = region.maskKeyframes
+        else { return nil }
+        let keyframes = allKeyframes.filter { frameRange.contains($0.frame) }
+        guard !keyframes.isEmpty else { return nil }
+        let bounds = keyframes.compactMap {
+            maskGridBounds($0.maskData, width: maskWidth, height: maskHeight)
+        }
+        guard let minimumX = bounds.map(\.left).min(),
+              let minimumY = bounds.map(\.top).min(),
+              let maximumX = bounds.map(\.right).max(),
+              let maximumY = bounds.map(\.bottom).max()
+        else { return nil }
+
+        let maskLeft = region.x + minimumX * region.width / maskWidth
+        let maskTop = region.y + minimumY * region.height / maskHeight
+        let maskRight = region.x + maximumX * region.width / maskWidth
+        let maskBottom = region.y + maximumY * region.height / maskHeight
+        let cropX = max(region.x, maskLeft - padding)
+        let cropY = max(region.y, maskTop - padding)
+        let cropRight = min(region.x + region.width, maskRight + padding)
+        let cropBottom = min(region.y + region.height, maskBottom + padding)
+        guard cropRight > cropX, cropBottom > cropY else { return nil }
+
+        let temporalRegion = MosaicRegion(
+            startFrame: frameRange.lowerBound,
+            endFrame: frameRange.upperBound,
+            x: region.x,
+            y: region.y,
+            width: region.width,
+            height: region.height,
+            confidence: region.confidence,
+            blendX: region.blendX,
+            blendY: region.blendY,
+            blendWidth: region.blendWidth,
+            blendHeight: region.blendHeight,
+            maskWidth: maskWidth,
+            maskHeight: maskHeight,
+            maskData: keyframes.first?.maskData,
+            maskKeyframes: keyframes,
+            subdivisionGroup: region.subdivisionGroup,
+            detailBlendFeather: region.detailBlendFeather
+        )
+        let blendLeft = max(cropX, region.effectiveBlendX)
+        let blendTop = max(cropY, region.effectiveBlendY)
+        let blendRight = min(cropRight, region.effectiveBlendX + region.effectiveBlendWidth)
+        let blendBottom = min(cropBottom, region.effectiveBlendY + region.effectiveBlendHeight)
+        guard blendRight > blendLeft, blendBottom > blendTop else { return nil }
+        return croppedRegion(
+            temporalRegion,
+            x: cropX,
+            y: cropY,
+            width: cropRight - cropX,
+            height: cropBottom - cropY,
+            blendX: blendLeft,
+            blendY: blendTop,
+            blendWidth: blendRight - blendLeft,
+            blendHeight: blendBottom - blendTop,
+            subdivisionGroup: region.subdivisionGroup,
+            detailBlendFeather: region.detailBlendFeather
+        )
+    }
+
+    private static func maskGridBounds(
+        _ data: Data,
+        width: Int,
+        height: Int
+    ) -> (left: Int, top: Int, right: Int, bottom: Int)? {
+        guard data.count == width * height else { return nil }
+        var left = width
+        var top = height
+        var right = -1
+        var bottom = -1
+        data.withUnsafeBytes { bytes in
+            let values = bytes.bindMemory(to: UInt8.self)
+            for y in 0..<height {
+                for x in 0..<width where values[y * width + x] >= 32 {
+                    left = min(left, x)
+                    top = min(top, y)
+                    right = max(right, x + 1)
+                    bottom = max(bottom, y + 1)
+                }
+            }
+        }
+        guard right > left, bottom > top else { return nil }
+        return (left, top, right, bottom)
     }
 
     static func expand(
@@ -87,10 +327,16 @@ enum MosaicRegionSubdivision {
         configuration: MosaicRegionSubdivisionConfiguration
     ) -> Result {
         guard configuration.maximumBlendDimension > 0,
-              configuration.splitLimit > 0,
               !regions.isEmpty
         else {
-            return Result(regions: regions, splitRegionCount: 0, addedModelCropCount: 0)
+            return Result(
+                regions: regions,
+                splitRegionCount: 0,
+                addedModelCropCount: 0,
+                subdivisionModelCropCount: 0,
+                classifiedMaskCropCount: 0,
+                zeroMaskCropCount: 0
+            )
         }
         let candidates = regions.indices.filter { index in
             max(
@@ -106,22 +352,22 @@ enum MosaicRegionSubdivision {
             return leftArea > rightArea
         }
         let selected = Set(candidates.prefix(configuration.splitLimit))
-        guard !selected.isEmpty else {
-            return Result(regions: regions, splitRegionCount: 0, addedModelCropCount: 0)
-        }
         var expanded = [MosaicRegion]()
         expanded.reserveCapacity(
             regions.count + selected.count * (3 + configuration.detailCropCount)
         )
         var added = 0
+        var subdivisionModelCropCount = 0
+        var classifiedMaskCropCount = 0
+        var zeroMaskCropCount = 0
         for (index, region) in regions.enumerated() {
-            guard selected.contains(index) else {
-                expanded.append(region)
-                continue
-            }
             let expandedMaskRegion = expandingMaskCoverage(
                 of: region, configuration: configuration
             )
+            guard selected.contains(index) else {
+                expanded.append(expandedMaskRegion)
+                continue
+            }
             let children = subdivide(
                 expandedMaskRegion,
                 configuration: configuration,
@@ -137,12 +383,49 @@ enum MosaicRegionSubdivision {
             expanded.append(contentsOf: children)
             expanded.append(contentsOf: detailCrops)
             added += children.count + detailCrops.count - 1
+            let modelCrops = children + detailCrops
+            subdivisionModelCropCount += modelCrops.count
+            for crop in modelCrops {
+                guard let containsMaskCoverage = semanticMaskContainsCoverage(crop) else {
+                    continue
+                }
+                classifiedMaskCropCount += 1
+                if !containsMaskCoverage { zeroMaskCropCount += 1 }
+            }
         }
         return Result(
             regions: expanded,
             splitRegionCount: selected.count,
-            addedModelCropCount: added
+            addedModelCropCount: added,
+            subdivisionModelCropCount: subdivisionModelCropCount,
+            classifiedMaskCropCount: classifiedMaskCropCount,
+            zeroMaskCropCount: zeroMaskCropCount
         )
+    }
+
+    /// Returns whether any static or temporal semantic mask contains coverage.
+    /// `nil` means that the crop has no valid mask data and must not be treated
+    /// as empty. This is diagnostic only: an all-zero semantic mask can still
+    /// contribute through the compositor's model-delta mask-hole recovery.
+    static func semanticMaskContainsCoverage(_ region: MosaicRegion) -> Bool? {
+        guard let maskWidth = region.maskWidth,
+              let maskHeight = region.maskHeight,
+              maskWidth > 1,
+              maskHeight > 1
+        else { return nil }
+        let expectedCount = maskWidth * maskHeight
+        var validMaskCount = 0
+        if let maskData = region.maskData, maskData.count == expectedCount {
+            validMaskCount += 1
+            if maskData.contains(where: { $0 != 0 }) { return true }
+        }
+        if let keyframes = region.maskKeyframes {
+            for keyframe in keyframes where keyframe.maskData.count == expectedCount {
+                validMaskCount += 1
+                if keyframe.maskData.contains(where: { $0 != 0 }) { return true }
+            }
+        }
+        return validMaskCount > 0 ? false : nil
     }
 
     static func expandedMask(
@@ -303,22 +586,33 @@ enum MosaicRegionSubdivision {
     static func temporallyStabilizedKeyframes(
         _ keyframes: [MosaicMaskKeyframe],
         expectedByteCount: Int,
-        radius: Int
+        radius: Int,
+        strength: Double = 0.5
     ) -> [MosaicMaskKeyframe] {
         guard radius > 0, keyframes.count > 1 else { return keyframes }
+        let boundedStrength = min(1, max(0, strength))
         return keyframes.indices.map { index in
             var output = [UInt8](keyframes[index].maskData)
             guard output.count == expectedByteCount else { return keyframes[index] }
             let lower = max(keyframes.startIndex, index - radius)
             let upper = min(keyframes.index(before: keyframes.endIndex), index + radius)
             for neighbourIndex in lower...upper where neighbourIndex != index {
+                // Radius primarily counts adjacent keyframes, but do not allow a
+                // sparse/imported manifest to union masks from an unrelated
+                // point in the motion. Two source frames per radius preserves
+                // the existing short-gap smoothing while bounding stale masks.
+                let frameDistance = abs(
+                    keyframes[neighbourIndex].frame - keyframes[index].frame
+                )
+                guard frameDistance <= radius * 2 else { continue }
                 let neighbour = [UInt8](keyframes[neighbourIndex].maskData)
                 guard neighbour.count == expectedByteCount else { continue }
                 for byteIndex in output.indices {
-                    // Keep the neighbour below the 128 expansion threshold:
-                    // it contributes alpha but does not seed another full halo.
+                    // The default 0.5 contribution stays below the 128 expansion
+                    // threshold. A recovery-only A/B may opt into a full temporal
+                    // union when fast motion otherwise leaves half-restored blocks.
                     let temporalCandidate = UInt8(
-                        clamping: Int(neighbour[byteIndex]) / 2
+                        clamping: Int(Double(neighbour[byteIndex]) * boundedStrength)
                     )
                     output[byteIndex] = max(output[byteIndex], temporalCandidate)
                 }
@@ -354,7 +648,8 @@ enum MosaicRegionSubdivision {
             temporallyStabilizedKeyframes(
                 $0,
                 expectedByteCount: maskWidth * maskHeight,
-                radius: configuration.maskTemporalRadius
+                radius: configuration.maskTemporalRadius,
+                strength: configuration.maskTemporalStrength
             )
         }
         let expandedKeyframes = stabilizedKeyframes?.compactMap { keyframe in
@@ -398,7 +693,8 @@ enum MosaicRegionSubdivision {
             maskHeight: expandedStaticMask == nil ? nil : maskHeight,
             maskData: expandedStaticMask,
             maskKeyframes: expandedKeyframes?.isEmpty == false ? expandedKeyframes : nil,
-            subdivisionGroup: region.subdivisionGroup
+            subdivisionGroup: region.subdivisionGroup,
+            detailBlendFeather: region.detailBlendFeather
         )
     }
 
@@ -506,8 +802,14 @@ enum MosaicRegionSubdivision {
         let detailHeight = min(configuration.detailCropDimension, region.effectiveBlendHeight)
         guard detailWidth > 0, detailHeight > 0 else { return [] }
 
-        let count = configuration.detailCropCount
         let focusWidth = max(1, bounds.right - bounds.left)
+        // One focused crop remains enough for compact regions. Long moving VR
+        // boundaries need a second sample point; otherwise most of the strip is
+        // still reconstructed only by the coarse subdivision grid.
+        let count = min(
+            configuration.detailCropCount,
+            focusWidth > 3 * detailWidth ? 2 : 1
+        )
         let extractionRight = region.x + region.width
         let extractionBottom = region.y + region.height
         return (0..<count).map { detailIndex in
@@ -541,7 +843,11 @@ enum MosaicRegionSubdivision {
                 blendY: detailBlendTop,
                 blendWidth: detailWidth,
                 blendHeight: detailHeight,
-                subdivisionGroup: subdivisionGroup
+                subdivisionGroup: subdivisionGroup,
+                detailBlendFeather: max(
+                    48,
+                    min(128, min(detailWidth, detailHeight) / 8)
+                )
             )
         }
     }
@@ -595,7 +901,8 @@ enum MosaicRegionSubdivision {
         blendY: Int,
         blendWidth: Int,
         blendHeight: Int,
-        subdivisionGroup: Int
+        subdivisionGroup: Int?,
+        detailBlendFeather: Int? = nil
     ) -> MosaicRegion {
         let croppedMask = region.maskData.flatMap {
             resampleMask($0, from: region, x: x, y: y, width: width, height: height)
@@ -626,7 +933,8 @@ enum MosaicRegionSubdivision {
             maskHeight: croppedMask == nil ? nil : region.maskHeight,
             maskData: croppedMask,
             maskKeyframes: croppedKeyframes?.isEmpty == false ? croppedKeyframes : nil,
-            subdivisionGroup: subdivisionGroup
+            subdivisionGroup: subdivisionGroup,
+            detailBlendFeather: detailBlendFeather
         )
     }
 
