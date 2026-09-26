@@ -380,6 +380,202 @@ kernel void deform_conv2d_fp16_jasna_gather(
     }
 }
 
+// NCHW-to-NHWC staging for the deformable-convolution input.
+// The padded tile keeps both sides of the 16x16 transpose coalesced.
+kernel void transpose_dcn_input_channel_last_fp16(
+    device const half *input [[buffer(0)]],
+    device half *output [[buffer(1)]],
+    constant DeformConvShape &s [[buffer(2)]],
+    uint2 gid [[thread_position_in_grid]],
+    uint2 lid [[thread_position_in_threadgroup]],
+    uint2 group [[threadgroup_position_in_grid]]
+) {
+    threadgroup half tile[16][17];
+    constexpr uint channels = 128;
+    uint plane = s.inputHeight * s.inputWidth;
+    uint sourceSpatial = gid.x;
+    uint sourceBatchChannel = gid.y;
+    uint n = sourceBatchChannel / channels;
+    uint channel = sourceBatchChannel % channels;
+    if (sourceSpatial < plane && n < s.batch) {
+        tile[lid.y][lid.x] = input[(n * channels + channel) * plane + sourceSpatial];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint outputSpatial = group.x * 16 + lid.y;
+    uint outputChannel = group.y * 16 + lid.x;
+    uint outputBatch = group.y / (channels / 16);
+    outputChannel %= channels;
+    if (outputSpatial < plane && outputChannel < channels && outputBatch < s.batch) {
+        output[(outputBatch * plane + outputSpatial) * channels + outputChannel]
+            = tile[lid.x][lid.y];
+    }
+}
+
+// Channel-last gather. Lanes traverse channels for a fixed kernel
+// position, turning each offset group's eight channel reads into contiguous
+// memory accesses. The gathered matrix retains the production column order.
+kernel void deform_conv2d_fp16_jasna_gather_channel_last(
+    device const half *input [[buffer(0)]],
+    device const half *offset [[buffer(1)]],
+    device const half *mask [[buffer(2)]],
+    device half *gathered [[buffer(3)]],
+    constant DeformConvShape &s [[buffer(4)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint threadsPerGroup [[threads_per_threadgroup]]
+) {
+    constexpr uint channels = 128;
+    constexpr uint kernelArea = 9;
+    constexpr uint sampleCount = channels * kernelArea;
+    constexpr uint offsetSampleCount = 16 * kernelArea;
+    uint outputPlane = s.outputHeight * s.outputWidth;
+    if (row >= s.batch * outputPlane) return;
+    uint n = row / outputPlane;
+    uint spatial = row % outputPlane;
+    uint oy = spatial / s.outputWidth;
+    uint ox = spatial % s.outputWidth;
+    uint channelsPerOffsetGroup = channels / s.offsetGroups;
+    uint offsetBase = n * 2 * s.offsetGroups * kernelArea * outputPlane;
+    uint inputPlane = s.inputHeight * s.inputWidth;
+    threadgroup int4 sampleNeighbor[offsetSampleCount];
+    threadgroup float2 sampleFraction[offsetSampleCount];
+    threadgroup float sampleMask[offsetSampleCount];
+    for (
+        uint offsetSample = tid;
+        offsetSample < offsetSampleCount;
+        offsetSample += threadsPerGroup
+    ) {
+        uint k = offsetSample % kernelArea;
+        uint ky = k / 3;
+        uint kx = k % 3;
+        uint offsetChannel = 2 * offsetSample;
+        float y = float(int(oy * s.strideHeight + ky * s.dilationHeight)
+            - int(s.padHeight))
+            + float(offset[offsetBase + offsetChannel * outputPlane + spatial]);
+        float x = float(int(ox * s.strideWidth + kx * s.dilationWidth)
+            - int(s.padWidth))
+            + float(offset[offsetBase + (offsetChannel + 1) * outputPlane + spatial]);
+        int y0 = int(floor(y));
+        int x0 = int(floor(x));
+        int y1 = y0 + 1;
+        int x1 = x0 + 1;
+        sampleNeighbor[offsetSample] = int4(
+            y0 >= 0 && y0 < int(s.inputHeight) && x0 >= 0 && x0 < int(s.inputWidth)
+                ? y0 * int(s.inputWidth) + x0 : -1,
+            y0 >= 0 && y0 < int(s.inputHeight) && x1 >= 0 && x1 < int(s.inputWidth)
+                ? y0 * int(s.inputWidth) + x1 : -1,
+            y1 >= 0 && y1 < int(s.inputHeight) && x0 >= 0 && x0 < int(s.inputWidth)
+                ? y1 * int(s.inputWidth) + x0 : -1,
+            y1 >= 0 && y1 < int(s.inputHeight) && x1 >= 0 && x1 < int(s.inputWidth)
+                ? y1 * int(s.inputWidth) + x1 : -1
+        );
+        sampleFraction[offsetSample] = float2(y - float(y0), x - float(x0));
+        sampleMask[offsetSample] = float(
+            mask[n * s.offsetGroups * kernelArea * outputPlane
+                + offsetSample * outputPlane + spatial]
+        );
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint linear = tid; linear < sampleCount; linear += threadsPerGroup) {
+        uint k = linear / channels;
+        uint ic = linear % channels;
+        uint sampleIndex = ic * kernelArea + k;
+        uint offsetGroup = ic / channelsPerOffsetGroup;
+        uint offsetSample = offsetGroup * kernelArea + k;
+        int4 neighbor = sampleNeighbor[offsetSample];
+        float2 fraction = sampleFraction[offsetSample];
+        float v00 = neighbor.x >= 0
+            ? float(input[(n * inputPlane + uint(neighbor.x)) * channels + ic]) : 0.0f;
+        float v01 = neighbor.y >= 0
+            ? float(input[(n * inputPlane + uint(neighbor.y)) * channels + ic]) : 0.0f;
+        float v10 = neighbor.z >= 0
+            ? float(input[(n * inputPlane + uint(neighbor.z)) * channels + ic]) : 0.0f;
+        float v11 = neighbor.w >= 0
+            ? float(input[(n * inputPlane + uint(neighbor.w)) * channels + ic]) : 0.0f;
+        float ly = fraction.x;
+        float lx = fraction.y;
+        float sampled = v00 * (1.0f - ly) * (1.0f - lx)
+            + v01 * (1.0f - ly) * lx
+            + v10 * ly * (1.0f - lx)
+            + v11 * ly * lx;
+        gathered[row * sampleCount + sampleIndex] = half(
+            sampled * sampleMask[offsetSample]
+        );
+    }
+}
+
+// Diagnostic-only summary of the learned sampling field. Each invocation
+// writes one temporal step's eight counters, avoiding retention/readback of
+// the full offset tensor. Positive float bit patterns preserve ordering for
+// the atomic maximum.
+kernel void summarize_dcn_offset_locality_fp16(
+    device const half *offset [[buffer(0)]],
+    device atomic_uint *statistics [[buffer(1)]],
+    constant DeformConvShape &s [[buffer(2)]],
+    constant uint &step [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    constexpr uint kernelArea = 9u;
+    constexpr uint offsetSamples = 16u * kernelArea;
+    constexpr float fixedScale = 64.0f;
+    uint plane = s.outputHeight * s.outputWidth;
+    uint count = s.batch * offsetSamples * plane;
+    if (gid >= count) return;
+    uint spatial = gid % plane;
+    uint q = gid / plane;
+    uint offsetSample = q % offsetSamples;
+    uint n = q / offsetSamples;
+    uint offsetChannel = 2u * offsetSample;
+    uint offsetBase = n * 2u * offsetSamples * plane;
+    float offY = float(offset[offsetBase + offsetChannel * plane + spatial]);
+    float offX = float(offset[offsetBase + (offsetChannel + 1u) * plane + spatial]);
+    float magnitude = max(abs(offY), abs(offX));
+    uint k = offsetSample % kernelArea;
+    uint ky = k / 3u;
+    uint kx = k % 3u;
+    uint oy = spatial / s.outputWidth;
+    uint ox = spatial % s.outputWidth;
+    float y = float(int(oy * s.strideHeight + ky * s.dilationHeight)
+        - int(s.padHeight)) + offY;
+    float x = float(int(ox * s.strideWidth + kx * s.dilationWidth)
+        - int(s.padWidth)) + offX;
+    float neighborDelta = 0.0f;
+    uint neighborCount = 0u;
+    if (ox > 0u) {
+        uint prior = spatial - 1u;
+        neighborDelta += abs(offY - float(offset[offsetBase + offsetChannel * plane + prior]));
+        neighborDelta += abs(offX - float(offset[offsetBase + (offsetChannel + 1u) * plane + prior]));
+        neighborCount += 2u;
+    }
+    if (oy > 0u) {
+        uint prior = spatial - s.outputWidth;
+        neighborDelta += abs(offY - float(offset[offsetBase + offsetChannel * plane + prior]));
+        neighborDelta += abs(offX - float(offset[offsetBase + (offsetChannel + 1u) * plane + prior]));
+        neighborCount += 2u;
+    }
+    if (neighborCount > 0u) neighborDelta /= float(neighborCount);
+
+    device atomic_uint *result = statistics + step * 8u;
+    atomic_fetch_add_explicit(&result[0], 1u, memory_order_relaxed);
+    atomic_fetch_add_explicit(
+        &result[1], uint(min(magnitude, 32.0f) * fixedScale), memory_order_relaxed
+    );
+    atomic_fetch_max_explicit(
+        &result[2], as_type<uint>(magnitude), memory_order_relaxed
+    );
+    if (magnitude > 2.0f) atomic_fetch_add_explicit(&result[3], 1u, memory_order_relaxed);
+    if (magnitude > 4.0f) atomic_fetch_add_explicit(&result[4], 1u, memory_order_relaxed);
+    if (magnitude > 8.0f) atomic_fetch_add_explicit(&result[5], 1u, memory_order_relaxed);
+    if (y < 0.0f || x < 0.0f || y > float(s.inputHeight - 1u)
+        || x > float(s.inputWidth - 1u)) {
+        atomic_fetch_add_explicit(&result[6], 1u, memory_order_relaxed);
+    }
+    atomic_fetch_add_explicit(
+        &result[7], uint(min(neighborDelta, 32.0f) * fixedScale), memory_order_relaxed
+    );
+}
+
 // Eight SIMD groups cooperatively produce a 32x64 output tile using the GPU's
 // 8x8 matrix instructions. Each weight tile feeds four row blocks before being
 // discarded. The accumulators are staged in threadgroup memory so
@@ -1026,6 +1222,9 @@ struct MosaicCompositeParams {
     uint groupX;
     uint groupY;
     uint groupWidth;
+    uint coverageMode;
+    float detailResidualLimit;
+    float maskRecoveryDeltaThreshold;
 };
 
 struct MosaicGroupResolveParams {
@@ -1033,6 +1232,7 @@ struct MosaicGroupResolveParams {
     uint groupY;
     uint groupWidth;
     uint groupHeight;
+    float detailResidualLimit;
 };
 
 inline float mosaic_sample_plane(
@@ -1095,22 +1295,43 @@ kernel void composite_fisheye_mosaic_delta(
     uint pixelY = params.regionY + gid / params.regionWidth;
 
     float4 compositeSample = compositeSamples[gid];
-    float alpha = compositeSample.z * mosaic_sample_mask(
+    float maskAlpha = mosaic_sample_mask(
         mask, params, gid % params.regionWidth, gid / params.regionWidth
     );
-    if (alpha <= 0.0f) return;
     float modelX = compositeSample.x;
     float modelY = compositeSample.y;
 
     uint plane = params.modelSize * params.modelSize;
+    float3 restoredColor;
+    float3 originalColor;
+    for (uint rgbChannel = 0u; rgbChannel < 3u; ++rgbChannel) {
+        uint offset = rgbChannel * plane;
+        restoredColor[rgbChannel] = mosaic_sample_plane(
+            restored, offset, params.modelSize, modelX, modelY
+        );
+        originalColor[rgbChannel] = mosaic_sample_plane(
+            original, offset, params.modelSize, modelX, modelY
+        );
+    }
+    if (params.coverageMode == 3u) {
+        float3 delta = restoredColor - originalColor;
+        float deltaStrength = max(abs(delta.x), max(abs(delta.y), abs(delta.z)));
+        float threshold = params.maskRecoveryDeltaThreshold;
+        float recoveredMask = smoothstep(threshold, threshold * 2.5f, deltaStrength);
+        maskAlpha = max(maskAlpha, recoveredMask);
+    }
+    float alpha = compositeSample.z * maskAlpha;
+    if (alpha <= 0.0f) return;
     uint destination = 4u * (pixelY * params.frameWidth + pixelX);
     for (uint bgraChannel = 0u; bgraChannel < 3u; ++bgraChannel) {
         uint rgbChannel = 2u - bgraChannel;
-        uint offset = rgbChannel * plane;
         float base = float(bgra[destination + bgraChannel]) / 255.0f;
-        float value = base
-            + mosaic_sample_plane(restored, offset, params.modelSize, modelX, modelY)
-            - mosaic_sample_plane(original, offset, params.modelSize, modelX, modelY);
+        float detail = clamp(
+            base - originalColor[rgbChannel],
+            -params.detailResidualLimit,
+            params.detailResidualLimit
+        );
+        float value = restoredColor[rgbChannel] + detail;
         float restoredByte = clamp(value, 0.0f, 1.0f) * 255.0f;
         float blended = float(bgra[destination + bgraChannel]) * (1.0f - alpha)
             + restoredByte * alpha;
@@ -1134,25 +1355,53 @@ kernel void composite_fisheye_mosaic_delta_texture(
         params.regionY + gid / params.regionWidth
     );
     float4 compositeSample = compositeSamples[gid];
-    float alpha = compositeSample.z * mosaic_sample_mask(
+    float maskAlpha = mosaic_sample_mask(
         mask, params, gid % params.regionWidth, gid / params.regionWidth
     );
-    if (alpha <= 0.0f) return;
 
     float4 color = frame.read(position);
     uint plane = params.modelSize * params.modelSize;
+    float3 restoredColor;
+    float3 originalColor;
     for (uint rgbChannel = 0u; rgbChannel < 3u; ++rgbChannel) {
         uint offset = rgbChannel * plane;
-        float value = color[rgbChannel]
-            + mosaic_sample_plane(
-                restored, offset, params.modelSize, compositeSample.x, compositeSample.y
-            )
-            - mosaic_sample_plane(
-                original, offset, params.modelSize, compositeSample.x, compositeSample.y
-            );
+        restoredColor[rgbChannel] = mosaic_sample_plane(
+            restored, offset, params.modelSize, compositeSample.x, compositeSample.y
+        );
+        originalColor[rgbChannel] = mosaic_sample_plane(
+            original, offset, params.modelSize, compositeSample.x, compositeSample.y
+        );
+    }
+    if (params.coverageMode == 3u) {
+        float3 delta = restoredColor - originalColor;
+        float deltaStrength = max(abs(delta.x), max(abs(delta.y), abs(delta.z)));
+        float threshold = params.maskRecoveryDeltaThreshold;
+        float recoveredMask = smoothstep(threshold, threshold * 2.5f, deltaStrength);
+        maskAlpha = max(maskAlpha, recoveredMask);
+    }
+    float alpha = compositeSample.z * maskAlpha;
+    if (alpha <= 0.0f) return;
+    for (uint rgbChannel = 0u; rgbChannel < 3u; ++rgbChannel) {
+        float detail = clamp(
+            color[rgbChannel] - originalColor[rgbChannel],
+            -params.detailResidualLimit,
+            params.detailResidualLimit
+        );
+        float value = restoredColor[rgbChannel] + detail;
         color[rgbChannel] = mix(color[rgbChannel], clamp(value, 0.0f, 1.0f), alpha);
     }
     frame.write(color, position);
+}
+
+kernel void clear_fisheye_mosaic_group(
+    device float4 *accumulator [[buffer(0)]],
+    device float *coverage [[buffer(1)]],
+    device half4 *restoredAccumulator [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    accumulator[gid] = float4(0.0f);
+    coverage[gid] = 0.0f;
+    restoredAccumulator[gid] = half4(half(0.0f));
 }
 
 kernel void accumulate_fisheye_mosaic_delta(
@@ -1162,6 +1411,8 @@ kernel void accumulate_fisheye_mosaic_delta(
     device const float4 *compositeSamples [[buffer(3)]],
     device const uchar *mask [[buffer(4)]],
     constant MosaicCompositeParams &params [[buffer(5)]],
+    device float *coverage [[buffer(6)]],
+    device half4 *restoredAccumulator [[buffer(7)]],
     uint gid [[thread_position_in_grid]]
 ) {
     uint regionPixels = params.regionWidth * params.regionHeight;
@@ -1171,29 +1422,48 @@ kernel void accumulate_fisheye_mosaic_delta(
     uint pixelX = params.regionX + localX;
     uint pixelY = params.regionY + localY;
     float4 compositeSample = compositeSamples[gid];
-    float alpha = compositeSample.z * mosaic_sample_mask(
-        mask, params, localX, localY
-    );
-    if (alpha <= 0.0f) return;
+    float maskAlpha = mosaic_sample_mask(mask, params, localX, localY);
+    float alpha = compositeSample.z * (params.coverageMode == 2u ? 1.0f : maskAlpha);
+    if (alpha <= 0.0f && params.coverageMode != 3u) return;
     uint plane = params.modelSize * params.modelSize;
     float3 delta;
+    float3 restoredColor;
     for (uint rgbChannel = 0u; rgbChannel < 3u; ++rgbChannel) {
         uint offset = rgbChannel * plane;
-        delta[rgbChannel] = mosaic_sample_plane(
+        restoredColor[rgbChannel] = mosaic_sample_plane(
             restored, offset, params.modelSize, compositeSample.x, compositeSample.y
-        ) - mosaic_sample_plane(
+        );
+        delta[rgbChannel] = restoredColor[rgbChannel] - mosaic_sample_plane(
             original, offset, params.modelSize, compositeSample.x, compositeSample.y
         );
     }
+    if (params.coverageMode == 3u) {
+        float deltaStrength = max(abs(delta.x), max(abs(delta.y), abs(delta.z)));
+        float threshold = params.maskRecoveryDeltaThreshold;
+        float recoveredMask = smoothstep(threshold, threshold * 2.5f, deltaStrength);
+        alpha = compositeSample.z * max(maskAlpha, recoveredMask);
+    }
+    if (alpha <= 0.0f) return;
     uint destination = (pixelY - params.groupY) * params.groupWidth
         + pixelX - params.groupX;
     accumulator[destination] += float4(delta * alpha, alpha);
+    restoredAccumulator[destination] += half4(half3(restoredColor * alpha), half(alpha));
+    if (params.coverageMode == 1u || params.coverageMode == 3u) {
+        coverage[destination] += alpha;
+    } else if (params.coverageMode == 2u) {
+        // A high-detail crop may fill a hole left by the moving primary mask,
+        // but must not stack opacity and reveal its rectangular footprint.
+        // Its own deep spatial feather bounds this contribution.
+        coverage[destination] = max(coverage[destination], alpha);
+    }
 }
 
 kernel void resolve_fisheye_mosaic_delta_group_texture(
     texture2d<float, access::read_write> frame [[texture(0)]],
     device const float4 *accumulator [[buffer(0)]],
-    constant MosaicGroupResolveParams &params [[buffer(1)]],
+    device const float *coverage [[buffer(1)]],
+    device const half4 *restoredAccumulator [[buffer(2)]],
+    constant MosaicGroupResolveParams &params [[buffer(3)]],
     uint gid [[thread_position_in_grid]]
 ) {
     uint groupPixels = params.groupWidth * params.groupHeight;
@@ -1205,11 +1475,22 @@ kernel void resolve_fisheye_mosaic_delta_group_texture(
         params.groupY + gid / params.groupWidth
     );
     float4 color = frame.read(position);
-    float visibleAlpha = min(accumulated.w, 1.0f);
-    color.rgb = clamp(
-        color.rgb + accumulated.rgb / accumulated.w * visibleAlpha,
-        0.0f,
-        1.0f
+    // Detail crops refine the normalized delta and may fill primary-mask holes
+    // using maximum (rather than additive) feathered coverage.
+    float visibleAlpha = min(coverage[gid], 1.0f);
+    float3 averageDelta = accumulated.rgb / accumulated.w;
+    float3 averageRestored = float3(restoredAccumulator[gid].rgb)
+        / max(float(restoredAccumulator[gid].w), 0.0001f);
+    float3 averageOriginal = averageRestored - averageDelta;
+    float3 detail = clamp(
+        color.rgb - averageOriginal,
+        -params.detailResidualLimit,
+        params.detailResidualLimit
+    );
+    color.rgb = mix(
+        color.rgb,
+        clamp(averageRestored + detail, 0.0f, 1.0f),
+        visibleAlpha
     );
     frame.write(color, position);
 }

@@ -343,6 +343,37 @@ private func benchmark(
 
 func runJasnaCLI() async throws {
     let commandLine = JasnaCommandLine()
+    // Generated application-path diagnostic: no normal Metal runner, models,
+    // detector, video decode, restoration graph, compositor, or encoder.
+    if let index = commandLine.index(of: .syntheticCropExtractionAB) {
+        guard commandLine.arguments.indices.contains(index + 1) else {
+            throw DeformConvError.commandFailed(
+                "--synthetic-crop-extraction-ab requires a new report path"
+            )
+        }
+        try runSyntheticCropExtractionAB(
+            reportURL: URL(fileURLWithPath: commandLine.arguments[index + 1])
+        )
+        return
+    }
+    // Load diagnostics must not initialize the normal runner, shader kernels,
+    // or tensor-allocation smoke test before the measurements begin.
+    if let index = commandLine.index(of: .metalMLLoadOnly) {
+        guard #available(macOS 27.0, *) else {
+            throw DeformConvError.commandFailed("Metal ML load-only requires macOS 27")
+        }
+        try runMetalMLLoadOnly(commandLine: commandLine, index: index)
+        return
+    }
+    // Generated production-graph lifecycle diagnostic: this uses the real
+    // batch-2 graph and weights, but no video, detector, compositor, or encoder.
+    if let index = commandLine.index(of: .metalMLGraphLifecycle) {
+        guard #available(macOS 27.0, *) else {
+            throw DeformConvError.commandFailed("Metal ML graph lifecycle requires macOS 27")
+        }
+        try runMetalMLGraphLifecycle(commandLine: commandLine, index: index)
+        return
+    }
     let runner = try MetalDeformConv()
     print("Metal device: \(runner.device.name)")
     print("Metal ML tensor family available: \(runner.device.supportsFamily(.apple7) ? "yes" : "no")")
@@ -736,6 +767,8 @@ func runJasnaCLI() async throws {
         print("Metal ML package: \(packageURL.lastPathComponent)")
         print("Median:     \(String(format: "%.3f", result.medianMilliseconds)) ms")
         print("Best:       \(String(format: "%.3f", result.minimumMilliseconds)) ms")
+        print("Wall median: \(String(format: "%.3f", result.wallMedianMilliseconds)) ms")
+        print("Wall best:   \(String(format: "%.3f", result.wallMinimumMilliseconds)) ms")
         print("Iterations: \(result.iterations)")
     }
     try await commandLine.dispatch(.metalMLInterop) { interopIndex in
@@ -752,6 +785,117 @@ func runJasnaCLI() async throws {
         print("Maximum error:    \(result.maximumError)")
         print("Model output max: \(result.baselineMaximum)")
         print("Model checksum:   \(String(format: "%.6f", result.baselineChecksum))")
+    }
+    try await commandLine.dispatch(.coreMLComparison) { comparisonIndex in
+        guard commandLine.arguments.indices.contains(comparisonIndex + 2) else {
+            throw DeformConvError.commandFailed(
+                "--core-ml-comparison requires CoreML and MetalML directories"
+            )
+        }
+        let iterations = commandLine.arguments.indices.contains(comparisonIndex + 3)
+            ? Int(commandLine.arguments[comparisonIndex + 3]) ?? 10
+            : 10
+        guard iterations > 0 else { throw DeformConvError.invalidShape }
+        let coreMLDirectory = URL(
+            fileURLWithPath: commandLine.arguments[comparisonIndex + 1], isDirectory: true
+        )
+        let metalMLDirectory = URL(
+            fileURLWithPath: commandLine.arguments[comparisonIndex + 2], isDirectory: true
+        )
+        print("Direct Core ML versus Metal ML microbenchmark")
+        print("Iterations: \(iterations) after two warm-up predictions")
+        let coreResults = try benchmarkCoreMLComparison(
+            coreMLDirectory: coreMLDirectory,
+            iterations: iterations
+        )
+        for result in coreResults {
+            print("Core ML package: \(result.package)")
+            print("  Compile: \(String(format: "%.3f", result.compileMilliseconds)) ms")
+            for policy in result.policies {
+                print("  \(policy.policy):")
+                print("    Load:       \(String(format: "%.3f", policy.loadMilliseconds)) ms")
+                print("    First:      \(String(format: "%.3f", policy.firstPredictionMilliseconds)) ms")
+                print("    Warm median: \(String(format: "%.3f", policy.statistics.median)) ms")
+                print("    Warm P10–P90: \(String(format: "%.3f–%.3f", policy.statistics.percentile10, policy.statistics.percentile90)) ms")
+                print("    Max delta:  \(policy.maximumDifferenceFromAll)")
+                print("    Checksum:   \(String(format: "%.6f", policy.checksum))")
+            }
+        }
+        print("Metal ML comparison (same converted packages)")
+        var metalResults = [String: MetalMLBenchmarkResult]()
+        for package in coreMLComparisonPackageNames() {
+            let url = metalMLDirectory.appendingPathComponent("\(package).mtlpackage")
+            let result = try benchmarkMetalMLPackage(
+                device: runner.device, packageURL: url, iterations: iterations
+            )
+            metalResults[package] = result
+            print("Metal ML package: \(package)")
+            print("  GPU median: \(String(format: "%.3f", result.medianMilliseconds)) ms")
+            print("  GPU best:   \(String(format: "%.3f", result.minimumMilliseconds)) ms")
+            print("  Wall median: \(String(format: "%.3f", result.wallMedianMilliseconds)) ms")
+            print("  Wall best:   \(String(format: "%.3f", result.wallMinimumMilliseconds)) ms")
+        }
+        print("Isolated warm-inference summary")
+        for core in coreResults {
+            guard let direct = core.policies.first(where: { $0.policy == "all" }),
+                  let metal = metalResults[core.package]
+            else { continue }
+            let ratio = direct.statistics.median / metal.wallMedianMilliseconds
+            let difference = abs(ratio - 1) * 100
+            let comparison = ratio < 1 ? "Core ML faster" : "Metal ML faster"
+            let gate = ratio <= 0.85 ? "CANDIDATE" : "KEEP METAL ML"
+            print(
+                "  \(core.package): \(comparison) by "
+                    + "\(String(format: "%.1f", difference))% — \(gate)"
+            )
+        }
+    }
+    try await commandLine.dispatch(.coreMLSPyNet) { spynetIndex in
+        guard commandLine.arguments.indices.contains(spynetIndex + 3) else {
+            throw DeformConvError.commandFailed(
+                "--core-ml-spynet requires CoreML, MetalML, and SPyNetOracle directories"
+            )
+        }
+        let iterations = commandLine.arguments.indices.contains(spynetIndex + 4)
+            ? Int(commandLine.arguments[spynetIndex + 4]) ?? 7
+            : 7
+        guard iterations > 0 else { throw DeformConvError.invalidShape }
+        let coreMLDirectory = URL(
+            fileURLWithPath: commandLine.arguments[spynetIndex + 1], isDirectory: true
+        )
+        let metalMLDirectory = URL(
+            fileURLWithPath: commandLine.arguments[spynetIndex + 2], isDirectory: true
+        )
+        let oracleDirectory = URL(
+            fileURLWithPath: commandLine.arguments[spynetIndex + 3], isDirectory: true
+        )
+        let metal = try verifySPyNetPair(
+            device: runner.device,
+            modelsURL: metalMLDirectory,
+            oracleURL: oracleDirectory
+        )
+        let core = try benchmarkCoreMLSPyNetInterop(
+            device: runner.device,
+            coreMLDirectory: coreMLDirectory,
+            oracleURL: oracleDirectory,
+            metalMLBackward: metal.backwardFlow,
+            metalMLForward: metal.forwardFlow,
+            iterations: iterations
+        )
+        let ratio = core.statistics.median / metal.wallMedianMilliseconds
+        print("Complete six-level bidirectional SPyNet interop: PASS")
+        print("Core ML execution: retained ANE models + shared FP16 buffers + custom Metal warps")
+        print("Core ML compile/load: \(String(format: "%.3f", core.compileAndLoadMilliseconds)) ms")
+        print("Core ML wall median: \(String(format: "%.3f", core.statistics.median)) ms")
+        print("Core ML P10–P90:     \(String(format: "%.3f–%.3f", core.statistics.percentile10, core.statistics.percentile90)) ms")
+        print("Metal ML GPU median: \(String(format: "%.3f", metal.medianMilliseconds)) ms")
+        print("Metal ML wall median: \(String(format: "%.3f", metal.wallMedianMilliseconds)) ms")
+        print("Core/Metal wall ratio: \(String(format: "%.3f", ratio))×")
+        print("Repeat max error:    \(core.repeatMaximumError)")
+        print("Metal ML max error:  \(core.metalMLMaximumError)")
+        print("PyTorch max error:   \(core.oracleMaximumError)")
+        print("Flow checksums:      \(String(format: "%.6f", core.backwardChecksum)) / \(String(format: "%.6f", core.forwardChecksum))")
+        print("Promotion gate:      \(ratio <= 0.85 ? "PASS" : "REJECT")")
     }
     try await commandLine.dispatch(.coreAIFeatureExtract) { coreAIIndex in
         guard commandLine.arguments.indices.contains(coreAIIndex + 1) else {
@@ -1442,25 +1586,87 @@ func runJasnaCLI() async throws {
         let batch = commandLine.arguments.indices.contains(productionIndex + 4)
             ? Int(commandLine.arguments[productionIndex + 4]) ?? 1 : 1
         guard batch > 0 else { throw DeformConvError.invalidShape }
-        let inputFrames = (0..<frameCount).map { frame in
+        let configuredInputOffset = Int(
+            ProcessInfo.processInfo.environment["JASNA_SINGLE_RUN_INPUT_OFFSET"] ?? ""
+        ) ?? 0
+        func syntheticFrames(offset: Int) -> [[Float16]] {
+            (0..<frameCount).map { frame in
             (0..<batch).flatMap { sample in
-                makeJasnaSyntheticFrame(index: frame + sample * frameCount)
+                    makeJasnaSyntheticFrame(
+                        index: offset + frame + sample * frameCount
+                    )
+                }
             }
         }
-        let fused = try verifyFusedFourPassRecurrence(
-            device: runner.device,
-            modelsURL: modelsURL,
-            weightsURL: weightsURL,
-            backwardFlows: [],
-            forwardFlows: [],
-            inputFrames: inputFrames,
-            stagedBranchFrames: [],
-            stagedRestoredFrames: [],
-            warmupCount: 0,
-            measurementCount: 1,
-            collectDiagnostics: batch == 1,
-            batch: batch
+        let inputFrames = syntheticFrames(offset: configuredInputOffset)
+        let repeatCount = max(
+            1,
+            Int(ProcessInfo.processInfo.environment["JASNA_SINGLE_RUN_REPEATS"] ?? "") ?? 1
         )
+        let alternateInput = ProcessInfo.processInfo.environment[
+            "JASNA_SINGLE_RUN_ALTERNATE_INPUT"
+        ] == "1"
+        var runs = [FusedFourPassRecurrenceResult]()
+        var wallSamples = [Double]()
+        for runIndex in 0..<repeatCount {
+            let started = ContinuousClock.now
+            let runInputFrames = alternateInput && runIndex > 0
+                ? syntheticFrames(offset: configuredInputOffset + 1)
+                : inputFrames
+            runs.append(try verifyFusedFourPassRecurrence(
+                device: runner.device,
+                modelsURL: modelsURL,
+                weightsURL: weightsURL,
+                backwardFlows: [],
+                forwardFlows: [],
+                inputFrames: runInputFrames,
+                stagedBranchFrames: [],
+                stagedRestoredFrames: [],
+                warmupCount: 0,
+                measurementCount: 1,
+                collectDiagnostics: batch == 1 && repeatCount == 1,
+                batch: batch
+            ))
+            let elapsed = started.duration(to: .now).components
+            wallSamples.append(
+                Double(elapsed.seconds) * 1_000
+                    + Double(elapsed.attoseconds) / 1_000_000_000_000_000
+            )
+        }
+        guard let fused = runs.first else { throw DeformConvError.invalidShape }
+        let outputHashes = runs.map { run -> String in
+            var hash: UInt64 = 14_695_981_039_346_656_037
+            for value in run.restoredFrames.joined() {
+                var bits = value.bitPattern.littleEndian
+                withUnsafeBytes(of: &bits) { bytes in
+                    for byte in bytes {
+                        hash ^= UInt64(byte)
+                        hash &*= 1_099_511_628_211
+                    }
+                }
+            }
+            return String(format: "%016llx", hash)
+        }
+        var retainedGraphMaximumError: Float = 0
+        if runs.count > 1 {
+            let referenceRun = alternateInput && runs.count > 2 ? runs[1] : fused
+            let repeatedRun = runs.last!
+            for (firstFrame, lastFrame) in zip(
+                referenceRun.restoredFrames, repeatedRun.restoredFrames
+            ) {
+                for (first, repeated) in zip(firstFrame, lastFrame) {
+                    retainedGraphMaximumError = max(
+                        retainedGraphMaximumError,
+                        abs(Float(first) - Float(repeated))
+                    )
+                }
+            }
+            guard retainedGraphMaximumError <= 0.001 else {
+                throw DeformConvError.commandFailed(
+                    "retained graph output changed by \(retainedGraphMaximumError)"
+                )
+            }
+        }
         var batchReferenceMaximumError: Float?
         if batch > 1, commandLine.arguments.indices.contains(productionIndex + 5) {
             let referenceModelsURL = URL(
@@ -1508,6 +1714,11 @@ func runJasnaCLI() async throws {
         print("Production single-run \(frameCount)-frame graph: PASS")
         print("Batch:              \(batch)")
         print("GPU timeline:       \(String(format: "%.3f", fused.statistics.median)) ms")
+        if repeatCount > 1 {
+            print("Wall samples:       \(wallSamples.map { String(format: "%.3f", $0) }.joined(separator: " / ")) ms")
+            print("Retained max error: \(retainedGraphMaximumError)")
+        }
+        print("Output hashes:      \(outputHashes.joined(separator: " / "))")
         print("Executions:         \(fused.statistics.samples.count)")
         print("Restored frames:    \(fused.restoredFrames.count)")
         print("Output elements:    \(fused.restoredFrames.reduce(0) { $0 + $1.count })")

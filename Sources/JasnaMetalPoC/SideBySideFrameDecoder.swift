@@ -11,6 +11,8 @@ extension SideBySideRestoration {
         >
         private let dimensions: VideoDimensions
         private let cropX: Int
+        private let primaryPool: CVPixelBufferPool
+        private let secondaryPool: CVPixelBufferPool
         private var previous: CMReadySampleBuffer<CMSampleBuffer.DynamicContent>?
         private var next: CMReadySampleBuffer<CMSampleBuffer.DynamicContent>?
 
@@ -18,8 +20,10 @@ extension SideBySideRestoration {
             inputURL: URL,
             plan: SideBySideVideoPlan,
             sourceDimensions: VideoDimensions? = nil,
-            cropX: Int = 0
+            cropX: Int = 0,
+            startOutputIndex: Int = 0
         ) async throws {
+            guard startOutputIndex >= 0 else { throw DeformConvError.invalidShape }
             let asset = AVURLAsset(url: inputURL)
             guard let track = try await asset.loadTracks(withMediaType: .video).first else {
                 throw DeformConvError.commandFailed("video has no video track")
@@ -38,6 +42,22 @@ extension SideBySideRestoration {
                 )
             }
             reader = try AVAssetReader(asset: asset)
+            if startOutputIndex > 0 {
+                let assetDuration = try await asset.load(.duration)
+                let startTime = CMTime(
+                    value: CMTimeValue(startOutputIndex),
+                    timescale: CMTimeScale(SideBySideVideoPlan.outputFramesPerSecond)
+                )
+                guard CMTimeCompare(startTime, assetDuration) < 0 else {
+                    throw DeformConvError.commandFailed(
+                        "decoder start frame \(startOutputIndex) is outside the source"
+                    )
+                }
+                reader.timeRange = CMTimeRange(
+                    start: startTime,
+                    duration: CMTimeSubtract(assetDuration, startTime)
+                )
+            }
             let output = AVAssetReaderTrackOutput(
                 track: track,
                 outputSettings: [
@@ -47,6 +67,8 @@ extension SideBySideRestoration {
             )
             dimensions = plan.dimensions
             self.cropX = cropX
+            primaryPool = try Self.makeBGRAPool(dimensions: plan.dimensions)
+            secondaryPool = try Self.makeBGRAPool(dimensions: plan.dimensions)
             guard reader.canAdd(output) else {
                 throw DeformConvError.commandFailed("video reader rejected BGRA output")
             }
@@ -58,6 +80,45 @@ extension SideBySideRestoration {
         deinit { reader.cancelReading() }
 
         func copyFrame(outputIndex: Int) async throws -> CVPixelBuffer {
+            let source = try await sourceFrame(outputIndex: outputIndex)
+            var copiedFrame: CVPixelBuffer?
+            try source.withUnsafeBuffer {
+                copiedFrame = try Self.copyBGRA(
+                    $0,
+                    dimensions: dimensions,
+                    cropX: cropX,
+                    pool: primaryPool
+                )
+            }
+            guard let copiedFrame else {
+                throw DeformConvError.commandFailed("decoded frame copy was not created")
+            }
+            return copiedFrame
+        }
+
+        func copyStereoFrames(outputIndex: Int) async throws -> (
+            left: CVPixelBuffer, right: CVPixelBuffer
+        ) {
+            let source = try await sourceFrame(outputIndex: outputIndex)
+            var left: CVPixelBuffer?
+            var right: CVPixelBuffer?
+            try source.withUnsafeBuffer {
+                let pair = try Self.copyStereoBGRA(
+                    $0,
+                    dimensions: dimensions,
+                    leftPool: primaryPool,
+                    rightPool: secondaryPool
+                )
+                left = pair.left
+                right = pair.right
+            }
+            guard let left, let right else {
+                throw DeformConvError.commandFailed("decoded stereo frame copies were not created")
+            }
+            return (left, right)
+        }
+
+        private func sourceFrame(outputIndex: Int) async throws -> CVReadOnlyPixelBuffer {
             let target = CMTime(value: CMTimeValue(outputIndex), timescale: 30)
             while let candidate = next,
                   CMTimeCompare(candidate.presentationTimeStamp, target) < 0 {
@@ -80,14 +141,7 @@ extension SideBySideRestoration {
             guard case .pixelBuffer(let source) = sample.content else {
                 throw DeformConvError.commandFailed("decoded video sample has no pixel buffer")
             }
-            var copiedFrame: CVPixelBuffer?
-            try source.withUnsafeBuffer {
-                copiedFrame = try Self.copyBGRA($0, dimensions: dimensions, cropX: cropX)
-            }
-            guard let copiedFrame else {
-                throw DeformConvError.commandFailed("decoded frame copy was not created")
-            }
-            return copiedFrame
+            return source
         }
 
         private static func closest(
@@ -106,24 +160,46 @@ extension SideBySideRestoration {
             return priorDistance <= nextDistance ? previous : next
         }
 
-        private static func copyBGRA(
-            _ source: CVPixelBuffer, dimensions: VideoDimensions, cropX: Int
+        private static func makeBGRAPool(
+            dimensions: VideoDimensions
+        ) throws -> CVPixelBufferPool {
+            let attributes = [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                kCVPixelBufferWidthKey as String: dimensions.width,
+                kCVPixelBufferHeightKey as String: dimensions.height,
+                kCVPixelBufferMetalCompatibilityKey as String: true,
+                kCVPixelBufferIOSurfacePropertiesKey as String: [:],
+            ] as CFDictionary
+            var optionalPool: CVPixelBufferPool?
+            let status = CVPixelBufferPoolCreate(
+                nil, nil, attributes, &optionalPool
+            )
+            guard status == kCVReturnSuccess, let pool = optionalPool else {
+                throw DeformConvError.commandFailed("failed creating decoded frame pool")
+            }
+            return pool
+        }
+
+        private static func makeBGRAFrame(
+            from pool: CVPixelBufferPool
         ) throws -> CVPixelBuffer {
             var optionalDestination: CVPixelBuffer?
-            let status = CVPixelBufferCreate(
-                nil,
-                dimensions.width,
-                dimensions.height,
-                kCVPixelFormatType_32BGRA,
-                [
-                    kCVPixelBufferMetalCompatibilityKey as String: true,
-                    kCVPixelBufferIOSurfacePropertiesKey as String: [:],
-                ] as CFDictionary,
-                &optionalDestination
+            let status = CVPixelBufferPoolCreatePixelBuffer(
+                nil, pool, &optionalDestination
             )
             guard status == kCVReturnSuccess, let destination = optionalDestination else {
                 throw DeformConvError.commandFailed("failed allocating decoded frame copy")
             }
+            return destination
+        }
+
+        private static func copyBGRA(
+            _ source: CVPixelBuffer,
+            dimensions: VideoDimensions,
+            cropX: Int,
+            pool: CVPixelBufferPool
+        ) throws -> CVPixelBuffer {
+            let destination = try makeBGRAFrame(from: pool)
             CVPixelBufferLockBaseAddress(source, .readOnly)
             CVPixelBufferLockBaseAddress(destination, [])
             defer {
@@ -144,6 +220,44 @@ extension SideBySideRestoration {
             }
             CVBufferPropagateAttachments(source, destination)
             return destination
+        }
+
+        private static func copyStereoBGRA(
+            _ source: CVPixelBuffer,
+            dimensions: VideoDimensions,
+            leftPool: CVPixelBufferPool,
+            rightPool: CVPixelBufferPool
+        ) throws -> (left: CVPixelBuffer, right: CVPixelBuffer) {
+            let left = try makeBGRAFrame(from: leftPool)
+            let right = try makeBGRAFrame(from: rightPool)
+            CVPixelBufferLockBaseAddress(source, .readOnly)
+            CVPixelBufferLockBaseAddress(left, [])
+            CVPixelBufferLockBaseAddress(right, [])
+            defer {
+                CVPixelBufferUnlockBaseAddress(right, [])
+                CVPixelBufferUnlockBaseAddress(left, [])
+                CVPixelBufferUnlockBaseAddress(source, .readOnly)
+            }
+            guard let sourceBase = CVPixelBufferGetBaseAddress(source),
+                  let leftBase = CVPixelBufferGetBaseAddress(left),
+                  let rightBase = CVPixelBufferGetBaseAddress(right)
+            else { throw DeformConvError.commandFailed("decoded frame is not CPU accessible") }
+            let sourceRowBytes = CVPixelBufferGetBytesPerRow(source)
+            let leftRowBytes = CVPixelBufferGetBytesPerRow(left)
+            let rightRowBytes = CVPixelBufferGetBytesPerRow(right)
+            let eyeBytes = dimensions.width * 4
+            for row in 0..<dimensions.height {
+                let sourceRow = sourceBase.advanced(by: row * sourceRowBytes)
+                memcpy(leftBase.advanced(by: row * leftRowBytes), sourceRow, eyeBytes)
+                memcpy(
+                    rightBase.advanced(by: row * rightRowBytes),
+                    sourceRow.advanced(by: eyeBytes),
+                    eyeBytes
+                )
+            }
+            CVBufferPropagateAttachments(source, left)
+            CVBufferPropagateAttachments(source, right)
+            return (left, right)
         }
     }
 }

@@ -55,7 +55,12 @@ LEFT_DONE="$WORK_DIR/left.done"
 RIGHT_DONE="$WORK_DIR/right.done"
 LEFT_WORK_DIR="${JASNA_LEFT_WORK_DIR:-$WORK_DIR/left.jasna-work}"
 RIGHT_WORK_DIR="${JASNA_RIGHT_WORK_DIR:-$WORK_DIR/right.jasna-work}"
-VIDEO_BITRATE="${JASNA_VR_BITRATE:-40000000}"
+SOURCE_VIDEO_BITRATE="$(/usr/bin/python3 "$ROOT_DIR/tools/source_video_bitrate.py" "$FFPROBE_PATH" "$INPUT_PATH")" || exit 1
+VIDEO_BITRATE="${JASNA_VR_BITRATE:-$SOURCE_VIDEO_BITRATE}"
+[[ "$VIDEO_BITRATE" =~ ^[0-9]+$ ]] && (( VIDEO_BITRATE > 0 )) || {
+  echo "error: JASNA_VR_BITRATE must be a positive integer bit rate" >&2
+  exit 1
+}
 
 mkdir -p "$WORK_DIR" "$LEFT_WORK_DIR" "$RIGHT_WORK_DIR"
 exec > >(/usr/bin/tee -a "$LOG_PATH") 2>&1
@@ -64,6 +69,7 @@ echo
 echo "===== Jasna sequential-eye VR restoration $(date -u '+%Y-%m-%dT%H:%M:%SZ') ====="
 echo "Input:      $INPUT_PATH"
 echo "Output:     $OUTPUT_PATH"
+echo "Source video bitrate: $SOURCE_VIDEO_BITRATE bps; SBS target: $VIDEO_BITRATE bps"
 echo "Work dir:   $WORK_DIR"
 echo "Left cache: $LEFT_WORK_DIR"
 echo "Right cache:$RIGHT_WORK_DIR"
@@ -105,7 +111,7 @@ fi
 
 if [[ ! -f "$LEFT_DONE" ]]; then
   echo "Stage 1/3: restoring left eye"
-  JASNA_WORK_DIR="$LEFT_WORK_DIR" \
+  JASNA_VIDEO_BITRATE="$((VIDEO_BITRATE / 2))" JASNA_WORK_DIR="$LEFT_WORK_DIR" \
     "$ROOT_DIR/script/build_and_run.sh" --restore-sbs-eye \
       "$INPUT_PATH" left "$LEFT_OUTPUT"
   [[ -s "$LEFT_OUTPUT" ]] || {
@@ -123,7 +129,7 @@ fi
 
 if [[ ! -f "$RIGHT_DONE" ]]; then
   echo "Stage 2/3: restoring right eye"
-  JASNA_WORK_DIR="$RIGHT_WORK_DIR" \
+  JASNA_VIDEO_BITRATE="$((VIDEO_BITRATE / 2))" JASNA_WORK_DIR="$RIGHT_WORK_DIR" \
     "$ROOT_DIR/script/build_and_run.sh" --restore-sbs-eye \
       "$INPUT_PATH" right "$RIGHT_OUTPUT"
   [[ -s "$RIGHT_OUTPUT" ]] || {

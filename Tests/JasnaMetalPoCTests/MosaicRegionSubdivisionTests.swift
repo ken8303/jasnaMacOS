@@ -11,6 +11,7 @@ private let subdivisionConfiguration = MosaicRegionSubdivisionConfiguration(
     maskFeatherFraction: 0.025,
     blockResidualGrowthFraction: 0.04,
     maskTemporalRadius: 1,
+    maskTemporalStrength: 0.5,
     detailCropDimension: 576,
     detailCropCount: 1
 )
@@ -94,6 +95,74 @@ private let subdivisionConfiguration = MosaicRegionSubdivisionConfiguration(
     #expect(!result.regions.contains(largest))
 }
 
+@Test func semanticMaskOccupancyIsConservativeAcrossStaticAndTemporalMasks() {
+    let noMask = MosaicRegion(
+        startFrame: 0, endFrame: 3, x: 0, y: 0,
+        width: 64, height: 64, confidence: 1
+    )
+    let zeroMask = MosaicRegion(
+        startFrame: 0, endFrame: 3, x: 0, y: 0,
+        width: 64, height: 64, confidence: 1,
+        maskWidth: 2, maskHeight: 2,
+        maskData: Data(repeating: 0, count: 4),
+        maskKeyframes: [
+            MosaicMaskKeyframe(frame: 0, maskData: Data(repeating: 0, count: 4)),
+        ]
+    )
+    let temporalCoverage = MosaicRegion(
+        startFrame: 0, endFrame: 3, x: 0, y: 0,
+        width: 64, height: 64, confidence: 1,
+        maskWidth: 2, maskHeight: 2,
+        maskData: Data(repeating: 0, count: 4),
+        maskKeyframes: [
+            MosaicMaskKeyframe(frame: 0, maskData: Data([0, 0, 0, 1])),
+        ]
+    )
+
+    #expect(MosaicRegionSubdivision.semanticMaskContainsCoverage(noMask) == nil)
+    #expect(MosaicRegionSubdivision.semanticMaskContainsCoverage(zeroMask) == false)
+    #expect(MosaicRegionSubdivision.semanticMaskContainsCoverage(temporalCoverage) == true)
+}
+
+@Test func subdivisionReportsAllZeroMaskCandidatesWithoutPruningThem() {
+    var mask = Data(repeating: 0, count: 8 * 8)
+    mask[0] = 255
+    let region = MosaicRegion(
+        startFrame: 0,
+        endFrame: 30,
+        x: 0,
+        y: 0,
+        width: 1_600,
+        height: 1_600,
+        confidence: 1,
+        maskWidth: 8,
+        maskHeight: 8,
+        maskData: mask
+    )
+    let telemetryConfiguration = MosaicRegionSubdivisionConfiguration(
+        maximumBlendDimension: 800,
+        overlap: 0,
+        splitLimit: 1,
+        maximumAxisCrops: 4,
+        maskGrowthFraction: 0,
+        maskFeatherFraction: 0,
+        blockResidualGrowthFraction: 0,
+        maskTemporalRadius: 0,
+        maskTemporalStrength: 0.5,
+        detailCropDimension: 576,
+        detailCropCount: 0
+    )
+
+    let result = MosaicRegionSubdivision.expand(
+        [region], configuration: telemetryConfiguration
+    )
+
+    #expect(result.regions.count == 4)
+    #expect(result.subdivisionModelCropCount == 4)
+    #expect(result.classifiedMaskCropCount == 4)
+    #expect(result.zeroMaskCropCount == 3)
+}
+
 @Test func subdivisionConfigurationCanBeDisabled() {
     let defaults = MosaicRegionSubdivisionConfiguration.fromEnvironment([:])
     let disabled = MosaicRegionSubdivisionConfiguration.fromEnvironment([
@@ -103,13 +172,122 @@ private let subdivisionConfiguration = MosaicRegionSubdivisionConfiguration(
     #expect(defaults.maximumBlendDimension == 768)
     #expect(defaults.overlap == 96)
     #expect(defaults.splitLimit == 1)
+    #expect(defaults.maximumAxisCrops == 4)
     #expect(defaults.maskGrowthFraction == 0.05)
     #expect(defaults.maskFeatherFraction == 0.025)
     #expect(defaults.blockResidualGrowthFraction == 0.04)
     #expect(defaults.maskTemporalRadius == 1)
+    #expect(defaults.maskTemporalStrength == 0.5)
     #expect(defaults.detailCropDimension == 576)
     #expect(defaults.detailCropCount == 1)
     #expect(disabled == .disabled)
+}
+
+@Test func temporalCropConfigurationIsOptInAndBounded() {
+    #expect(MosaicTemporalCropConfiguration.fromEnvironment([:]) == .disabled)
+    let configured = MosaicTemporalCropConfiguration.fromEnvironment([
+        "JASNA_TEMPORAL_CROP_FRAMES": "10",
+        "JASNA_TEMPORAL_CROP_PADDING": "96",
+        "JASNA_TEMPORAL_CROP_MIN_DIMENSION": "900",
+        "JASNA_TEMPORAL_CROP_MOTION": "0.12",
+    ])
+
+    #expect(configured.chunkFrames == 10)
+    #expect(configured.padding == 96)
+    #expect(configured.minimumDimension == 900)
+    #expect(configured.minimumMotionFraction == 0.12)
+}
+
+@Test func movingTemporalMaskProducesTighterFrameRanges() throws {
+    let maskWidth = 12
+    let maskHeight = 4
+    let keyframes = (0..<30).map { frame in
+        var mask = [UInt8](repeating: 0, count: maskWidth * maskHeight)
+        let x = 1 + frame * 9 / 29
+        mask[1 * maskWidth + x] = 255
+        mask[2 * maskWidth + x] = 255
+        return MosaicMaskKeyframe(frame: frame, maskData: Data(mask))
+    }
+    let region = MosaicRegion(
+        startFrame: 0,
+        endFrame: 30,
+        x: 0,
+        y: 0,
+        width: 1_200,
+        height: 400,
+        confidence: 1,
+        blendX: 0,
+        blendY: 0,
+        blendWidth: 1_200,
+        blendHeight: 400,
+        maskWidth: maskWidth,
+        maskHeight: maskHeight,
+        maskData: keyframes[0].maskData,
+        maskKeyframes: keyframes
+    )
+    let result = MosaicRegionSubdivision.tightenMovingRegions(
+        [region],
+        configuration: MosaicTemporalCropConfiguration(
+            chunkFrames: 10,
+            padding: 50,
+            minimumDimension: 1_024,
+            minimumMotionFraction: 0.08
+        )
+    )
+
+    #expect(result.movingRegionCount == 1)
+    #expect(result.addedTemporalCropCount == 2)
+    #expect(result.regions.map(\.frameRange) == [0..<10, 10..<20, 20..<30])
+    #expect(result.regions.allSatisfy { $0.width < region.width })
+    #expect(result.regions.allSatisfy { $0.maskKeyframes?.count == 10 })
+    #expect(result.regions.allSatisfy { $0.maskData?.count == maskWidth * maskHeight })
+    let manifest = MosaicRegionManifest(
+        version: 1,
+        width: 1_200,
+        height: 400,
+        framesPerSecond: 30,
+        frameCount: 30,
+        regions: result.regions
+    )
+    try manifest.validate()
+}
+
+@Test func stationaryTemporalMaskKeepsOneFullSequence() {
+    let maskWidth = 12
+    let maskHeight = 4
+    var mask = [UInt8](repeating: 0, count: maskWidth * maskHeight)
+    mask[1 * maskWidth + 6] = 255
+    mask[2 * maskWidth + 6] = 255
+    let keyframes = (0..<30).map {
+        MosaicMaskKeyframe(frame: $0, maskData: Data(mask))
+    }
+    let region = MosaicRegion(
+        startFrame: 0, endFrame: 30, x: 0, y: 0,
+        width: 1_200, height: 400, confidence: 1,
+        maskWidth: maskWidth, maskHeight: maskHeight,
+        maskData: Data(mask), maskKeyframes: keyframes
+    )
+    let result = MosaicRegionSubdivision.tightenMovingRegions(
+        [region],
+        configuration: MosaicTemporalCropConfiguration(
+            chunkFrames: 10,
+            padding: 50,
+            minimumDimension: 1_024,
+            minimumMotionFraction: 0.08
+        )
+    )
+
+    #expect(result.regions == [region])
+    #expect(result.movingRegionCount == 0)
+    #expect(result.addedTemporalCropCount == 0)
+}
+
+@Test func temporalCropRangesMergeAShortTail() {
+    #expect(
+        MosaicRegionSubdivision.temporalCropRanges(
+            startFrame: 0, endFrame: 22, chunkFrames: 10
+        ) == [0..<10, 10..<22]
+    )
 }
 
 @Test func blockResidualGrowthReachesSquareMaskCorners() throws {
@@ -147,6 +325,48 @@ private let subdivisionConfiguration = MosaicRegionSubdivisionConfiguration(
     #expect(stabilized[0].maskData[1] == 255)
     #expect(stabilized[0].maskData[7] == 127)
     #expect(stabilized[1].maskData[1] == 127)
+    #expect(stabilized[1].maskData[7] == 255)
+}
+
+@Test func adjacentMaskKeyframesCanUseFullTemporalCoverageForFastMotion() {
+    var first = [UInt8](repeating: 0, count: 9)
+    var second = [UInt8](repeating: 0, count: 9)
+    first[1] = 255
+    second[7] = 255
+    let stabilized = MosaicRegionSubdivision.temporallyStabilizedKeyframes(
+        [
+            MosaicMaskKeyframe(frame: 0, maskData: Data(first)),
+            MosaicMaskKeyframe(frame: 2, maskData: Data(second)),
+        ],
+        expectedByteCount: 9,
+        radius: 1,
+        strength: 1
+    )
+
+    #expect(stabilized[0].maskData[1] == 255)
+    #expect(stabilized[0].maskData[7] == 255)
+    #expect(stabilized[1].maskData[1] == 255)
+    #expect(stabilized[1].maskData[7] == 255)
+}
+
+@Test func distantMaskKeyframesDoNotLeakAcrossSparseManifestGaps() {
+    var first = [UInt8](repeating: 0, count: 9)
+    var distant = [UInt8](repeating: 0, count: 9)
+    first[1] = 255
+    distant[7] = 255
+    let stabilized = MosaicRegionSubdivision.temporallyStabilizedKeyframes(
+        [
+            MosaicMaskKeyframe(frame: 0, maskData: Data(first)),
+            MosaicMaskKeyframe(frame: 30, maskData: Data(distant)),
+        ],
+        expectedByteCount: 9,
+        radius: 1,
+        strength: 1
+    )
+
+    #expect(stabilized[0].maskData[1] == 255)
+    #expect(stabilized[0].maskData[7] == 0)
+    #expect(stabilized[1].maskData[1] == 0)
     #expect(stabilized[1].maskData[7] == 255)
 }
 
@@ -211,6 +431,43 @@ private let subdivisionConfiguration = MosaicRegionSubdivisionConfiguration(
     #expect(blendBottom <= region.y + region.height)
 }
 
+@Test func maskGrowthAlsoCoversRegionsBelowTheSubdivisionThreshold() throws {
+    var mask = [UInt8](repeating: 0, count: 9 * 9)
+    mask[4 * 9 + 4] = 255
+    let region = MosaicRegion(
+        startFrame: 0,
+        endFrame: 30,
+        x: 100,
+        y: 200,
+        width: 400,
+        height: 360,
+        confidence: 1,
+        blendX: 180,
+        blendY: 280,
+        blendWidth: 240,
+        blendHeight: 200,
+        maskWidth: 9,
+        maskHeight: 9,
+        maskData: Data(mask)
+    )
+
+    let result = MosaicRegionSubdivision.expand(
+        [region], configuration: subdivisionConfiguration
+    )
+    let expanded = try #require(result.regions.first)
+    let expandedMask = try #require(expanded.maskData)
+
+    #expect(result.splitRegionCount == 0)
+    #expect(result.addedModelCropCount == 0)
+    #expect(result.regions.count == 1)
+    #expect(expanded.effectiveBlendX < region.effectiveBlendX)
+    #expect(expanded.effectiveBlendY < region.effectiveBlendY)
+    #expect(expanded.effectiveBlendWidth > region.effectiveBlendWidth)
+    #expect(expanded.effectiveBlendHeight > region.effectiveBlendHeight)
+    #expect(expandedMask != region.maskData)
+    #expect(expandedMask[4 * 9 + 3] > 0)
+}
+
 @Test func lowerResidualDetailCropFollowsTheSemanticMaskBottom() throws {
     var mask = [UInt8](repeating: 0, count: 8 * 8)
     for y in 2...5 {
@@ -248,7 +505,96 @@ private let subdivisionConfiguration = MosaicRegionSubdivisionConfiguration(
     #expect(detail.effectiveBlendY <= maskBottom)
     #expect(detail.effectiveBlendY + detail.effectiveBlendHeight >= maskBottom)
     #expect(detail.subdivisionGroup == 7)
+    #expect(detail.detailBlendFeather == 72)
     #expect(detail.maskData?.count == 64)
+}
+
+@Test func longMovingBoundaryReceivesTwoDistributedDetailCrops() throws {
+    var mask = [UInt8](repeating: 0, count: 16 * 8)
+    for y in 4...6 {
+        for x in 1...14 { mask[y * 16 + x] = 255 }
+    }
+    let region = MosaicRegion(
+        startFrame: 0,
+        endFrame: 30,
+        x: 0,
+        y: 0,
+        width: 4_096,
+        height: 1_400,
+        confidence: 1,
+        blendX: 64,
+        blendY: 500,
+        blendWidth: 3_968,
+        blendHeight: 800,
+        maskWidth: 16,
+        maskHeight: 8,
+        maskData: Data(mask)
+    )
+    let configuration = MosaicRegionSubdivisionConfiguration(
+        maximumBlendDimension: 768,
+        overlap: 96,
+        splitLimit: 1,
+        maximumAxisCrops: 4,
+        maskGrowthFraction: 0.05,
+        maskFeatherFraction: 0.025,
+        blockResidualGrowthFraction: 0.04,
+        maskTemporalRadius: 1,
+        maskTemporalStrength: 0.5,
+        detailCropDimension: 576,
+        detailCropCount: 2
+    )
+
+    let details = MosaicRegionSubdivision.lowerResidualDetailCrops(
+        from: region,
+        focusReference: region,
+        configuration: configuration,
+        subdivisionGroup: 1
+    )
+
+    #expect(details.count == 2)
+    #expect(details[0].effectiveBlendX < details[1].effectiveBlendX)
+    #expect(details.allSatisfy { $0.effectiveBlendWidth == 576 })
+    #expect(details.allSatisfy { $0.detailBlendFeather == 72 })
+}
+
+@Test func detailCropUsesADeepEdgeFadeWithoutChangingGridChildren() throws {
+    let mask = Data(repeating: 255, count: 8 * 8)
+    let region = MosaicRegion(
+        startFrame: 0,
+        endFrame: 30,
+        x: 100,
+        y: 200,
+        width: 1_600,
+        height: 1_400,
+        confidence: 1,
+        blendX: 200,
+        blendY: 300,
+        blendWidth: 1_400,
+        blendHeight: 1_200,
+        maskWidth: 8,
+        maskHeight: 8,
+        maskData: mask
+    )
+
+    let result = MosaicRegionSubdivision.expand(
+        [region], configuration: subdivisionConfiguration
+    )
+    let detail = try #require(result.regions.first { $0.detailBlendFeather != nil })
+    let gridChildren = result.regions.filter { $0.detailBlendFeather == nil }
+
+    #expect(detail.detailBlendFeather == 72)
+    #expect(detail.featherAlpha(
+        x: detail.effectiveBlendX,
+        y: detail.effectiveBlendY + detail.effectiveBlendHeight / 2,
+        feather: detail.detailBlendFeather!
+    ) < 0.02)
+    #expect(detail.featherAlpha(
+        x: detail.effectiveBlendX + detail.detailBlendFeather! - 1,
+        y: detail.effectiveBlendY + detail.effectiveBlendHeight / 2,
+        feather: detail.detailBlendFeather!
+    ) > 0.98)
+    #expect(!gridChildren.isEmpty)
+    #expect(gridChildren.allSatisfy { $0.subdivisionGroup == 1 })
 }
 
 @Test func adaptiveBlendGrowthDoesNotIncreaseTheModelGridDimensions() {

@@ -3,6 +3,45 @@ import Testing
 @testable import JasnaMetalPoC
 
 @available(macOS 27.0, *)
+@Test func restorationIdentityIncludesSupplementalBatchModels() throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+        "jasna-model-identity-test-\(UUID().uuidString)", isDirectory: true
+    )
+    let source = directory.appendingPathComponent("source.mov")
+    let models = directory.appendingPathComponent("models", isDirectory: true)
+    let weights = directory.appendingPathComponent("weights", isDirectory: true)
+    let batch2A = directory.appendingPathComponent("batch2-a", isDirectory: true)
+    let batch2B = directory.appendingPathComponent("batch2-b", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    for url in [models, weights, batch2A, batch2B] {
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: false)
+    }
+    try Data("source".utf8).write(to: source)
+    try Data("batch-a".utf8).write(to: batch2A.appendingPathComponent("model.bin"))
+    try Data("batch-b".utf8).write(to: batch2B.appendingPathComponent("model.bin"))
+
+    let identityA = SideBySideRestoration.restorationCacheIdentity(
+        sourceURLs: [source], modelsURL: models, weightsURL: weights,
+        additionalModelURLs: [batch2A]
+    )
+    let identityB = SideBySideRestoration.restorationCacheIdentity(
+        sourceURLs: [source], modelsURL: models, weightsURL: weights,
+        additionalModelURLs: [batch2B]
+    )
+
+    #expect(identityA != identityB)
+    #expect(
+        SideBySideRestoration.configuredAdditionalModelURLs(environment: [:]).isEmpty
+    )
+    #expect(
+        SideBySideRestoration.configuredAdditionalModelURLs(
+            environment: ["JASNA_BATCH2_MODELS_DIR": batch2A.path]
+        ).first?.standardizedFileURL == batch2A.standardizedFileURL
+    )
+}
+
+@available(macOS 27.0, *)
 @Test func restorationResumeUsesOnlyTilesCompleteInEveryFrame() throws {
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
         "jasna-resume-test-\(UUID().uuidString)", isDirectory: true
@@ -73,7 +112,7 @@ import Testing
 
 @available(macOS 27.0, *)
 @Test func encoderSegmentsStopBeforeExistingLegacyOutputs() {
-    #expect(SideBySideRestoration.defaultEncoderWindowsPerSegment == 120)
+    #expect(SideBySideRestoration.defaultEncoderWindowsPerSegment == 4)
     #expect(
         SideBySideRestoration.encoderSegmentEnd(
             windowIndex: 0,
@@ -103,8 +142,8 @@ import Testing
             windowIndex: 0,
             windowCount: 120,
             maximumWindows: SideBySideRestoration.defaultEncoderWindowsPerSegment,
-            hasExistingOutput: { $0 == 5 || $0 == 10 }
-        ) == 5
+            hasExistingOutput: { $0 == 3 || $0 == 10 }
+        ) == 3
     )
     #expect(
         SideBySideRestoration.encoderSegmentEnd(
@@ -112,7 +151,7 @@ import Testing
             windowCount: 120,
             maximumWindows: SideBySideRestoration.defaultEncoderWindowsPerSegment,
             hasExistingOutput: { _ in false }
-        ) == 120
+        ) == 4
     )
 }
 
@@ -148,4 +187,24 @@ import Testing
             environment: ["JASNA_WINDOW_START": "0", "JASNA_WINDOW_COUNT": "0"]
         )
     }
+}
+
+@available(macOS 27.0, *)
+@Test func inMemoryRegionFrameCacheKeepsFramesAndRegionsIndependent() throws {
+    let cache = try SideBySideRestoration.InMemoryRegionFrameCache(
+        frameCount: 2, regionCount: 2
+    )
+    var first = [Float16](repeating: 0, count: SideBySideRestoration.tileElements)
+    var second = [Float16](repeating: 0, count: SideBySideRestoration.tileElements)
+    first[0] = 1.25
+    first[first.count - 1] = -2.5
+    second[0] = 3.5
+    second[second.count - 1] = 4.75
+
+    try cache.store(first, frame: 0, region: 1)
+    try cache.store(second, frame: 1, region: 0)
+
+    #expect(try cache.values(frame: 0, region: 1) == first)
+    #expect(try cache.values(frame: 1, region: 0) == second)
+    #expect(try cache.values(frame: 0, region: 0).allSatisfy { $0 == 0 })
 }

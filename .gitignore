@@ -6,4 +6,11 @@ __pycache__/
 *.pyc
 .DS_Store
 .venv-mosaic/
+.venv-rfdetr/
 .venv-coreai/
+.venv-rfdetr-ane/
+.test-results/
+*.jasna-vr*-work/
+*.jasna-vr*.log
+/fast-shared-*.mov
+/dist/
