@@ -12,7 +12,7 @@ usage() {
   echo "          JASNA_DETECT_DEVICE=auto (MPS with automatic CPU fallback; or force cpu)" >&2
   echo "          JASNA_STEREO_DETECT=1 (one RF-DETR load/decode for both SBS eyes)" >&2
   echo "          JASNA_STEREO_SAMPLE_MODE=paired (experimental: alternating)" >&2
-  echo "          JASNA_EYE_BITRATE=20000000 JASNA_VR_BITRATE=40000000" >&2
+  echo "          JASNA_EYE_BITRATE=<bps> JASNA_VR_BITRATE=<bps> (defaults to source)" >&2
   echo "          JASNA_DIRECT_SBS_OUTPUT=1 (set 0 for lower-memory eye-by-eye output)" >&2
   echo "          JASNA_EYE_JOB_PROCESS_ISOLATION=1 (fresh process per 30-120 second 4K eye job)" >&2
   echo "          JASNA_EYE_PAIR_SEGMENTS=1 (combine each eye pair before the final join)" >&2
@@ -36,8 +36,6 @@ START_TIME="${3:-0}"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$ROOT_DIR/script/restoration_identity.sh"
 TEST_SECONDS="${JASNA_TEST_SECONDS:-30}"
-EYE_BITRATE="${JASNA_EYE_BITRATE:-20000000}"
-VR_BITRATE="${JASNA_VR_BITRATE:-40000000}"
 FAST_ENCODE="${JASNA_FAST_ENCODE:-1}"
 FAST_SOURCE_COPY="${JASNA_FAST_SOURCE_COPY:-auto}"
 WORK_CONTAINER="${JASNA_WORK_CONTAINER:-mov}"
@@ -112,10 +110,6 @@ if [[ -n "$MOSAIC_RANGES" ]]; then
   }
   export JASNA_MOSAIC_RANGES_RELATIVE="$MOSAIC_RANGES_RELATIVE"
 fi
-[[ "$EYE_BITRATE" =~ ^[0-9]+$ && "$VR_BITRATE" =~ ^[0-9]+$ ]] || {
-  echo "error: JASNA_EYE_BITRATE and JASNA_VR_BITRATE must be integer bit rates" >&2
-  exit 1
-}
 [[ "$FAST_ENCODE" == "0" || "$FAST_ENCODE" == "1" ]] || {
   echo "error: JASNA_FAST_ENCODE must be 0 or 1" >&2
   exit 1
@@ -161,8 +155,8 @@ fi
   exit 1
 }
 [[ "$DETECT_DEVICE" == "auto" || "$DETECT_DEVICE" == "mps" \
-  || "$DETECT_DEVICE" == "cpu" ]] || {
-  echo "error: JASNA_DETECT_DEVICE must be auto, mps, or cpu" >&2
+  || "$DETECT_DEVICE" == "cpu" || "$DETECT_DEVICE" == "mlx" ]] || {
+  echo "error: JASNA_DETECT_DEVICE must be auto, mps, cpu, or mlx" >&2
   exit 1
 }
 [[ "$TEMPORAL_WARMUP_FRAMES" =~ ^[0-9]+$ ]] \
@@ -243,6 +237,15 @@ else
   echo "error: ffprobe is not installed" >&2
   exit 1
 fi
+
+SOURCE_VIDEO_BITRATE="$(/usr/bin/python3 "$ROOT_DIR/tools/source_video_bitrate.py" "$FFPROBE_PATH" "$INPUT_PATH")" || exit 1
+VR_BITRATE="${JASNA_VR_BITRATE:-$SOURCE_VIDEO_BITRATE}"
+EYE_BITRATE="${JASNA_EYE_BITRATE:-$((VR_BITRATE / 2))}"
+[[ "$VR_BITRATE" =~ ^[0-9]+$ && "$EYE_BITRATE" =~ ^[0-9]+$ ]] \
+  && (( VR_BITRATE > 0 && EYE_BITRATE > 0 )) || {
+    echo "error: video bitrate overrides must be positive integer bit rates" >&2
+    exit 1
+  }
 
 mkdir -p "$(dirname "$OUTPUT_PATH")"
 INPUT_PATH="$(cd "$(dirname "$INPUT_PATH")" && pwd)/$(basename "$INPUT_PATH")"
@@ -411,6 +414,12 @@ projection=fisheye
 detector=$DETECTOR"
 RUN_CONFIG="$RUN_CONFIG
 detect_device=$DETECT_DEVICE"
+case "${JASNA_RESTORATION_BACKEND:-metal}" in
+  metal) ;;
+  mlx) RUN_CONFIG="$RUN_CONFIG
+restoration_backend=mlx" ;;
+  *) echo "error: JASNA_RESTORATION_BACKEND must be metal or mlx" >&2; exit 1 ;;
+esac
 if [[ -s "$RUN_CONFIG_PATH" ]]; then
   EXISTING_STABLE_CONFIG="$(
     /usr/bin/sed \
@@ -495,6 +504,7 @@ echo "Work dir:    $WORK_DIR"
 echo "Log:         $LOG_PATH"
 echo "Projection:  fisheye"
 echo "Fast encode: $FAST_ENCODE"
+echo "Source video bitrate: $SOURCE_VIDEO_BITRATE bps; SBS target: $VR_BITRATE bps; per-eye target: $EYE_BITRATE bps"
 echo "Direct SBS:  $DIRECT_SBS_OUTPUT"
 echo "Shared SBS source: $SHARED_SBS_SOURCE"
 echo "Stereo detector sampling: $STEREO_SAMPLE_MODE"
@@ -514,7 +524,11 @@ fi
 echo "Model batch: $MODEL_BATCH"
 echo "Crop preparation pipeline depth: $REGION_PREPARE_DEPTH"
 echo "Detector:    $DETECTOR"
-echo "Detect device: $DETECT_DEVICE (auto prefers MPS and falls back to CPU)"
+if [[ "$DETECT_DEVICE" == "auto" ]]; then
+  echo "Detect device: auto (prefers MPS and falls back to CPU)"
+else
+  echo "Detect device: $DETECT_DEVICE"
+fi
 if [[ -n "$MOSAIC_RANGES" ]]; then
   echo "Manual mosaic ranges: $MOSAIC_RANGES"
   echo "Only these source-timeline ranges will be detected/restored"

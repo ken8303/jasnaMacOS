@@ -16,7 +16,6 @@ OUTPUT_PATH="$3"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$ROOT_DIR/script/restoration_identity.sh"
 SEGMENT_SECONDS="${JASNA_SEGMENT_SECONDS:-120}"
-EYE_BITRATE="${JASNA_EYE_BITRATE:-20000000}"
 SPARSE_MOSAIC="${JASNA_SPARSE_MOSAIC:-0}"
 VR_PROJECTION="${JASNA_VR_PROJECTION:-raw}"
 FAST_ENCODE="${JASNA_FAST_ENCODE:-1}"
@@ -59,10 +58,6 @@ fi
   echo "error: JASNA_SEGMENT_SECONDS must be an integer from 30 to 120" >&2
   exit 1
 }
-[[ "$EYE_BITRATE" =~ ^[0-9]+$ ]] || {
-  echo "error: JASNA_EYE_BITRATE must be an integer bit rate" >&2
-  exit 1
-}
 [[ "$VR_PROJECTION" == "raw" || "$VR_PROJECTION" == "fisheye" ]] || {
   echo "error: JASNA_VR_PROJECTION must be raw or fisheye" >&2
   exit 1
@@ -72,8 +67,8 @@ fi
   exit 1
 }
 [[ "$DETECT_DEVICE" == "auto" || "$DETECT_DEVICE" == "mps" \
-  || "$DETECT_DEVICE" == "cpu" ]] || {
-  echo "error: JASNA_DETECT_DEVICE must be auto, mps, or cpu" >&2
+  || "$DETECT_DEVICE" == "cpu" || "$DETECT_DEVICE" == "mlx" ]] || {
+  echo "error: JASNA_DETECT_DEVICE must be auto, mps, cpu, or mlx" >&2
   exit 1
 }
 export JASNA_DETECT_DEVICE="$DETECT_DEVICE"
@@ -129,6 +124,13 @@ else
   echo "error: ffprobe is not installed" >&2
   exit 1
 fi
+
+SOURCE_VIDEO_BITRATE="$(/usr/bin/python3 "$ROOT_DIR/tools/source_video_bitrate.py" "$FFPROBE_PATH" "$INPUT_PATH")" || exit 1
+EYE_BITRATE="${JASNA_EYE_BITRATE:-$((SOURCE_VIDEO_BITRATE / 2))}"
+[[ "$EYE_BITRATE" =~ ^[0-9]+$ ]] && (( EYE_BITRATE > 0 )) || {
+  echo "error: JASNA_EYE_BITRATE must be a positive integer bit rate" >&2
+  exit 1
+}
 
 OUTPUT_DIR="$(cd "$(dirname "$OUTPUT_PATH")" && pwd)"
 OUTPUT_NAME="$(basename "$OUTPUT_PATH")"

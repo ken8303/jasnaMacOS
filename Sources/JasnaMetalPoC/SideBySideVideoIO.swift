@@ -83,7 +83,9 @@ enum SideBySideVideoIO {
         let provider = reader.outputProvider(for: readerOutput)
 
         let writer = try AVAssetWriter(outputURL: outputURL, fileType: .mov)
-        let bitRate = min(160_000_000, max(8_000_000, inputInfo.dimensions.pixelCount * 5 / 2))
+        let configuredBitRate = Int(ProcessInfo.processInfo.environment["JASNA_VIDEO_BITRATE"] ?? "")
+        let bitRate = configuredBitRate.flatMap { $0 > 0 ? $0 : nil }
+            ?? min(160_000_000, max(8_000_000, inputInfo.dimensions.pixelCount * 5 / 2))
         let writerInput = AVAssetWriterInput(
             mediaType: .video,
             outputSettings: [

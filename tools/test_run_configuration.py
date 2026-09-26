@@ -5,6 +5,7 @@ import os
 import subprocess
 import tempfile
 import unittest
+import zipfile
 
 
 class RunConfigurationSafetyTests(unittest.TestCase):
@@ -31,7 +32,7 @@ class RunConfigurationSafetyTests(unittest.TestCase):
         self.assertIn('JASNA_COMPOSITE_CONCURRENCY:-1', rollout)
         self.assertIn('JASNA_RUNTIME_SCRATCH_ON_OUTPUT:-1', rollout)
         self.assertNotIn('JASNA_CLEAN_WORK_ON_SUCCESS', rollout)
-        self.assertIn('JASNA_ALLOW_IMPLEMENTATION_RESUME:-1', rollout)
+        self.assertIn('JASNA_ALLOW_IMPLEMENTATION_RESUME:-0', rollout)
         self.assertIn('JASNA_DETECT_BATCH_SIZE:-1', rollout)
         self.assertIn('JASNA_DETECT_DECODE_MODE:-sequential', rollout)
         self.assertIn("metal_model_packages_available", rollout)
@@ -212,22 +213,45 @@ printf '%s|%s\n' "$JASNA_MODEL_BATCH" "$JASNA_LARGE_REGION_MASK_GROWTH"
         self.assertIn("export JASNA_APP_BINARY", profile)
         self.assertEqual(profile.count("test_vr_restore_only_30s.sh"), 2)
 
-    def test_packager_installs_current_unpacked_app_after_archiving_previous(self):
-        root = Path(__file__).resolve().parents[1]
-        packager = (root / "script" / "package_jasna_test_app.sh").read_text(
-            encoding="utf-8"
-        )
+    def test_packager_publishes_validated_zip_and_preserves_apps(self):
+        self.check_archive_publication(valid=True)
 
-        archive_index = packager.index("Archived previous test app")
-        install_index = packager.index(
-            '/usr/bin/ditto --noextattr --noqtn "$APP_PATH" "$OLD_APP_PATH"'
-        )
-        self.assertGreater(install_index, archive_index)
-        self.assertIn(
-            '/usr/bin/codesign --verify --deep --verbose=2 "$OLD_APP_PATH"',
-            packager,
-        )
-        self.assertIn('APP_SIZE="$(du -sh "$OLD_APP_PATH"', packager)
+    def test_packager_keeps_existing_release_when_validation_fails(self):
+        self.check_archive_publication(valid=False)
+
+    def check_archive_publication(self, valid):
+        root = Path(__file__).resolve().parents[1]
+        packager = (root / "script/package_jasna_test_app.sh").read_text()
+        start = packager.index("publish_archive() (")
+        end = packager.index("\n)\n", start) + 3
+        function = packager[start:end]
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory)
+            current = destination / "Jasna-VR-Restoration-macOS27-Test.zip"
+            previous = destination / "Jasna-VR-Restoration-macOS27-Test.previous.zip"
+            current.write_bytes(b"current release")
+            previous.write_bytes(b"older release")
+            app = destination / "Jasna VR Restoration.app"
+            app.mkdir()
+            (app / "sentinel").write_text("working app")
+            staged = destination / "staged.zip"
+            if valid:
+                with zipfile.ZipFile(staged, "w") as archive:
+                    archive.writestr("build.txt", "new release")
+            else:
+                staged.write_bytes(b"invalid archive")
+            result = subprocess.run(
+                ["bash", "-c", function + '\npublish_archive "$1" "$2"',
+                 "test", str(staged), str(destination)],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode == 0, valid, result.stderr)
+            self.assertEqual(current.read_bytes(),
+                             staged.read_bytes() if valid else b"current release")
+            self.assertEqual(previous.read_bytes(),
+                             b"current release" if valid else b"older release")
+            self.assertEqual((app / "sentinel").read_text(), "working app")
+            self.assertEqual(list(destination.glob(".jasna-*")), [])
 
     def test_rfdetr_setup_and_packager_pin_validated_version(self):
         root = Path(__file__).resolve().parents[1]

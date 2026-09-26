@@ -470,7 +470,7 @@ extension SideBySideRestoration {
                 ProcessInfo.processInfo.environment["JASNA_REGION_CHECKPOINT_INTERVAL"] ?? ""
             )
             let checkpointInterval = max(1, configuredCheckpointInterval ?? 5)
-            let batchModelsURL = sharedBatch2CircuitBreaker.isDisabled ? nil
+            let batchModelsURL = MLXRestorationBridge.isSelected || sharedBatch2CircuitBreaker.isDisabled ? nil
                 : ProcessInfo.processInfo.environment[
                     "JASNA_BATCH2_MODELS_DIR"
                 ].map { URL(fileURLWithPath: $0, isDirectory: true) }.flatMap { candidate in
@@ -654,8 +654,9 @@ extension SideBySideRestoration {
                     cacheWriteMilliseconds += elapsedMilliseconds(since: cacheWriteStarted)
                     report(
                         "Window \(windowIndex + 1)/\(windowCount): mosaic crop "
-                            + "\(completedCount)/\(regions.count), GPU "
-                            + "\(String(format: "%.3f", gpuMilliseconds)) ms cumulative, "
+                            + "\(completedCount)/\(regions.count), "
+                            + (MLXRestorationBridge.isSelected ? "MLX GPU time unavailable, "
+                                : "GPU \(String(format: "%.3f", gpuMilliseconds)) ms cumulative, ")
                             + "crop wall \(String(format: "%.3f", restored.wallMilliseconds)) ms"
                     )
                 }
@@ -667,8 +668,10 @@ extension SideBySideRestoration {
                     + "\(String(format: "%.3f", extractionMilliseconds)) ms "
                     + "(foreground blocking \(String(format: "%.3f", foregroundPreparationMilliseconds)) ms), "
                     + "graph wall "
-                    + "\(String(format: "%.3f", graphWallMilliseconds)) ms, GPU "
-                    + "\(String(format: "%.3f", gpuMilliseconds)) ms, cache writes "
+                    + "\(String(format: "%.3f", graphWallMilliseconds)) ms, "
+                    + (MLXRestorationBridge.isSelected ? "MLX GPU time unavailable, "
+                        : "GPU \(String(format: "%.3f", gpuMilliseconds)) ms, ")
+                    + "cache writes "
                     + "\(String(format: "%.3f", cacheWriteMilliseconds)) ms"
             )
             report(
@@ -898,6 +901,12 @@ extension SideBySideRestoration {
         inputFrames: [[Float16]],
         context: String
     ) throws -> (frames: [[Float16]], gpuMilliseconds: Double) {
+        if MLXRestorationBridge.isSelected {
+            return try MLXRestorationBridge.restore(
+                inputFrames: inputFrames,
+                modelsURL: modelsURL
+            )
+        }
         do {
             return try restoreTileFrames(
                 device: device,

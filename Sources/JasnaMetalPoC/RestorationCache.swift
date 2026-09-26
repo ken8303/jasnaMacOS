@@ -177,6 +177,8 @@ extension SideBySideRestoration {
         var hash: UInt64 = 14_695_981_039_346_656_037
         let configuration = "\(projection.rawValue):\(restorationIdentity):"
             + "warmup=\(temporalWarmupFrames):passthrough=\(allowPassthrough ? 1 : 0)"
+            + (ProcessInfo.processInfo.environment["JASNA_RESTORATION_BACKEND"] == "mlx"
+                ? ":backend=mlx" : "")
         for byte in configuration.utf8 {
             hash ^= UInt64(byte)
             hash &*= 1_099_511_628_211

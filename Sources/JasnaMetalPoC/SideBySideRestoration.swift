@@ -397,8 +397,9 @@ enum SideBySideRestoration {
         }
         report(
             "Diagnostic tile \(tileNumber)/\(plan.tiles.count): PASS, "
-                + "\(result.frames.count) frames, GPU "
-                + "\(String(format: "%.3f", result.gpuMilliseconds)) ms"
+                + "\(result.frames.count) frames, "
+                + (MLXRestorationBridge.isSelected ? "MLX GPU time unavailable"
+                    : "GPU \(String(format: "%.3f", result.gpuMilliseconds)) ms")
         )
     }
 

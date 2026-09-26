@@ -62,8 +62,8 @@ fi
   exit 1
 }
 [[ "$DETECT_DEVICE" == "auto" || "$DETECT_DEVICE" == "mps" \
-  || "$DETECT_DEVICE" == "cpu" ]] || {
-  echo "error: JASNA_DETECT_DEVICE must be auto, mps, or cpu" >&2
+  || "$DETECT_DEVICE" == "cpu" || "$DETECT_DEVICE" == "mlx" ]] || {
+  echo "error: JASNA_DETECT_DEVICE must be auto, mps, cpu, or mlx" >&2
   exit 1
 }
 [[ "$DETECT_DECODE_MODE" == "sequential" || "$DETECT_DECODE_MODE" == "seek" ]] || {

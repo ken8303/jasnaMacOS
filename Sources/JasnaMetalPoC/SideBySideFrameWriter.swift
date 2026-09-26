@@ -327,9 +327,8 @@ extension SideBySideRestoration {
             let configuredBitRate = Int(
                 ProcessInfo.processInfo.environment["JASNA_VIDEO_BITRATE"] ?? ""
             )
-            let bitRate = min(
-                160_000_000, max(8_000_000, configuredBitRate ?? automaticBitRate)
-            )
+            let bitRate = configuredBitRate.flatMap { $0 > 0 ? $0 : nil }
+                ?? min(160_000_000, max(8_000_000, automaticBitRate))
             let input = AVAssetWriterInput(
                 mediaType: .video,
                 outputSettings: [

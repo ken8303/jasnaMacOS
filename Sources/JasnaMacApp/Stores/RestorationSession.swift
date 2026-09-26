@@ -32,6 +32,7 @@ final class RestorationSession {
 
     var inputURL: URL?
     var outputURL: URL?
+    var selectedBackend: RestorationBackend = .metal
     var ranges = [MosaicTimeRangeDraft()]
     var state: State = .ready
     var activity = "Choose a source video and output file. Leave mosaic times blank for full video."
@@ -83,23 +84,38 @@ final class RestorationSession {
         guard let selected = FilePanelService.chooseInputVideo() else { return }
         inputURL = selected
         validationMessage = nil
-        if outputURL == nil {
-            outputURL = selected.deletingLastPathComponent()
-                .appendingPathComponent(
-                    selected.deletingPathExtension().lastPathComponent + "-restored.mp4"
-                )
-        }
+        outputURL = selected.deletingLastPathComponent()
+            .appendingPathComponent(suggestedOutputName(for: selected, backend: selectedBackend))
     }
 
     func chooseOutput() {
         let suggestedName = inputURL.map {
-            $0.deletingPathExtension().lastPathComponent + "-restored.mp4"
+            suggestedOutputName(for: $0, backend: selectedBackend)
         } ?? "restored-vr.mp4"
         guard let selected = FilePanelService.chooseOutputVideo(suggestedName: suggestedName) else {
             return
         }
         outputURL = selected
         validationMessage = nil
+    }
+
+    func selectBackend(_ backend: RestorationBackend) {
+        guard selectedBackend != backend else { return }
+        if let inputURL, let outputURL,
+           outputURL.deletingLastPathComponent().standardizedFileURL
+             == inputURL.deletingLastPathComponent().standardizedFileURL,
+           outputURL.lastPathComponent
+             == suggestedOutputName(for: inputURL, backend: selectedBackend) {
+            self.outputURL = outputURL.deletingLastPathComponent()
+                .appendingPathComponent(suggestedOutputName(for: inputURL, backend: backend))
+        }
+        selectedBackend = backend
+        validationMessage = nil
+    }
+
+    private func suggestedOutputName(for source: URL, backend: RestorationBackend) -> String {
+        source.deletingPathExtension().lastPathComponent
+            + (backend == .mlx ? "-restored-mlx.mp4" : "-restored.mp4")
     }
 
     func addRange() {
@@ -112,14 +128,14 @@ final class RestorationSession {
         validationMessage = nil
     }
 
-    func start(performanceProfile: RestorationPerformanceProfile) {
+    func start(performanceProfile: RestorationPerformanceProfile, backend: RestorationBackend) {
         guard !isRunning else { return }
         // Cancel the previous run's countdown even if validating this new request fails.
         shutdownTask?.cancel()
         shutdownTask = nil
         shutdownCountdownSeconds = nil
         do {
-            let request = try validatedRequest(performanceProfile: performanceProfile)
+            let request = try validatedRequest(performanceProfile: performanceProfile, backend: backend)
             try launch(request)
         } catch {
             state = .failed
@@ -155,10 +171,12 @@ final class RestorationSession {
         let ranges: String?
         let autoShutdownAfterCompletion: Bool
         let performanceProfile: RestorationPerformanceProfile
+        let backend: RestorationBackend
     }
 
     private func validatedRequest(
-        performanceProfile: RestorationPerformanceProfile
+        performanceProfile: RestorationPerformanceProfile,
+        backend: RestorationBackend
     ) throws -> Request {
         guard let inputURL else {
             throw ValidationError("Choose a source side-by-side video.")
@@ -188,7 +206,8 @@ final class RestorationSession {
             outputURL: outputURL,
             ranges: ranges,
             autoShutdownAfterCompletion: autoShutdownAfterCompletion,
-            performanceProfile: performanceProfile
+            performanceProfile: performanceProfile,
+            backend: backend
         )
     }
 
@@ -215,6 +234,7 @@ final class RestorationSession {
             environment["JASNA_APP_BINARY"] = bundledEngine.path
         }
         environment.merge(request.performanceProfile.processEnvironment) { _, requested in requested }
+        environment.merge(request.backend.processEnvironment) { _, requested in requested }
         process.environment = environment
         // GUI-launched child processes must never inherit a terminal as stdin. FFmpeg otherwise
         // receives SIGTTIN and silently pauses when it probes stdin from a background process group.
@@ -238,6 +258,7 @@ final class RestorationSession {
                 + "Output: \(request.outputURL.path)\nMosaic ranges: "
                 + "\(request.ranges ?? "full video (automatic detection)")\n"
                 + "Performance: \(request.performanceProfile.logDescription)\n"
+                + "Restoration model: \(request.backend.title)\n"
                 + "Compatible interrupted work retains its recorded model batch.\n"
                 + "Restart files: always preserved\n"
                 + "Automatic shutdown after success: "

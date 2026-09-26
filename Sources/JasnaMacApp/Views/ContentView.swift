@@ -5,6 +5,8 @@ struct ContentView: View {
     @Bindable var session: RestorationSession
     @AppStorage("restorationPerformanceProfile") private var performanceProfileRawValue =
         RestorationPerformanceProfile.fast.rawValue
+    @AppStorage("restorationBackend") private var backendRawValue =
+        RestorationBackend.metal.rawValue
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
@@ -47,6 +49,24 @@ struct ContentView: View {
 
             GroupBox {
                 VStack(alignment: .leading, spacing: 8) {
+                    Picker("Restoration model", selection: backendBinding) {
+                        ForEach(RestorationBackend.allCases) { backend in
+                            Text(backend.title).tag(backend)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    Text(backend.detail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(6)
+            } label: {
+                Label("Restoration Model", systemImage: "cpu")
+            }
+            .disabled(session.isRunning)
+
+            GroupBox {
+                VStack(alignment: .leading, spacing: 8) {
                     Picker("Performance", selection: performanceProfileBinding) {
                         ForEach(RestorationPerformanceProfile.allCases) { profile in
                             Text(profile.title).tag(profile)
@@ -55,7 +75,9 @@ struct ContentView: View {
                     .pickerStyle(.segmented)
 
                     Label(
-                        performanceProfile.detail,
+                        backend == .mlx
+                            ? "MLX detects mosaics and restores crops; Metal composites the video."
+                            : performanceProfile.detail,
                         systemImage: "gauge.with.dots.needle.67percent"
                     )
                     .font(.caption)
@@ -144,7 +166,7 @@ struct ContentView: View {
                     Button("Stop", role: .destructive) { session.stop() }
                 } else {
                     Button("Start Restoration") {
-                        session.start(performanceProfile: performanceProfile)
+                        session.start(performanceProfile: performanceProfile, backend: backend)
                     }
                         .buttonStyle(.borderedProminent)
                         .keyboardShortcut(.return, modifiers: [.command])
@@ -158,10 +180,25 @@ struct ContentView: View {
         }
         .padding(24)
         .frame(minWidth: 720, minHeight: 820)
+        .onAppear { session.selectBackend(backend) }
     }
 
     private var performanceProfile: RestorationPerformanceProfile {
         RestorationPerformanceProfile(rawValue: performanceProfileRawValue) ?? .fast
+    }
+
+    private var backend: RestorationBackend {
+        RestorationBackend(rawValue: backendRawValue) ?? .metal
+    }
+
+    private var backendBinding: Binding<RestorationBackend> {
+        Binding(
+            get: { backend },
+            set: {
+                backendRawValue = $0.rawValue
+                session.selectBackend($0)
+            }
+        )
     }
 
     private var performanceProfileBinding: Binding<RestorationPerformanceProfile> {

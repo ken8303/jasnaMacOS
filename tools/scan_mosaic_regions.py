@@ -104,7 +104,7 @@ def parse_args() -> argparse.Namespace:
         default=128,
         help="square segmentation-mask resolution; power of two from 32 through 256",
     )
-    parser.add_argument("--device", choices=("auto", "mps", "cpu"), default="auto")
+    parser.add_argument("--device", choices=("auto", "mps", "cpu", "mlx"), default="auto")
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument(
         "--max-detections",
@@ -823,6 +823,8 @@ def main() -> int:
         raise SystemExit(
             "--stereo-sample-mode alternating cannot be combined with --adaptive-scan"
         )
+    if args.device == "mlx" and args.backend != "rfdetr":
+        raise SystemExit("--device mlx requires --backend rfdetr")
 
     try:
         import cv2
@@ -841,13 +843,18 @@ def main() -> int:
                 "YOLO detector dependencies are missing; run "
                 "script/setup_mosaic_detector.sh"
             ) from error
-    else:
+    elif args.device != "mlx":
         try:
             from rfdetr_mps_detector import RFDetrMPSDetector
         except ImportError as error:
             raise SystemExit(
                 "RF-DETR dependencies are missing from .venv-rfdetr"
             ) from error
+    else:
+        try:
+            from rfdetr_mlx_detector import RFDetrMLXDetector
+        except ImportError as error:
+            raise SystemExit("MLX RF-DETR dependencies are missing") from error
 
     capture = cv2.VideoCapture(str(args.input_video))
     if not capture.isOpened():
@@ -910,6 +917,13 @@ def main() -> int:
         # Exported Core ML packages do not reliably retain enough metadata for
         # Ultralytics to infer that this checkpoint is a segmentation model.
         model = YOLO(str(args.model), task="segment")
+    elif device == "mlx":
+        if args.rfdetr_variant != "large":
+            raise SystemExit("MLX RF-DETR supports the rfdetr-vr-v1 large checkpoint only")
+        archive = args.model.parent.parent / "MLXDetector/rfdetr-vr-v1.safetensors"
+        if not archive.is_file():
+            raise SystemExit(f"MLX RF-DETR archive is missing: {archive}")
+        model = RFDetrMLXDetector(archive, max_select=args.max_detections)
     else:
         model = RFDetrMPSDetector(
             args.model,

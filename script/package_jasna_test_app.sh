@@ -24,6 +24,9 @@ export SWIFTPM_MODULECACHE_OVERRIDE="$MODULE_CACHE_DIR"
 for required in \
   "$ROOT_DIR/Models/MetalML/feature_extract.mtlpackage" \
   "$ROOT_DIR/Models/MetalMLBatch2/feature_extract.mtlpackage" \
+  "$ROOT_DIR/Models/MLX/basicvsrpp-v1.2.safetensors" \
+  "$ROOT_DIR/Models/MLXDetector/rfdetr-vr-v1.safetensors" \
+  "$ROOT_DIR/Models/MLXRuntime/mlx" \
   "$ROOT_DIR/Models/DeformConv/manifest.json" \
   "$ROOT_DIR/Models/MosaicDetection/rfdetr-vr-v1.pt" \
   "$ROOT_DIR/.venv-rfdetr/lib/python3.13/site-packages"; do
@@ -41,46 +44,57 @@ INSTALLED_RFDETR_VERSION="$("$ROOT_DIR/.venv-rfdetr/bin/python" -c \
 }
 echo "Bundling validated RF-DETR $INSTALLED_RFDETR_VERSION"
 BREW_PYTHON="/opt/homebrew/opt/python@3.13/bin/python3.13"
-[[ -x "$BREW_PYTHON" ]] || {
-  echo "error: packaging requires Homebrew python@3.13: $BREW_PYTHON" >&2
-  exit 1
-}
-PYTHON_FRAMEWORK_VERSION="$(/usr/bin/python3 -c \
-  'import os,sys; print(os.path.realpath(sys.argv[1]))' \
-  '/opt/homebrew/opt/python@3.13/Frameworks/Python.framework/Versions/3.13')"
-FFMPEG_BINARY="$(/usr/bin/python3 -c \
-  'import os,sys; print(os.path.realpath(sys.argv[1]))' "$(command -v ffmpeg)")"
-FFPROBE_BINARY="$(/usr/bin/python3 -c \
-  'import os,sys; print(os.path.realpath(sys.argv[1]))' "$(command -v ffprobe)")"
-[[ -d "$PYTHON_FRAMEWORK_VERSION" && -x "$FFMPEG_BINARY" && -x "$FFPROBE_BINARY" ]] || {
-  echo "error: packaging requires the local Python framework, FFmpeg, and FFprobe" >&2
+RUNTIME_SEED_APP="${JASNA_RUNTIME_SEED_APP:-$ROOT_DIR/work/recovered-runtime/Jasna VR Restoration.app}"
+RUNTIME_SEED=""
+if [[ -x "$BREW_PYTHON" ]] && command -v ffmpeg >/dev/null && command -v ffprobe >/dev/null; then
+  PYTHON_FRAMEWORK_VERSION="$(/usr/bin/python3 -c \
+    'import os,sys; print(os.path.realpath(sys.argv[1]))' \
+    '/opt/homebrew/opt/python@3.13/Frameworks/Python.framework/Versions/3.13')"
+  FFMPEG_BINARY="$(command -v ffmpeg)"
+  FFPROBE_BINARY="$(command -v ffprobe)"
+else
+  RUNTIME_SEED="$RUNTIME_SEED_APP/Contents/Resources/Runtime"
+  PYTHON_FRAMEWORK_VERSION="$RUNTIME_SEED/python"
+  FFMPEG_BINARY="$RUNTIME_SEED/bin/ffmpeg"
+  FFPROBE_BINARY="$RUNTIME_SEED/bin/ffprobe"
+  [[ -d "$RUNTIME_SEED_APP/Contents/Frameworks/RuntimeLibraries" ]] || {
+    echo "error: no Homebrew tools or complete bundled runtime at $RUNTIME_SEED_APP" >&2
+    exit 1
+  }
+  echo "Using existing bundled Python 3.13 and FFmpeg runtime"
+fi
+[[ -x "$PYTHON_FRAMEWORK_VERSION/bin/python3.13" && -x "$FFMPEG_BINARY" && -x "$FFPROBE_BINARY" ]] || {
+  echo "error: packaging requires a complete Python 3.13, FFmpeg, and FFprobe runtime" >&2
   exit 1
 }
 
 echo "Building optimized macOS 27 executables"
 swift build --package-path "$ROOT_DIR" --scratch-path "$BUILD_DIR" \
-  --disable-sandbox -c release --product JasnaMacApp
+  --disable-sandbox -c release -Xswiftc -gnone --product JasnaMacApp
 swift build --package-path "$ROOT_DIR" --scratch-path "$BUILD_DIR" \
-  --disable-sandbox -c release --product JasnaMetalPoC
+  --disable-sandbox -c release -Xswiftc -gnone --product JasnaMetalPoC
 BIN_DIR="$(swift build --package-path "$ROOT_DIR" --scratch-path "$BUILD_DIR" \
-  --disable-sandbox -c release --show-bin-path)"
+  --disable-sandbox -c release -Xswiftc -gnone --show-bin-path)"
 
 mkdir -p "$DIST_DIR"
-PREVIOUS_ZIP_PATH="$DIST_DIR/Jasna-VR-Restoration-macOS27-Test.previous.zip"
-# A synced distribution directory can attach Finder metadata to a loose app
-# after signing and invalidate it. Publish ZIPs only, retaining one previous
-# archive, and remove loose apps left by older packagers.
-find "$DIST_DIR" -maxdepth 1 -type d \
-  -name 'Jasna VR Restoration.previous-*.app' -exec /bin/rm -rf {} +
-find "$DIST_DIR" -maxdepth 1 -type d \
-  \( -name "$APP_NAME" -o -name 'Jasna VR Restoration.previous.app' \) \
-  -exec /bin/rm -rf {} +
-find "$DIST_DIR" -maxdepth 1 -type f \
-  -name 'Jasna-VR-Restoration-macOS27-Test.zip.previous-*' -delete
-if [[ -e "$ZIP_PATH" ]]; then
-  /bin/rm -f "$PREVIOUS_ZIP_PATH"
-  mv "$ZIP_PATH" "$PREVIOUS_ZIP_PATH"
-fi
+# Publish only after the new archive passes validation. Leave loose apps intact.
+publish_archive() (
+  set -euo pipefail
+  staged_zip="$1" destination="$2"
+  pending="$(mktemp "$destination/.jasna-new.XXXXXX")"
+  previous_pending=""
+  trap 'rm -f "$pending"; if [[ -n "$previous_pending" ]]; then rm -f "$previous_pending"; fi' EXIT
+  /bin/cp "$staged_zip" "$pending"
+  /usr/bin/unzip -tq "$pending"
+  current="$destination/Jasna-VR-Restoration-macOS27-Test.zip"
+  previous="$destination/Jasna-VR-Restoration-macOS27-Test.previous.zip"
+  if [[ -e "$current" ]]; then
+    previous_pending="$(mktemp "$destination/.jasna-previous.XXXXXX")"
+    /bin/cp "$current" "$previous_pending"
+    /bin/mv -f "$previous_pending" "$previous"
+  fi
+  /bin/mv -f "$pending" "$current"
+)
 
 CONTENTS="$APP_PATH/Contents"
 MACOS_DIR="$CONTENTS/MacOS"
@@ -101,6 +115,9 @@ mkdir -p "$MACOS_DIR" "$FRAMEWORKS" "$RUNTIME/bin" "$RUNTIME/Models/MosaicDetect
 /usr/bin/ditto --noextattr --noqtn "$ROOT_DIR/tools" "$RUNTIME/tools"
 /usr/bin/ditto --noextattr --noqtn "$ROOT_DIR/Models/MetalML" "$RUNTIME/Models/MetalML"
 /usr/bin/ditto --noextattr --noqtn "$ROOT_DIR/Models/MetalMLBatch2" "$RUNTIME/Models/MetalMLBatch2"
+/usr/bin/ditto --noextattr --noqtn "$ROOT_DIR/Models/MLX" "$RUNTIME/Models/MLX"
+/usr/bin/ditto --noextattr --noqtn "$ROOT_DIR/Models/MLXDetector" "$RUNTIME/Models/MLXDetector"
+/usr/bin/ditto --noextattr --noqtn "$ROOT_DIR/Models/MLXRuntime" "$RUNTIME/Models/MLXRuntime"
 /usr/bin/ditto --noextattr --noqtn "$ROOT_DIR/Models/DeformConv" "$RUNTIME/Models/DeformConv"
 /usr/bin/ditto --noextattr --noqtn \
   "$ROOT_DIR/Models/MosaicDetection/rfdetr-vr-v1.pt" \
@@ -113,6 +130,11 @@ mkdir -p "$MACOS_DIR" "$FRAMEWORKS" "$RUNTIME/bin" "$RUNTIME/Models/MosaicDetect
 # The relocator places that library in RuntimeLibraries, so preserve the helper
 # at the corresponding location as well as in the standalone Python home.
 mkdir -p "$FRAMEWORKS/RuntimeLibraries"
+if [[ -n "$RUNTIME_SEED" ]]; then
+  /usr/bin/ditto --noextattr --noqtn \
+    "$RUNTIME_SEED_APP/Contents/Frameworks/RuntimeLibraries" \
+    "$FRAMEWORKS/RuntimeLibraries"
+fi
 /usr/bin/ditto --noextattr --noqtn \
   "$RUNTIME/python/Resources/Python.app" \
   "$FRAMEWORKS/RuntimeLibraries/Resources/Python.app"
@@ -149,8 +171,7 @@ if /usr/bin/unzip -Z1 "$STAGED_ZIP" | /usr/bin/grep -Eq '(^|/)\._'; then
   echo "error: packaged archive contains disallowed AppleDouble metadata" >&2
   exit 1
 fi
-/usr/bin/ditto --noextattr --noqtn "$STAGED_ZIP" "$ZIP_PATH"
-/usr/bin/unzip -tq "$ZIP_PATH"
+publish_archive "$STAGED_ZIP" "$DIST_DIR"
 
 APP_SIZE="$(du -sh "$APP_PATH" | awk '{print $1}')"
 ZIP_SIZE="$(du -sh "$ZIP_PATH" | awk '{print $1}')"

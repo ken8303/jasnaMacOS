@@ -12,6 +12,24 @@ usage() {
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BASELINE_MODELS="$ROOT_DIR/Models/MetalML"
 BASELINE_BATCH2_MODELS="$ROOT_DIR/Models/MetalMLBatch2"
+RESTORATION_BACKEND="${JASNA_RESTORATION_BACKEND:-metal}"
+case "$RESTORATION_BACKEND" in
+  metal) ;;
+  mlx)
+    for required in \
+      "$ROOT_DIR/Models/MLX/basicvsrpp-v1.2.safetensors" \
+      "$ROOT_DIR/Models/MLXRuntime/mlx" \
+      "$ROOT_DIR/tools/restore_mlx_crop.py" \
+      "$ROOT_DIR/.venv-rfdetr/bin/python"; do
+      [[ -e "$required" ]] || {
+        echo "error: MLX restoration component is missing: $required" >&2
+        exit 1
+      }
+    done
+    ;;
+  *) echo "error: JASNA_RESTORATION_BACKEND must be metal or mlx" >&2; exit 1 ;;
+esac
+export JASNA_RESTORATION_BACKEND="$RESTORATION_BACKEND"
 
 metal_model_packages_available() {
   local directory="$1"
@@ -103,9 +121,31 @@ else
   echo "error: JASNA_MODEL_BATCH must be 1, 2, auto, or unset" >&2
   exit 1
 fi
+if [[ "$RESTORATION_BACKEND" == "mlx" ]]; then
+  export JASNA_MODEL_BATCH=1
+  unset JASNA_BATCH2_MODELS_DIR
+fi
 export JASNA_DETECTOR="${JASNA_DETECTOR:-rfdetr-vr-v1}"
-export JASNA_DETECT_DEVICE="${JASNA_DETECT_DEVICE:-auto}"
+if [[ "$RESTORATION_BACKEND" == "mlx" ]]; then
+  export JASNA_DETECT_DEVICE="${JASNA_DETECT_DEVICE:-mlx}"
+else
+  export JASNA_DETECT_DEVICE="${JASNA_DETECT_DEVICE:-auto}"
+fi
 export JASNA_DETECT_DECODE_MODE="${JASNA_DETECT_DECODE_MODE:-sequential}"
+if [[ "$JASNA_DETECT_DEVICE" == "mlx" ]]; then
+  [[ "$JASNA_DETECTOR" == "rfdetr-vr-v1" ]] || {
+    echo "error: MLX detection supports rfdetr-vr-v1 only" >&2
+    exit 1
+  }
+  for required in \
+    "$ROOT_DIR/Models/MLXDetector/rfdetr-vr-v1.safetensors" \
+    "$ROOT_DIR/Models/MLXRuntime/mlx"; do
+    [[ -e "$required" ]] || {
+      echo "error: MLX detector component is missing: $required" >&2
+      exit 1
+    }
+  done
+fi
 if [[ -z "${JASNA_WORK_CONTAINER+x}" ]]; then
   RECORDED_WORK_CONTAINER=""
   if [[ -s "$ROLLOUT_RESUME_CONFIG" ]]; then
@@ -127,9 +167,9 @@ export JASNA_DIRECT_SBS_OUTPUT="${JASNA_DIRECT_SBS_OUTPUT:-1}"
 export JASNA_SHARED_SBS_SOURCE="${JASNA_SHARED_SBS_SOURCE:-1}"
 export JASNA_COMPOSITE_CONCURRENCY="${JASNA_COMPOSITE_CONCURRENCY:-1}"
 export JASNA_RUNTIME_SCRATCH_ON_OUTPUT="${JASNA_RUNTIME_SCRATCH_ON_OUTPUT:-1}"
-# The lower-level workflow still requires every source/model/range/quality field
-# to match. The rollout wrapper may safely reuse work after an app/script update.
-export JASNA_ALLOW_IMPLEMENTATION_RESUME="${JASNA_ALLOW_IMPLEMENTATION_RESUME:-1}"
+# Reusing cached crops across restoration-code changes can mix two algorithms in
+# one output. Require an explicit opt-in for known-compatible updates.
+export JASNA_ALLOW_IMPLEMENTATION_RESUME="${JASNA_ALLOW_IMPLEMENTATION_RESUME:-0}"
 export JASNA_FAST_ENCODE="${JASNA_FAST_ENCODE:-1}"
 export JASNA_LOG_PEAK_MEMORY="${JASNA_LOG_PEAK_MEMORY:-1}"
 export JASNA_MOSAIC_MASK_RECOVERY_ALL_REGIONS="${JASNA_MOSAIC_MASK_RECOVERY_ALL_REGIONS:-1}"
@@ -138,6 +178,7 @@ export JASNA_TEMPORAL_WARMUP_FRAMES="${JASNA_TEMPORAL_WARMUP_FRAMES:-5}"
 echo "Jasna macOS 27 rollout profile"
 echo "Performance profile: $PERFORMANCE_PROFILE"
 echo "Model track: baseline (fine-tuned candidates are test-only)"
+echo "Restoration backend: $RESTORATION_BACKEND"
 echo "Models: $JASNA_MODELS_DIR"
 echo "Detector: $JASNA_DETECTOR on $JASNA_DETECT_DEVICE; model batch: $JASNA_MODEL_BATCH"
 echo "Detector memory: batch $JASNA_DETECT_BATCH_SIZE, $JASNA_DETECT_DECODE_MODE decode"
@@ -148,7 +189,7 @@ echo "Memory profile: bounded (batch $JASNA_MODEL_BATCH, crop handoff $([[ "$JAS
 echo "Frame compositing concurrency: $JASNA_COMPOSITE_CONCURRENCY"
 echo "Runtime scratch beside output: $JASNA_RUNTIME_SCRATCH_ON_OUTPUT"
 echo "Restart data after validated success: preserved"
-echo "Accelerators: RF-DETR=MPS GPU; restoration/composite=Metal ML/Metal; encode=VideoToolbox"
+echo "Accelerators: RF-DETR=$JASNA_DETECT_DEVICE; restoration=$RESTORATION_BACKEND; composite=Metal; encode=VideoToolbox"
 echo "CPU boundary: 8192x4096/4096x4096 HEVC decode and FFmpeg spatial/time filters"
 echo "Ordinary mask-hole recovery: $JASNA_MOSAIC_MASK_RECOVERY_ALL_REGIONS"
 echo "Temporal crop warm-up: $JASNA_TEMPORAL_WARMUP_FRAMES frame(s)"

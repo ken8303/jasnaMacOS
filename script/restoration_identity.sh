@@ -66,6 +66,15 @@ jasna_implementation_fingerprint() {
     "$root_dir/tools/manifest_window_runs.py" \
     "$root_dir/tools/mosaic_time_ranges.py" \
     "$root_dir/tools/rfdetr_mps_detector.py" \
+    "$root_dir/tools/rfdetr_mlx_backbone.py" \
+    "$root_dir/tools/rfdetr_mlx_projector.py" \
+    "$root_dir/tools/rfdetr_mlx_deformable.py" \
+    "$root_dir/tools/rfdetr_mlx_decoder.py" \
+    "$root_dir/tools/rfdetr_mlx_segmentation.py" \
+    "$root_dir/tools/rfdetr_mlx_postprocess.py" \
+    "$root_dir/tools/rfdetr_mlx_detector.py" \
+    "$root_dir/tools/basicvsrpp_mlx_segments.py" \
+    "$root_dir/tools/restore_mlx_crop.py" \
     "$root_dir/tools/scan_mosaic_regions.py" \
     "$root_dir/tools/reconcile_stereo_manifests.py"
 }
@@ -92,6 +101,21 @@ jasna_model_fingerprint() {
   esac
   local detector_hash
   detector_hash="$(jasna_content_fingerprint "$detector_model")"
+  if [[ "${JASNA_DETECT_DEVICE:-auto}" == "mlx" ]]; then
+    detector_hash="$({
+      printf 'pytorch-source=%s\n' "$detector_hash"
+      printf 'mlx-archive=%s\n' "$(jasna_content_fingerprint \
+        "$root_dir/Models/MLXDetector/rfdetr-vr-v1.safetensors")"
+    } | jasna_hash_lines)"
+  fi
+  if [[ "${JASNA_RESTORATION_BACKEND:-metal}" == "mlx" ]]; then
+    {
+      printf 'detector=%s\n' "$detector_hash"
+      printf 'restoration-mlx=%s\n' "$(jasna_content_fingerprint \
+        "$root_dir/Models/MLX/basicvsrpp-v1.2.safetensors")"
+    } | jasna_hash_lines
+    return
+  fi
   {
     printf 'detector=%s\n' "$detector_hash"
     printf 'restoration=%s\n' "$(jasna_metadata_fingerprint \
