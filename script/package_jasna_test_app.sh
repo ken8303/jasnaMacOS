@@ -138,6 +138,19 @@ fi
 /usr/bin/ditto --noextattr --noqtn \
   "$RUNTIME/python/Resources/Python.app" \
   "$FRAMEWORKS/RuntimeLibraries/Resources/Python.app"
+FRAMEWORK_PYTHON_HELPER="$FRAMEWORKS/RuntimeLibraries/Resources/Python.app/Contents/MacOS/Python"
+# This copy sits four directories below RuntimeLibraries. Its original rpath
+# belongs to the copy under Runtime/python and cannot resolve @rpath/Python here.
+OLD_PYTHON_HELPER_RPATH='@loader_path/../../../../../../../Frameworks/RuntimeLibraries'
+NEW_PYTHON_HELPER_RPATH='@loader_path/../../../..'
+if /usr/bin/otool -l "$FRAMEWORK_PYTHON_HELPER" | /usr/bin/grep -Fq "$OLD_PYTHON_HELPER_RPATH"; then
+  /usr/bin/install_name_tool -rpath \
+    "$OLD_PYTHON_HELPER_RPATH" "$NEW_PYTHON_HELPER_RPATH" \
+    "$FRAMEWORK_PYTHON_HELPER"
+elif ! /usr/bin/otool -l "$FRAMEWORK_PYTHON_HELPER" | /usr/bin/grep -Fq "$NEW_PYTHON_HELPER_RPATH"; then
+  /usr/bin/install_name_tool -add_rpath \
+    "$NEW_PYTHON_HELPER_RPATH" "$FRAMEWORK_PYTHON_HELPER"
+fi
 /usr/bin/ditto --noextattr --noqtn "$FFMPEG_BINARY" "$RUNTIME/bin/ffmpeg"
 /usr/bin/ditto --noextattr --noqtn "$FFPROBE_BINARY" "$RUNTIME/bin/ffprobe"
 /bin/rm -f "$RUNTIME/.venv-rfdetr/bin/python" \
@@ -163,6 +176,11 @@ echo "Applying an ad-hoc test signature"
 xattr -cr "$APP_PATH"
 /usr/bin/codesign --force --deep --sign - --timestamp=none "$APP_PATH"
 /usr/bin/codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+"$RUNTIME/.venv-rfdetr/bin/python" -c \
+  'import sys; assert sys.version_info[:2] == (3, 13); sys.path.insert(0, sys.argv[1]); import mlx.core, rfdetr' \
+  "$RUNTIME/Models/MLXRuntime"
+"$RUNTIME/bin/ffmpeg" -version >/dev/null
+"$RUNTIME/bin/ffprobe" -version >/dev/null
 
 echo "Creating shareable ZIP archive"
 /usr/bin/ditto -c -k --norsrc --noextattr --noqtn --keepParent \
