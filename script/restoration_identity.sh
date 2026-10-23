@@ -8,35 +8,22 @@ jasna_hash_lines() {
 }
 
 jasna_content_fingerprint() {
-  local path file
+  local path file index=0 relative digest
   {
     for path in "$@"; do
       if [[ -f "$path" ]]; then
-        /usr/bin/shasum -a 256 "$path"
+        digest="$(/usr/bin/shasum -a 256 "$path" | /usr/bin/awk '{print $1}')"
+        printf 'file[%s]=%s\n' "$index" "$digest"
       elif [[ -d "$path" ]]; then
         while IFS= read -r file; do
-          /usr/bin/shasum -a 256 "$file"
+          relative="${file#"$path"/}"
+          digest="$(/usr/bin/shasum -a 256 "$file" | /usr/bin/awk '{print $1}')"
+          printf 'directory[%s]/%s=%s\n' "$index" "$relative" "$digest"
         done < <(/usr/bin/find "$path" -type f -print | LC_ALL=C /usr/bin/sort)
       else
-        printf 'missing  %s\n' "$path"
+        printf 'missing[%s]\n' "$index"
       fi
-    done
-  } | LC_ALL=C /usr/bin/sort | jasna_hash_lines
-}
-
-jasna_metadata_fingerprint() {
-  local path file
-  {
-    for path in "$@"; do
-      if [[ -f "$path" ]]; then
-        /usr/bin/stat -f '%N|%z|%m' "$path"
-      elif [[ -d "$path" ]]; then
-        while IFS= read -r file; do
-          /usr/bin/stat -f '%N|%z|%m' "$file"
-        done < <(/usr/bin/find "$path" -type f -print | LC_ALL=C /usr/bin/sort)
-      else
-        printf 'missing|%s\n' "$path"
-      fi
+      index=$((index + 1))
     done
   } | LC_ALL=C /usr/bin/sort | jasna_hash_lines
 }
@@ -118,7 +105,7 @@ jasna_model_fingerprint() {
   fi
   {
     printf 'detector=%s\n' "$detector_hash"
-    printf 'restoration=%s\n' "$(jasna_metadata_fingerprint \
+    printf 'restoration=%s\n' "$(jasna_content_fingerprint \
       "$models_dir" \
       "$batch2_models_dir" \
       "$root_dir/Models/DeformConv")"

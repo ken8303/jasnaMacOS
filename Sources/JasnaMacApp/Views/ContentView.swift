@@ -7,153 +7,117 @@ struct ContentView: View {
         RestorationPerformanceProfile.fast.rawValue
     @AppStorage("restorationBackend") private var backendRawValue =
         RestorationBackend.metal.rawValue
+    @AppStorage("hybridDetectorDefaultApplied") private var hybridDetectorDefaultApplied = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            VStack(alignment: .leading, spacing: 5) {
-                Text("Jasna VR Mosaic Restoration")
-                    .font(.largeTitle.weight(.semibold))
-                Text(
-                    "Restore only the time ranges you identify. The rest of the original "
-                        + "side-by-side video is copied directly into the final output."
-                )
-                .foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text("Jasna VR Restoration")
+                    .font(.title.weight(.semibold))
+                Text("Drop your videos, choose a model, and start restoration.")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
             }
 
-            GroupBox {
-                VStack(spacing: 8) {
-                    FileSelectionRow(
-                        title: "Source SBS video",
-                        systemImage: "film.stack",
-                        url: session.inputURL,
-                        placeholder: "Choose the original VR video",
-                        action: session.chooseInput
-                    )
-                    Divider()
-                    FileSelectionRow(
-                        title: "Restored output",
-                        systemImage: "square.and.arrow.down",
-                        url: session.outputURL,
-                        placeholder: "Choose where to save the restored video",
-                        action: session.chooseOutput
-                    )
-                }
-                .padding(6)
-            } label: {
-                Label("Video Files", systemImage: "movieclapper")
-            }
-            .disabled(session.isRunning)
-
-            MosaicRangesView(session: session)
+            SourceDropZone(session: session)
                 .disabled(session.isRunning)
 
             GroupBox {
-                VStack(alignment: .leading, spacing: 8) {
-                    Picker("Restoration model", selection: backendBinding) {
-                        ForEach(RestorationBackend.allCases) { backend in
-                            Text(backend.title).tag(backend)
-                        }
-                    }
-                    .pickerStyle(.segmented)
-                    Text(backend.detail)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                .padding(6)
-            } label: {
-                Label("Restoration Model", systemImage: "cpu")
-            }
-            .disabled(session.isRunning)
-
-            GroupBox {
-                VStack(alignment: .leading, spacing: 8) {
-                    Picker("Performance", selection: performanceProfileBinding) {
-                        ForEach(RestorationPerformanceProfile.allCases) { profile in
-                            Text(profile.title).tag(profile)
-                        }
-                    }
-                    .pickerStyle(.segmented)
-
-                    Label(
-                        backend == .mlx
-                            ? "MLX detects mosaics and restores crops; Metal composites the video."
-                            : performanceProfile.detail,
-                        systemImage: "gauge.with.dots.needle.67percent"
-                    )
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                }
-                .padding(6)
-            } label: {
-                Label("Performance", systemImage: "speedometer")
-            }
-            .disabled(session.isRunning)
-
-            GroupBox {
                 VStack(alignment: .leading, spacing: 10) {
-                    ForEach(session.progress.phases) { phase in
-                        HStack {
-                            Text(phase.title)
-                                .frame(width: 145, alignment: .leading)
-                            ProgressView(value: phase.fraction)
-                            Text(phase.fraction, format: .percent.precision(.fractionLength(0)))
-                                .monospacedDigit()
-                                .frame(width: 42, alignment: .trailing)
+                    HStack(spacing: 16) {
+                        Text("Restoration")
+                        Picker("Restoration model", selection: backendBinding) {
+                            ForEach(RestorationBackend.allCases) { backend in
+                                Text(backend.title).tag(backend)
+                            }
+                        }
+                        .labelsHidden()
+                        .pickerStyle(.segmented)
+                        .frame(width: 210)
+                        .help(backend.detail)
+                        Spacer()
+                        Text("Performance")
+                        Picker("Performance", selection: performanceProfileBinding) {
+                            ForEach(RestorationPerformanceProfile.allCases) { profile in
+                                Text(profile.title).tag(profile)
+                            }
+                        }
+                        .labelsHidden()
+                        .pickerStyle(.segmented)
+                        .frame(width: 180)
+                        .help(performanceProfile.detail)
+                    }
+                    MosaicRangesView(session: session)
+                    Toggle("Shut down after all videos finish successfully", isOn: $session.autoShutdownAfterCompletion)
+                        .font(.caption)
+                        .help("Shutdown starts only after all queued videos pass validation, with 60 seconds to cancel.")
+                }
+                .padding(4)
+            } label: {
+                Text("Settings")
+            }
+            .disabled(session.isRunning)
+
+            GroupBox {
+                VStack(spacing: 8) {
+                    HStack(spacing: 14) {
+                        ForEach(session.progress.phases) { phase in
+                            VStack(alignment: .leading, spacing: 4) {
+                                HStack {
+                                    Text(phase.title).lineLimit(1)
+                                    Spacer(minLength: 3)
+                                    Text(phase.fraction, format: .percent.precision(.fractionLength(0)))
+                                        .monospacedDigit()
+                                }
+                                .font(.caption)
+                                ProgressView(value: phase.fraction)
+                            }
+                            .frame(maxWidth: .infinity)
                         }
                     }
                     HStack {
                         Text("Overall (approx.)")
-                        Spacer()
                         Text(session.progress.overallFraction, format: .percent.precision(.fractionLength(0)))
                             .monospacedDigit()
-                        if let estimatedCompletion = session.progress.estimatedCompletion,
-                           session.isRunning {
-                            Text("Current phase finishes around \(estimatedCompletion.formatted(date: .abbreviated, time: .shortened))")
-                                .foregroundStyle(.secondary)
-                        } else if session.isRunning {
-                            Text("Phase finish time: estimating…")
-                                .foregroundStyle(.secondary)
+                        Spacer()
+                        if session.isRunning, let estimatedCompletion = session.progress.estimatedCompletion {
+                            Text("Current phase finishes around \(estimatedCompletion.formatted(date: .omitted, time: .shortened))")
                         }
                     }
                     .font(.caption)
+                    .foregroundStyle(.secondary)
                 }
-                .padding(6)
+                .padding(4)
             } label: {
-                Label("Progress", systemImage: "chart.bar.fill")
+                Text("Progress")
             }
-
-            Toggle(
-                "Shut down this Mac after successful completion",
-                isOn: $session.autoShutdownAfterCompletion
-            )
-            .help("Only shuts down after the final output passes validation. A 60-second cancellation period is provided.")
-            .disabled(session.isRunning)
 
             if let validationMessage = session.validationMessage {
-                Label(validationMessage, systemImage: "exclamationmark.triangle.fill")
+                Text(validationMessage)
+                    .font(.caption)
                     .foregroundStyle(.red)
-                    .textSelection(.enabled)
+                    .lineLimit(2)
+                    .help(validationMessage)
             }
             if let logWarning = session.logWarning {
-                Label(logWarning, systemImage: "externaldrive.badge.exclamationmark")
+                Text(logWarning)
                     .font(.caption)
                     .foregroundStyle(.orange)
-                    .textSelection(.enabled)
+                    .lineLimit(1)
+                    .help(logWarning)
             }
 
-            HStack(spacing: 12) {
-                if session.isRunning {
-                    ProgressView().controlSize(.small)
-                } else {
-                    Image(systemName: statusSymbol)
-                        .foregroundStyle(statusColor)
-                }
+            HStack(spacing: 10) {
+                Image(systemName: session.isRunning ? "play.circle" : statusSymbol)
+                    .foregroundStyle(statusColor)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(session.state.title).font(.headline)
-                    Text(session.activity)
+                    Text(session.isRunning ? "Video \(session.activeSourceIndex + 1) of \(session.sourceURLs.count)" : session.state.title)
+                        .font(.headline)
+                    Text(session.implementationResumeAvailable ? "App updated. Resume matching saved work." : session.activity)
                         .font(.caption)
                         .foregroundStyle(.secondary)
-                        .lineLimit(2)
+                        .lineLimit(1)
+                        .help(session.activity)
                 }
                 Spacer()
                 if session.canRevealOutput {
@@ -165,22 +129,35 @@ struct ContentView: View {
                 if session.isRunning {
                     Button("Stop", role: .destructive) { session.stop() }
                 } else {
-                    Button("Start Restoration") {
-                        session.start(performanceProfile: performanceProfile, backend: backend)
-                    }
-                        .buttonStyle(.borderedProminent)
-                        .keyboardShortcut(.return, modifiers: [.command])
+                    if session.implementationResumeAvailable {
+                        Button("Resume Saved Work") {
+                            session.start(performanceProfile: performanceProfile, backend: backend, allowImplementationResume: true)
+                        }
                         .disabled(!session.canStart)
+                    }
+                    Button(session.freshStartAvailable ? "Start Fresh" : "Start Restoration") {
+                        session.start(performanceProfile: performanceProfile, backend: backend, startFresh: session.freshStartAvailable)
+                    }
+                    .help(session.freshStartAvailable
+                          ? "Preserve this video's previous output and saved work in a backup folder, then restart with the selected settings."
+                          : "Restore the queued videos, resuming compatible saved work.")
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.return, modifiers: [.command])
+                    .disabled(!session.canStart)
                 }
             }
 
-            // Let the log leaf observe logText. Reading it here would invalidate and rebuild
-            // this entire form on every live-log refresh.
             RestorationLogView(session: session)
         }
-        .padding(24)
-        .frame(minWidth: 720, minHeight: 820)
-        .onAppear { session.selectBackend(backend) }
+        .padding(18)
+        .frame(minWidth: 760, minHeight: 720)
+        .onAppear {
+            if !hybridDetectorDefaultApplied {
+                backendRawValue = RestorationBackend.metal.rawValue
+                hybridDetectorDefaultApplied = true
+            }
+            session.selectBackend(backend)
+        }
     }
 
     private var performanceProfile: RestorationPerformanceProfile {

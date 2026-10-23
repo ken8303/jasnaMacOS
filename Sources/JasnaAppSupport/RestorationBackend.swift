@@ -14,7 +14,7 @@ public enum RestorationBackend: String, CaseIterable, Identifiable, Sendable {
     public var detail: String {
         switch self {
         case .metal: "Validated restoration engine"
-        case .mlx: "Experimental MLX detection and v1.2 restoration"
+        case .mlx: "Experimental v1.2 restoration engine"
         }
     }
 

@@ -27,6 +27,7 @@ usage() {
 REFERENCE_WORK_DIR="$1"
 OUTPUT_PATH="$2"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$ROOT_DIR/script/lib/runtime_environment.sh"
 [[ -d "$REFERENCE_WORK_DIR" ]] || {
   echo "error: reference work directory not found: $REFERENCE_WORK_DIR" >&2
   exit 1
@@ -79,7 +80,7 @@ done
 WINDOWS_PER_PROCESS="${JASNA_METAL_WINDOWS_PER_PROCESS:-1}"
 VIDEO_BITRATE="${JASNA_VIDEO_BITRATE:-40000000}"
 VALIDATE_ONLY="${JASNA_RESTORE_ONLY_VALIDATE:-0}"
-GPU_TIMEOUT_RETRIES="${JASNA_GPU_TIMEOUT_RETRIES:-2}"
+GPU_TIMEOUT_RETRIES="${JASNA_GPU_TIMEOUT_RETRIES:-0}"
 START_WINDOW="${JASNA_RESTORE_ONLY_START_SECOND:-0}"
 SELECTED_SECONDS="${JASNA_RESTORE_ONLY_SECONDS:-}"
 AUDIO_START_SECOND="${JASNA_RESTORE_ONLY_AUDIO_START_SECOND:-$START_WINDOW}"
@@ -201,7 +202,7 @@ if [[ -s "$PHYSICAL_LEFT_INPUT" && -s "$PHYSICAL_RIGHT_INPUT" ]]; then
   LEFT_INPUT="$PHYSICAL_LEFT_INPUT"
   RIGHT_INPUT="$PHYSICAL_RIGHT_INPUT"
   if [[ "$PHYSICAL_LEFT_INPUT" -ef "$PHYSICAL_RIGHT_INPUT" ]]; then
-    RESTORE_INPUT_KIND="one shared 8K SBS decode"
+    RESTORE_INPUT_KIND="one shared SBS decode"
   else
     RESTORE_INPUT_KIND="physical 4K eye files"
   fi
@@ -223,13 +224,13 @@ else
     fi
   done
   [[ -n "$SHARED_SEGMENT_INPUT" ]] || SHARED_SEGMENT_INPUT="$SOURCE_SBS"
-  # The direct stereo command recognizes identical 8K left/right paths and
+  # The direct stereo command recognizes identical SBS left/right paths and
   # performs one shared decode with in-memory eye crops. Newer production work
   # directories intentionally omit the old physical 4K intermediates. Prefer
   # the first bounded shared segment because its timeline matches manifest 0.
   LEFT_INPUT="$SHARED_SEGMENT_INPUT"
   RIGHT_INPUT="$SHARED_SEGMENT_INPUT"
-  RESTORE_INPUT_KIND="one shared 8K SBS decode"
+  RESTORE_INPUT_KIND="one shared SBS decode"
 fi
 
 find_one_manifest() {
@@ -283,9 +284,10 @@ SOURCE_INFO="$(
 )"
 IFS=, read -r SOURCE_CODEC SOURCE_WIDTH SOURCE_HEIGHT SOURCE_RATE \
   SOURCE_FRAME_COUNT SOURCE_EXTRA <<< "$SOURCE_INFO"
-[[ -z "$SOURCE_EXTRA" && "$SOURCE_WIDTH" == "8192" \
-  && "$SOURCE_HEIGHT" == "4096" && "$SOURCE_FRAME_COUNT" =~ ^[0-9]+$ ]] || {
-  echo "error: reference source must be a frame-counted 8192x4096 video" >&2
+[[ -z "$SOURCE_EXTRA" && "$SOURCE_FRAME_COUNT" =~ ^[0-9]+$ \
+  && ( ( "$SOURCE_WIDTH" == "8192" && "$SOURCE_HEIGHT" == "4096" ) \
+    || ( "$SOURCE_WIDTH" == "3840" && "$SOURCE_HEIGHT" == "1920" ) ) ]] || {
+  echo "error: reference source must be a frame-counted 8192x4096 or 3840x1920 SBS video" >&2
   echo "found: $SOURCE_INFO" >&2
   exit 1
 }
@@ -328,11 +330,13 @@ END_WINDOW=$((START_WINDOW + SELECTED_SECONDS))
   exit 1
 }
 
-/usr/bin/python3 - "$LEFT_MANIFEST" "$RIGHT_MANIFEST" "$LEFT_INPUT_FRAME_COUNT" <<'PY'
+/usr/bin/python3 - "$LEFT_MANIFEST" "$RIGHT_MANIFEST" \
+  "$LEFT_INPUT_FRAME_COUNT" "$SOURCE_HEIGHT" <<'PY'
 import json
 import sys
 
 expected_frames = int(sys.argv[3])
+eye_dimension = int(sys.argv[4])
 for eye, path in zip(("left", "right"), sys.argv[1:3]):
     with open(path, "r", encoding="utf-8") as handle:
         manifest = json.load(handle)
@@ -340,9 +344,10 @@ for eye, path in zip(("left", "right"), sys.argv[1:3]):
         manifest.get("width"), manifest.get("height"),
         manifest.get("frameCount"), manifest.get("framesPerSecond"),
     )
-    if actual != (4096, 4096, expected_frames, 30):
+    if actual != (eye_dimension, eye_dimension, expected_frames, 30):
         raise SystemExit(
-            f"error: {eye} manifest does not match the reusable 4096x4096, "
+            f"error: {eye} manifest does not match the reusable "
+            f"{eye_dimension}x{eye_dimension}, "
             f"{expected_frames}-frame, 30-fps input: {actual}"
         )
 PY
@@ -450,8 +455,8 @@ valid_segment() {
       -show_entries stream=codec_name,width,height,avg_frame_rate,nb_frames \
       -of csv=p=0 "$candidate" 2>/dev/null
   )
-  [[ -z "$extra" && "$codec" == "hevc" && "$width" == "8192" \
-    && "$height" == "4096" && "$frames" =~ ^[0-9]+$ ]] || return 1
+  [[ -z "$extra" && "$codec" == "hevc" && "$width" == "$SOURCE_WIDTH" \
+    && "$height" == "$SOURCE_HEIGHT" && "$frames" =~ ^[0-9]+$ ]] || return 1
   /usr/bin/awk -v actual="$frames" -v expected="$expected_frames" '
     BEGIN { delta = actual - expected; if (delta < 0) delta = -delta; exit !(delta <= 1) }
   ' || return 1
@@ -533,7 +538,7 @@ while (( WINDOW_START < END_WINDOW )); do
           exit "$STATUS"
         fi
         if (( ATTEMPT >= GPU_TIMEOUT_RETRIES )); then
-          echo "error: restoration exhausted $GPU_TIMEOUT_RETRIES GPU-timeout retries" >&2
+          echo "error: Metal GPU timeout; restoration stopped. Checkpoints are preserved. Automatic retry limit: $GPU_TIMEOUT_RETRIES." >&2
           exit "$STATUS"
         fi
         ATTEMPT=$((ATTEMPT + 1))

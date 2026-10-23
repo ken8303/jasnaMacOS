@@ -20,7 +20,7 @@ struct JasnaMacApp: App {
         WindowGroup("Jasna VR Restoration", id: "restoration") {
             ContentView(session: session)
         }
-        .defaultSize(width: 820, height: 900)
+        .defaultSize(width: 860, height: 820)
         .windowResizability(.contentMinSize)
     }
 }

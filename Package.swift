@@ -24,5 +24,9 @@ let package = Package(
             name: "JasnaAppSupportTests",
             dependencies: ["JasnaAppSupport"]
         ),
+        .testTarget(
+            name: "JasnaMacAppTests",
+            dependencies: ["JasnaMacApp", "JasnaAppSupport"]
+        ),
     ]
 )

@@ -30,12 +30,14 @@ final class RestorationSession {
         }
     }
 
-    var inputURL: URL?
-    var outputURL: URL?
+    private(set) var sourceURLs: [URL] = []
+    private(set) var activeSourceIndex = 0
+    var inputURL: URL? { sourceURLs.indices.contains(activeSourceIndex) ? sourceURLs[activeSourceIndex] : nil }
+    var outputURL: URL? { inputURL.map { RestorationSourceQueue.outputURL(for: $0) } }
     var selectedBackend: RestorationBackend = .metal
     var ranges = [MosaicTimeRangeDraft()]
     var state: State = .ready
-    var activity = "Choose a source video and output file. Leave mosaic times blank for full video."
+    var activity = "Drop source videos here. Restored files are saved beside each source. Leave mosaic times blank for full video."
     var logText = ""
     var validationMessage: String?
     var logWarning: String?
@@ -49,6 +51,8 @@ final class RestorationSession {
     var progress = RestorationProgressSnapshot.initial
     var shutdownCountdownSeconds: Int?
 
+    @ObservationIgnored private var pendingRequests: [Request] = []
+    @ObservationIgnored private let projectRootURL: URL?
     @ObservationIgnored private var process: Process?
     @ObservationIgnored private var outputPipe: Pipe?
     @ObservationIgnored private var outputCoordinator: ProcessOutputCoordinator?
@@ -62,6 +66,10 @@ final class RestorationSession {
     // The complete transcript is persisted by QueuedLogWriter. Keep only a small tail in
     // SwiftUI so frequent updates do not repeatedly lay out hundreds of thousands of glyphs.
     @ObservationIgnored private let maximumVisibleLogCharacters = 64_000
+
+    init(projectRootURL: URL? = nil) {
+        self.projectRootURL = projectRootURL
+    }
 
     var isRunning: Bool { state == .running || state == .stopping }
     var canStart: Bool { inputURL != nil && outputURL != nil && !isRunning }
@@ -81,41 +89,69 @@ final class RestorationSession {
     }
 
     func chooseInput() {
-        guard let selected = FilePanelService.chooseInputVideo() else { return }
-        inputURL = selected
-        validationMessage = nil
-        outputURL = selected.deletingLastPathComponent()
-            .appendingPathComponent(suggestedOutputName(for: selected, backend: selectedBackend))
+        addSources(FilePanelService.chooseInputVideos())
     }
 
-    func chooseOutput() {
-        let suggestedName = inputURL.map {
-            suggestedOutputName(for: $0, backend: selectedBackend)
-        } ?? "restored-vr.mp4"
-        guard let selected = FilePanelService.chooseOutputVideo(suggestedName: suggestedName) else {
-            return
+    func addSources(_ urls: [URL]) {
+        guard !isRunning, !urls.isEmpty else { return }
+        var accepted = sourceURLs
+        var rejected = [String]()
+        for candidate in urls {
+            let url = candidate.resolvingSymlinksInPath().standardizedFileURL
+            guard RestorationSourceQueue.accepts(url) else {
+                rejected.append(candidate.lastPathComponent)
+                continue
+            }
+            if accepted.contains(where: { (try? FileIdentity.refersToSameFile($0, url)) == true }) { continue }
+            accepted.append(url)
         }
-        outputURL = selected
+        if accepted != sourceURLs {
+            sourceURLs = accepted
+            resetForSourceChange()
+        }
+        validationMessage = rejected.isEmpty ? nil : "These files are not supported videos: " + rejected.joined(separator: ", ")
+    }
+
+    func removeSource(_ url: URL) {
+        guard !isRunning else { return }
+        sourceURLs.removeAll { $0 == url }
+        resetForSourceChange()
+    }
+
+    func clearSources() {
+        guard !isRunning else { return }
+        sourceURLs = []
+        resetForSourceChange()
+    }
+
+    private func resetForSourceChange() {
+        shutdownTask?.cancel()
+        shutdownTask = nil
+        shutdownCountdownSeconds = nil
+        logRefreshTask?.cancel()
+        logRefreshTask = nil
+        pendingVisibleLog = ""
+        logText = ""
+        logSessionID = UUID()
+        uiLogWriter?.close()
+        uiLogWriter = nil
+        logWarning = nil
+        outputDecoder = UTF8StreamDecoder()
+        progress = progressTracker.reset()
+        pendingRequests = []
+        activeSourceIndex = 0
+        state = .ready
+        implementationResumeAvailable = false
+        freshStartAvailable = false
         validationMessage = nil
+        activity = sourceURLs.isEmpty
+            ? "Drop source videos here. Restored files are saved beside each source."
+            : "Ready to restore \(sourceURLs.count) video(s). Results will be saved beside each source."
     }
 
     func selectBackend(_ backend: RestorationBackend) {
-        guard selectedBackend != backend else { return }
-        if let inputURL, let outputURL,
-           outputURL.deletingLastPathComponent().standardizedFileURL
-             == inputURL.deletingLastPathComponent().standardizedFileURL,
-           outputURL.lastPathComponent
-             == suggestedOutputName(for: inputURL, backend: selectedBackend) {
-            self.outputURL = outputURL.deletingLastPathComponent()
-                .appendingPathComponent(suggestedOutputName(for: inputURL, backend: backend))
-        }
         selectedBackend = backend
         validationMessage = nil
-    }
-
-    private func suggestedOutputName(for source: URL, backend: RestorationBackend) -> String {
-        source.deletingPathExtension().lastPathComponent
-            + (backend == .mlx ? "-restored-mlx.mp4" : "-restored.mp4")
     }
 
     func addRange() {
@@ -128,16 +164,33 @@ final class RestorationSession {
         validationMessage = nil
     }
 
-    func start(performanceProfile: RestorationPerformanceProfile, backend: RestorationBackend) {
+    private(set) var implementationResumeAvailable = false
+    private(set) var freshStartAvailable = false
+
+    func start(
+        performanceProfile: RestorationPerformanceProfile,
+        backend: RestorationBackend,
+        allowImplementationResume: Bool = false,
+        startFresh: Bool = false
+    ) {
         guard !isRunning else { return }
+        let freshAttempt = startFresh && freshStartAvailable
+        let resumeAfterUpdate = !freshAttempt && allowImplementationResume && implementationResumeAvailable
         // Cancel the previous run's countdown even if validating this new request fails.
         shutdownTask?.cancel()
         shutdownTask = nil
         shutdownCountdownSeconds = nil
         do {
-            let request = try validatedRequest(performanceProfile: performanceProfile, backend: backend)
-            try launch(request)
+            try RestorationSourceQueue.validate(sourceURLs)
+            if state == .completed { activeSourceIndex = 0 }
+            pendingRequests = try sourceURLs.dropFirst(activeSourceIndex).map { source in
+                try validatedRequest(inputURL: source, performanceProfile: performanceProfile, backend: backend)
+            }
+            guard !pendingRequests.isEmpty else { throw ValidationError("Add at least one source video.") }
+            let request = pendingRequests.removeFirst()
+            try launch(request, allowImplementationResume: resumeAfterUpdate, startFresh: freshAttempt)
         } catch {
+            pendingRequests = []
             state = .failed
             validationMessage = error.localizedDescription
             activity = error.localizedDescription
@@ -145,11 +198,16 @@ final class RestorationSession {
     }
 
     func stop() {
-        guard let process, process.isRunning else { return }
+        // Completion can already be queued on the main actor after the child exits.
+        // Record cancellation before checking the process so it cannot launch another video.
+        guard isRunning else { return }
+        pendingRequests = []
         state = .stopping
         activity = "Stopping restoration safely…"
         appendLog("\nUser requested stop. Waiting for the current process to exit…\n")
-        ProcessTreeTerminator.terminate(rootIdentifier: process.processIdentifier)
+        if let process, process.isRunning {
+            ProcessTreeTerminator.terminate(rootIdentifier: process.processIdentifier)
+        }
     }
 
     func revealOutput() {
@@ -175,16 +233,14 @@ final class RestorationSession {
     }
 
     private func validatedRequest(
+        inputURL: URL,
         performanceProfile: RestorationPerformanceProfile,
         backend: RestorationBackend
     ) throws -> Request {
-        guard let inputURL else {
-            throw ValidationError("Choose a source side-by-side video.")
-        }
         guard FileManager.default.fileExists(atPath: inputURL.path) else {
             throw ValidationError("The selected source video no longer exists.")
         }
-        guard let outputURL else { throw ValidationError("Choose an output video file.") }
+        let outputURL = RestorationSourceQueue.outputURL(for: inputURL)
         guard try !FileIdentity.refersToSameFile(inputURL, outputURL) else {
             throw ValidationError("The output file must be different from the source video.")
         }
@@ -194,7 +250,7 @@ final class RestorationSession {
         let ranges = try MosaicTimeRangeParser.optionalCommandArgument(
             for: self.ranges.map(\.value)
         )
-        guard let rootURL = ProjectRootLocator.locate() else {
+        guard let rootURL = projectRootURL ?? ProjectRootLocator.locate() else {
             throw ValidationError(
                 "The Jasna project could not be found. Launch the app from the project folder "
                     + "or set JASNA_PROJECT_ROOT."
@@ -211,7 +267,10 @@ final class RestorationSession {
         )
     }
 
-    private func launch(_ request: Request) throws {
+    private func launch(_ request: Request, allowImplementationResume: Bool, startFresh: Bool = false) throws {
+        guard try !FileIdentity.refersToSameFile(request.inputURL, request.outputURL) else {
+            throw ValidationError("The output file must be different from the source video.")
+        }
         let scriptURL = request.rootURL.appendingPathComponent("script/restore_vr_rollout.sh")
         let process = Process()
         let pipe = Pipe()
@@ -219,9 +278,10 @@ final class RestorationSession {
         var arguments = ["bash", scriptURL.path, request.inputURL.path, request.outputURL.path]
         if let ranges = request.ranges { arguments.append(ranges) }
         process.arguments = arguments
-        process.currentDirectoryURL = request.rootURL
+        process.currentDirectoryURL = request.outputURL.deletingLastPathComponent()
         var environment = ProcessInfo.processInfo.environment
         environment["PYTHONUNBUFFERED"] = "1"
+        environment["PYTHONDONTWRITEBYTECODE"] = "1"
         if let runtimeURL = Bundle.main.resourceURL?
             .appendingPathComponent("Runtime", isDirectory: true),
            FileManager.default.fileExists(atPath: runtimeURL.path)
@@ -235,6 +295,10 @@ final class RestorationSession {
         }
         environment.merge(request.performanceProfile.processEnvironment) { _, requested in requested }
         environment.merge(request.backend.processEnvironment) { _, requested in requested }
+        // This opt-in belongs to this attempt only. The shell still verifies all other settings.
+        environment["JASNA_ALLOW_IMPLEMENTATION_RESUME"] = allowImplementationResume ? "1" : "0"
+        // Fresh start applies only to the failed video, never the remaining queue.
+        environment["JASNA_START_FRESH"] = startFresh ? "1" : "0"
         process.environment = environment
         // GUI-launched child processes must never inherit a terminal as stdin. FFmpeg otherwise
         // receives SIGTTIN and silently pauses when it probes stdin from a background process group.
@@ -243,6 +307,8 @@ final class RestorationSession {
         process.standardError = pipe
 
         logText = ""
+        implementationResumeAvailable = false
+        freshStartAvailable = false
         logRefreshTask?.cancel()
         logRefreshTask = nil
         pendingVisibleLog = ""
@@ -254,7 +320,7 @@ final class RestorationSession {
         openUILog(beside: request.outputURL)
         validationMessage = nil
         appendLog(
-            "Jasna VR restoration\nSource: \(request.inputURL.path)\n"
+            "Jasna VR restoration\nQueue: \(activeSourceIndex + 1)/\(sourceURLs.count)\nSource: \(request.inputURL.path)\n"
                 + "Output: \(request.outputURL.path)\nMosaic ranges: "
                 + "\(request.ranges ?? "full video (automatic detection)")\n"
                 + "Performance: \(request.performanceProfile.logDescription)\n"
@@ -365,6 +431,21 @@ final class RestorationSession {
         outputPipe = nil
         outputCoordinator = nil
         process = nil
+        if status == 0, state != .stopping, !pendingRequests.isEmpty {
+            uiLogWriter?.close()
+            uiLogWriter = nil
+            activeSourceIndex += 1
+            let next = pendingRequests.removeFirst()
+            do {
+                try launch(next, allowImplementationResume: false)
+            } catch {
+                pendingRequests = []
+                state = .failed
+                validationMessage = error.localizedDescription
+                activity = error.localizedDescription
+            }
+            return
+        }
         if state == .stopping {
             // A child may exit successfully just as Stop is requested. User cancellation
             // still takes precedence over success-triggered actions such as shutdown.
@@ -381,8 +462,16 @@ final class RestorationSession {
                 activity = "Restoration completed successfully. Restart files were preserved."
             }
         } else {
+            pendingRequests = []
             state = .failed
-            activity = "Restoration stopped with exit code \(status). Review the log below."
+            implementationResumeAvailable = logText.contains(
+                "only the implementation changed; set JASNA_ALLOW_IMPLEMENTATION_RESUME=1 once to reuse compatible work"
+            )
+            freshStartAvailable = logText.contains("error: this output path belongs to a different test configuration")
+                || logText.contains("error: a previous fresh start was interrupted")
+            activity = freshStartAvailable
+                ? "Saved work uses different settings. Start Fresh preserves it in a backup folder."
+                : "Restoration stopped with exit code \(status). Review the log below."
         }
         uiLogWriter?.close()
         uiLogWriter = nil

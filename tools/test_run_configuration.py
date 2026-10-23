@@ -2,6 +2,7 @@
 
 from pathlib import Path
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -9,6 +10,178 @@ import zipfile
 
 
 class RunConfigurationSafetyTests(unittest.TestCase):
+    def test_implementation_resume_still_rejects_changed_settings(self):
+        root = Path(__file__).resolve().parents[1]
+        script = (root / "script/test_vr_sparse_30s.sh").read_text()
+        guard = script.split('if [[ -s "$RUN_CONFIG_PATH" ]]; then', 1)[1].split(
+            'RUN_CONFIG_TEMP=', 1
+        )[0]
+        guard = 'if [[ -s "$RUN_CONFIG_PATH" ]]; then' + guard
+        original = "input=source.mp4\nmodels=original\ndetector=rfdetr-vr-v1\nimplementation_fingerprint=old\n"
+        for opt_in, change, expected in (
+            ("0", "implementation", 1),
+            ("1", "implementation", 0),
+            ("1", "input", 1),
+            ("1", "models", 1),
+        ):
+            with self.subTest(opt_in=opt_in, change=change), tempfile.TemporaryDirectory() as directory:
+                config = Path(directory) / "run-config"
+                config.write_text(original)
+                current = original.replace("implementation_fingerprint=old", "implementation_fingerprint=new")
+                if change == "input":
+                    current = current.replace("source.mp4", "different.mp4")
+                elif change == "models":
+                    current = current.replace("models=original", "models=different")
+                result = subprocess.run(
+                    ["bash", "-c", guard], capture_output=True, text=True,
+                    env=dict(os.environ, RUN_CONFIG_PATH=str(config), RUN_CONFIG=current,
+                             ALLOW_IMPLEMENTATION_RESUME=opt_in),
+                )
+                self.assertEqual(result.returncode, expected, result.stderr)
+                if expected == 0:
+                    self.assertIn("one-time implementation-only resume", result.stdout)
+                elif change == "implementation":
+                    self.assertIn("only the implementation changed", result.stderr)
+                else:
+                    self.assertNotIn("only the implementation changed", result.stderr)
+
+    def test_packaged_launcher_does_not_build_or_write_inside_app(self):
+        root = Path(__file__).resolve().parents[1]
+        for mode in ("automatic_engine", "explicit_engine", "missing_engine"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                work = Path(directory)
+                app = work / "Applications/Jasna VR Restoration.app"
+                runtime = app / "Contents/Resources/Runtime"
+                scripts = runtime / "script"
+                (scripts / "lib").mkdir(parents=True)
+                (runtime / "Models/MetalML").mkdir(parents=True)
+                for relative in ("script/build_and_run.sh", "script/lib/runtime_environment.sh"):
+                    shutil.copyfile(root / relative, runtime / relative)
+                engine = app / "Contents/MacOS/JasnaMetalPoC"
+                engine.parent.mkdir(parents=True)
+                if mode != "missing_engine":
+                    engine.write_text('#!/bin/bash\nprintf "%s|%s|%s\\n" "$PWD" "$*" "$PYTHONDONTWRITEBYTECODE" > "$ENGINE_MARKER"\n')
+                    engine.chmod(0o555)
+                before = sorted(str(p.relative_to(app)) for p in app.rglob("*"))
+                for folder in sorted((p for p in app.rglob("*") if p.is_dir()), reverse=True):
+                    folder.chmod(0o555)
+                app.chmod(0o555)
+                env = os.environ.copy()
+                env.pop("JASNA_APP_BINARY", None)
+                env.pop("JASNA_MODELS_DIR", None)
+                marker = work / "engine-result"
+                env.update(ENGINE_MARKER=str(marker), TMPDIR=directory)
+                if mode == "explicit_engine":
+                    env["JASNA_APP_BINARY"] = str(engine)
+                try:
+                    result = subprocess.run(["bash", str(scripts / "build_and_run.sh"), "--verify"],
+                                            env=env, capture_output=True, text=True)
+                    self.assertEqual(sorted(str(p.relative_to(app)) for p in app.rglob("*")), before)
+                    self.assertFalse((runtime / ".build").exists())
+                    if mode == "missing_engine":
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertIn("bundled restoration engine is missing", result.stderr)
+                        self.assertFalse(marker.exists())
+                    else:
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertEqual(marker.read_text().strip(), directory + "|--self-test|1")
+                finally:
+                    app.chmod(0o755)
+                    for folder in (p for p in app.rglob("*") if p.is_dir()):
+                        folder.chmod(0o755)
+
+    def test_output_publication_preserves_previous_video_on_failure(self):
+        helper = Path(__file__).resolve().parents[1] / "script/lib/vr_sparse_media.sh"
+        for mode in ("success", "invalid", "backup_failure"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                work = Path(directory)
+                output = work / "video.mp4"
+                output.write_bytes(b"previous video")
+                candidate = work / "joined.mp4"
+                candidate.write_bytes(b"new video")
+                env = os.environ.copy()
+                env.update(OUTPUT_PATH=str(output), OUTPUT_DIR=str(work if mode != "backup_failure" else work / "missing"),
+                           OUTPUT_STEM="video", OUTPUT_NAME="video.mp4", TEST_VALID="0" if mode == "invalid" else "1")
+                command = ('source "$1"\n'
+                           'completed_sbs_output() { [[ "$TEST_VALID" == 1 ]]; }\n'
+                           'explain_sbs_validation_failure() { :; }\n'
+                           'publish_validated_sbs_output "$2"')
+                result = subprocess.run(["bash", "-c", command, "test", str(helper), str(candidate)],
+                                        env=env, capture_output=True, text=True)
+                if mode == "success":
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(output.read_bytes(), b"new video")
+                    backups = list(work.glob("video.previous-*.mp4"))
+                    self.assertEqual(len(backups), 1)
+                    self.assertEqual(backups[0].read_bytes(), b"previous video")
+                    self.assertFalse(candidate.exists())
+                else:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(output.read_bytes(), b"previous video")
+                    self.assertEqual(candidate.read_bytes(), b"new video")
+                self.assertEqual(list(work.glob(".jasna-previous.*")), [])
+
+    def test_source_audio_copies_compatible_streams_and_handles_unsupported_codecs(self):
+        helper = Path(__file__).resolve().parents[1] / "script/lib/vr_sparse_media.sh"
+        for codecs, expected in (("aac", "-c:a copy"), ("aac\nac3", "-c:a copy"),
+                                 ("", "-c:a copy"), ("opus", "-c:a aac -b:a 256k")):
+            with self.subTest(codecs=codecs), tempfile.TemporaryDirectory() as directory:
+                probe = Path(directory) / "ffprobe"
+                probe.write_text('#!/bin/bash\nprintf "%s\\n" "$MOCK_CODECS"\n')
+                probe.chmod(0o755)
+                env = os.environ.copy()
+                env.update(FFPROBE_PATH=str(probe), INPUT_PATH="input.mp4", MOCK_CODECS=codecs)
+                command = ('source "$1"\nsource_audio_encoding_args\n'
+                           'printf "args=%s\\n" "${SOURCE_AUDIO_ARGS[*]}"')
+                result = subprocess.run(["bash", "-c", command, "test", str(helper)],
+                                        env=env, capture_output=True, text=True, check=True)
+                self.assertIn("args=" + expected, result.stdout)
+
+    def test_gpu_failure_stops_without_resubmitting_and_preserves_checkpoint(self):
+        root = Path(__file__).resolve().parents[1]
+        workflows = (
+            ("script/lib/vr_sparse_direct.sh", "RESTORE_ATTEMPT=0", "RESTORED_WINDOW_COUNT="),
+            ("script/test_vr_restore_only_30s.sh", "      ATTEMPT=0", "      valid_segment"),
+        )
+        for path, start, end in workflows:
+            source = (root / path).read_text(encoding="utf-8")
+            default = next(line.strip() for line in source.splitlines()
+                           if line.strip().startswith('GPU_TIMEOUT_RETRIES='))
+            loop = source[source.index(start):].split(end, 1)[0]
+            for failure, status in (("GPU Timeout Error", 7), ("Other failure", 7), ("", 0)):
+                with self.subTest(workflow=path, failure=failure), tempfile.TemporaryDirectory() as directory:
+                    work = Path(directory)
+                    (work / "script").mkdir()
+                    stub = work / "script/build_and_run.sh"
+                    stub.write_text(
+                        '#!/bin/bash\n'
+                        'echo call >> "$COUNT_FILE"\n'
+                        'echo checkpoint > "$CHECKPOINT_FILE"\n'
+                        'echo "$MOCK_FAILURE" >> "${4%.mov}.jasna.log"\n'
+                        'exit "$MOCK_STATUS"\n', encoding="utf-8")
+                    stub.chmod(0o755)
+                    environment = os.environ.copy()
+                    environment.pop("JASNA_GPU_TIMEOUT_RETRIES", None)
+                    environment.update(ROOT_DIR=directory, COUNT_FILE=str(work / "calls"),
+                                       CHECKPOINT_FILE=str(work / "checkpoint"),
+                                       MOCK_FAILURE=failure, MOCK_STATUS=str(status))
+                    setup = '\n'.join((
+                        'set -euo pipefail', default,
+                        'DIRECT_SEGMENT="$ROOT_DIR/output.mov"; SEGMENT="$DIRECT_SEGMENT"',
+                        'WINDOW_START=0; WINDOW_COUNT=1; VR_BITRATE=1000; VIDEO_BITRATE=1000',
+                        'JOB_LEFT_INPUT=left; JOB_RIGHT_INPUT=right; JOB_LEFT_MANIFEST=left.json',
+                        'JOB_RIGHT_MANIFEST=right.json; JOB_LEFT_CACHE=left-cache; JOB_RIGHT_CACHE=right-cache',
+                        'LEFT_INPUT=left; RIGHT_INPUT=right; LEFT_MANIFEST=left.json; RIGHT_MANIFEST=right.json',
+                        'LEFT_CACHE=left-cache; RIGHT_CACHE=right-cache; PROCESS_WORK="$ROOT_DIR/work"',
+                    ))
+                    result = subprocess.run(["bash", "-c", setup + '\n' + loop],
+                                            env=environment, capture_output=True, text=True)
+                    self.assertEqual(result.returncode, status, result.stderr)
+                    self.assertEqual((work / "calls").read_text().splitlines(), ["call"])
+                    self.assertEqual((work / "checkpoint").read_text(), "checkpoint\n")
+                    if failure == "GPU Timeout Error":
+                        self.assertIn("Checkpoints are preserved", result.stderr)
+
     def test_persistent_workflows_include_diagnostic_passthrough_in_resume_identity(self):
         root = Path(__file__).resolve().parents[1]
         expected = "allow_passthrough=${JASNA_ALLOW_PASSTHROUGH:-0}"
@@ -48,6 +221,65 @@ class RunConfigurationSafetyTests(unittest.TestCase):
             'elif [[ "$REQUESTED_MODEL_BATCH" == "1" ]]', 1
         )[0]
         self.assertIn("export JASNA_MODEL_BATCH=2", batch_two_branch)
+
+    def test_rollout_defaults_to_mlx_detection_and_metal_restoration(self):
+        root = Path(__file__).resolve().parents[1]
+        rollout = (root / "script" / "restore_vr_rollout.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('JASNA_RESTORATION_BACKEND:-metal', rollout)
+        self.assertIn('JASNA_DETECT_DEVICE:-mlx', rollout)
+        self.assertNotIn('JASNA_DETECT_DEVICE:-auto', rollout)
+        self.assertIn(
+            '"$ROLLOUT_RESUME_CONFIG" detect_device JASNA_DETECT_DEVICE',
+            rollout,
+        )
+
+    def test_content_fingerprint_survives_app_relocation(self):
+        root = Path(__file__).resolve().parents[1]
+        identity = root / "script" / "restoration_identity.sh"
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            copies = [base / "first", base / "second"]
+            for copy in copies:
+                (copy / "model").mkdir(parents=True)
+                (copy / "model" / "weights.bin").write_bytes(b"same model")
+                (copy / "runtime.py").write_text("same code", encoding="utf-8")
+            os.utime(copies[1] / "model" / "weights.bin", (1, 1))
+
+            def fingerprint(copy):
+                result = subprocess.run(
+                    ["bash", "-c", 'source "$1"; jasna_content_fingerprint "$2" "$3"',
+                     "bash", str(identity), str(copy / "runtime.py"), str(copy / "model")],
+                    check=True, capture_output=True, text=True,
+                )
+                return result.stdout.strip()
+
+            self.assertEqual(fingerprint(copies[0]), fingerprint(copies[1]))
+            (copies[1] / "model" / "weights.bin").write_bytes(b"changed model")
+            self.assertNotEqual(fingerprint(copies[0]), fingerprint(copies[1]))
+
+    def test_saved_detector_is_reused_unless_explicitly_overridden(self):
+        root = Path(__file__).resolve().parents[1]
+        helper = root / "script" / "lib" / "run_configuration.sh"
+        with tempfile.TemporaryDirectory() as temporary:
+            config = Path(temporary) / "run-config.txt"
+            config.write_text("detect_device=mps\n", encoding="utf-8")
+            command = (
+                'source "$1"; jasna_adopt_recorded_environment "$2" '
+                'detect_device JASNA_DETECT_DEVICE; printf "%s" "$JASNA_DETECT_DEVICE"'
+            )
+            base = {key: value for key, value in os.environ.items()
+                    if key != "JASNA_DETECT_DEVICE"}
+            for override, expected in ((None, "mps"), ("mlx", "mlx")):
+                environment = dict(base)
+                if override is not None:
+                    environment["JASNA_DETECT_DEVICE"] = override
+                result = subprocess.run(
+                    ["bash", "-c", command, "bash", str(helper), str(config)],
+                    check=True, capture_output=True, text=True, env=environment,
+                )
+                self.assertEqual(result.stdout, expected)
 
     def test_rollout_fast_profile_uses_measured_memory_accelerators(self):
         root = Path(__file__).resolve().parents[1]

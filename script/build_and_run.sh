@@ -4,6 +4,7 @@ set -euo pipefail
 MODE="${1:-run}"
 APP_NAME="JasnaMetalPoC"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$ROOT_DIR/script/lib/runtime_environment.sh"
 MODELS_DIR="${JASNA_MODELS_DIR:-$ROOT_DIR/Models/MetalML}"
 PIPELINE_LOAD_ONLY=0
 GRAPH_LIFECYCLE_ONLY=0
@@ -247,15 +248,10 @@ case "$MODE" in
     ;;
 esac
 
-cd "$ROOT_DIR"
-mkdir -p "$ROOT_DIR/.build/ModuleCache"
-export CLANG_MODULE_CACHE_PATH="$ROOT_DIR/.build/ModuleCache"
-export SWIFTPM_MODULECACHE_OVERRIDE="$ROOT_DIR/.build/ModuleCache"
 BUILD_ARGUMENTS=(--disable-sandbox)
 case "$MODE" in
   --metal-ml-load-only|metal-ml-load-only|--metal-ml-graph-lifecycle|metal-ml-graph-lifecycle|--restore-sbs-video|restore-sbs-video|--restore-sbs-window|restore-sbs-window|--restore-sbs-eye|restore-sbs-eye|--restore-eye-video|restore-eye-video|--restore-eye-windows|restore-eye-windows|--restore-eye-windows-sparse|restore-eye-windows-sparse|--restore-eye-windows-sparse-batch|restore-eye-windows-sparse-batch|--restore-stereo-sparse-batch|restore-stereo-sparse-batch|--core-ml-comparison|core-ml-comparison|--core-ml-spynet|core-ml-spynet)
     BUILD_ARGUMENTS+=(-c release)
-    echo "Building optimized restoration binary..."
     ;;
 esac
 if [[ -n "${JASNA_APP_BINARY:-}" ]]; then
@@ -263,9 +259,15 @@ if [[ -n "${JASNA_APP_BINARY:-}" ]]; then
     echo "error: JASNA_APP_BINARY is not executable: $JASNA_APP_BINARY" >&2
     exit 1
   }
-  APP_BINARY="$JASNA_APP_BINARY"
+  APP_BINARY="$(cd "$(dirname "$JASNA_APP_BINARY")" && pwd)/$(basename "$JASNA_APP_BINARY")"
+  cd "${JASNA_WORK_DIR:-${TMPDIR:-/tmp}}"
   echo "Using shared optimized restoration binary: $APP_BINARY"
 else
+  cd "$ROOT_DIR"
+  mkdir -p "$ROOT_DIR/.build/ModuleCache"
+  export CLANG_MODULE_CACHE_PATH="$ROOT_DIR/.build/ModuleCache"
+  export SWIFTPM_MODULECACHE_OVERRIDE="$ROOT_DIR/.build/ModuleCache"
+  echo "Building restoration binary..."
   swift build "${BUILD_ARGUMENTS[@]}"
   APP_BINARY="$(swift build "${BUILD_ARGUMENTS[@]}" --show-bin-path)/$APP_NAME"
 fi

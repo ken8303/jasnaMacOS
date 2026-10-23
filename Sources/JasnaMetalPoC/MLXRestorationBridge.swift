@@ -34,7 +34,10 @@ enum MLXRestorationBridge {
                     library.path, root.appendingPathComponent("tools").path, script.path,
                     "--archive", archive.path, "--serve"
                 ]
-                child.currentDirectoryURL = root
+                child.currentDirectoryURL = inputPath.deletingLastPathComponent()
+                var environment = ProcessInfo.processInfo.environment
+                environment["PYTHONDONTWRITEBYTECODE"] = "1"
+                child.environment = environment
                 let stdinPipe = Pipe()
                 let stdoutPipe = Pipe()
                 child.standardInput = stdinPipe

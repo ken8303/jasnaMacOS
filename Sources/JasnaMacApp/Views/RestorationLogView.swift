@@ -24,7 +24,7 @@ struct RestorationLogView: View {
                     if followLatest { proxy.scrollTo("log-end", anchor: .bottom) }
                 }
             }
-            .frame(minHeight: 150)
+            .frame(minHeight: 110)
         } label: {
             HStack {
                 Text("Live Log")

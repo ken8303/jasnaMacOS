@@ -4,6 +4,45 @@
 # This file is sourced after the workflow has validated its configuration; it
 # deliberately uses the caller's FFmpeg paths, dimensions, and work directories.
 
+source_audio_encoding_args() {
+  SOURCE_AUDIO_ARGS=(-c:a copy)
+  local codecs codec
+  codecs="$("$FFPROBE_PATH" -v error -select_streams a \
+    -show_entries stream=codec_name -of default=noprint_wrappers=1:nokey=1 \
+    "$INPUT_PATH")" || return 1
+  while IFS= read -r codec; do
+    case "$codec" in
+      ''|aac|mp3|ac3|eac3|alac) ;;
+      *)
+        SOURCE_AUDIO_ARGS=(-c:a aac -b:a 256k)
+        echo "Source audio codec $codec requires AAC conversion for the working container"
+        return 0
+        ;;
+    esac
+  done <<< "$codecs"
+}
+
+publish_validated_sbs_output() (
+  set -euo pipefail
+  local candidate="$1" pending="" backup
+  completed_sbs_output "$candidate" || {
+    explain_sbs_validation_failure "$candidate"
+    echo "error: output validation failed; existing output preserved" >&2
+    return 1
+  }
+  trap 'if [[ -n "$pending" ]]; then rm -f "$pending"; fi' EXIT
+  if [[ -e "$OUTPUT_PATH" ]]; then
+    pending="$(mktemp "$OUTPUT_DIR/.jasna-previous.XXXXXX")"
+    /bin/cp -p "$OUTPUT_PATH" "$pending"
+    backup="$OUTPUT_DIR/${OUTPUT_STEM}.previous-$(date '+%Y%m%d-%H%M%S')-${pending##*.}.${OUTPUT_NAME##*.}"
+    /bin/mv "$pending" "$backup"
+    pending=""
+  fi
+  # Both paths live on the output volume. Rename only after validation and
+  # successful backup, keeping the current output accessible until publication.
+  /bin/mv -f "$candidate" "$OUTPUT_PATH"
+)
+
 video_duration() {
   "$FFPROBE_PATH" -v error -show_entries format=duration \
     -of default=noprint_wrappers=1:nokey=1 "$1" 2>/dev/null

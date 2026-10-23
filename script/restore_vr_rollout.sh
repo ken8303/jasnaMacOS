@@ -10,6 +10,7 @@ usage() {
 [[ $# -ge 2 && $# -le 3 ]] || usage
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$ROOT_DIR/script/lib/runtime_environment.sh"
 BASELINE_MODELS="$ROOT_DIR/Models/MetalML"
 BASELINE_BATCH2_MODELS="$ROOT_DIR/Models/MetalMLBatch2"
 RESTORATION_BACKEND="${JASNA_RESTORATION_BACKEND:-metal}"
@@ -85,7 +86,7 @@ ROLLOUT_OUTPUT_NAME="$(basename "$2")"
 ROLLOUT_OUTPUT_STEM="${ROLLOUT_OUTPUT_NAME%.*}"
 ROLLOUT_RESUME_CONFIG="$(dirname "$2")/${ROLLOUT_OUTPUT_STEM}.jasna-vr-full-v22-work/run-config.txt"
 RECORDED_MODEL_BATCH=""
-if [[ -s "$ROLLOUT_RESUME_CONFIG" ]]; then
+if [[ "${JASNA_START_FRESH:-0}" != "1" && -s "$ROLLOUT_RESUME_CONFIG" ]]; then
   RECORDED_MODEL_BATCH="$(
     /usr/bin/awk -F= '$1 == "model_batch" { print $2; exit }' \
       "$ROLLOUT_RESUME_CONFIG"
@@ -126,11 +127,12 @@ if [[ "$RESTORATION_BACKEND" == "mlx" ]]; then
   unset JASNA_BATCH2_MODELS_DIR
 fi
 export JASNA_DETECTOR="${JASNA_DETECTOR:-rfdetr-vr-v1}"
-if [[ "$RESTORATION_BACKEND" == "mlx" ]]; then
-  export JASNA_DETECT_DEVICE="${JASNA_DETECT_DEVICE:-mlx}"
-else
-  export JASNA_DETECT_DEVICE="${JASNA_DETECT_DEVICE:-auto}"
+source "$ROOT_DIR/script/lib/run_configuration.sh"
+if [[ "${JASNA_START_FRESH:-0}" != "1" ]]; then
+  jasna_adopt_recorded_environment \
+    "$ROLLOUT_RESUME_CONFIG" detect_device JASNA_DETECT_DEVICE
 fi
+export JASNA_DETECT_DEVICE="${JASNA_DETECT_DEVICE:-mlx}"
 export JASNA_DETECT_DECODE_MODE="${JASNA_DETECT_DECODE_MODE:-sequential}"
 if [[ "$JASNA_DETECT_DEVICE" == "mlx" ]]; then
   [[ "$JASNA_DETECTOR" == "rfdetr-vr-v1" ]] || {
@@ -148,7 +150,7 @@ if [[ "$JASNA_DETECT_DEVICE" == "mlx" ]]; then
 fi
 if [[ -z "${JASNA_WORK_CONTAINER+x}" ]]; then
   RECORDED_WORK_CONTAINER=""
-  if [[ -s "$ROLLOUT_RESUME_CONFIG" ]]; then
+  if [[ "${JASNA_START_FRESH:-0}" != "1" && -s "$ROLLOUT_RESUME_CONFIG" ]]; then
     RECORDED_WORK_CONTAINER="$(
       /usr/bin/awk -F= '$1 == "work_container" { print $2; exit }' \
         "$ROLLOUT_RESUME_CONFIG"
@@ -167,6 +169,9 @@ export JASNA_DIRECT_SBS_OUTPUT="${JASNA_DIRECT_SBS_OUTPUT:-1}"
 export JASNA_SHARED_SBS_SOURCE="${JASNA_SHARED_SBS_SOURCE:-1}"
 export JASNA_COMPOSITE_CONCURRENCY="${JASNA_COMPOSITE_CONCURRENCY:-1}"
 export JASNA_RUNTIME_SCRATCH_ON_OUTPUT="${JASNA_RUNTIME_SCRATCH_ON_OUTPUT:-1}"
+# A watchdog timeout can precede a GPU firmware panic. Stop by default rather
+# than submitting more work immediately after the GPU has failed.
+export JASNA_GPU_TIMEOUT_RETRIES="${JASNA_GPU_TIMEOUT_RETRIES:-0}"
 # Reusing cached crops across restoration-code changes can mix two algorithms in
 # one output. Require an explicit opt-in for known-compatible updates.
 export JASNA_ALLOW_IMPLEMENTATION_RESUME="${JASNA_ALLOW_IMPLEMENTATION_RESUME:-0}"
@@ -189,6 +194,7 @@ echo "Memory profile: bounded (batch $JASNA_MODEL_BATCH, crop handoff $([[ "$JAS
 echo "Frame compositing concurrency: $JASNA_COMPOSITE_CONCURRENCY"
 echo "Runtime scratch beside output: $JASNA_RUNTIME_SCRATCH_ON_OUTPUT"
 echo "Restart data after validated success: preserved"
+echo "GPU timeout automatic retries: $JASNA_GPU_TIMEOUT_RETRIES (checkpoints preserved on failure)"
 echo "Accelerators: RF-DETR=$JASNA_DETECT_DEVICE; restoration=$RESTORATION_BACKEND; composite=Metal; encode=VideoToolbox"
 echo "CPU boundary: 8192x4096/4096x4096 HEVC decode and FFmpeg spatial/time filters"
 echo "Ordinary mask-hole recovery: $JASNA_MOSAIC_MASK_RECOVERY_ALL_REGIONS"

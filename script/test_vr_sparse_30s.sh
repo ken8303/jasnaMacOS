@@ -8,7 +8,7 @@ usage() {
   echo "          JASNA_MOSAIC_RANGES=00:12:00-00:14:00,00:20:30-00:22:00" >&2
   echo "          JASNA_ENCODER_WINDOWS_PER_SEGMENT=4 (bounded eye-by-eye disk use)" >&2
   echo "          JASNA_METAL_WINDOWS_PER_PROCESS=2 (balanced default; set 1 for minimum memory or 8 for validated fast mode)" >&2
-  echo "          JASNA_GPU_TIMEOUT_RETRIES=2 (fresh-process checkpoint retries)" >&2
+  echo "          JASNA_GPU_TIMEOUT_RETRIES=0 (stop on GPU timeout; preserve checkpoints)" >&2
   echo "          JASNA_DETECT_DEVICE=auto (MPS with automatic CPU fallback; or force cpu)" >&2
   echo "          JASNA_STEREO_DETECT=1 (one RF-DETR load/decode for both SBS eyes)" >&2
   echo "          JASNA_STEREO_SAMPLE_MODE=paired (experimental: alternating)" >&2
@@ -34,6 +34,7 @@ INPUT_PATH="$1"
 OUTPUT_PATH="$2"
 START_TIME="${3:-0}"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$ROOT_DIR/script/lib/runtime_environment.sh"
 source "$ROOT_DIR/script/restoration_identity.sh"
 TEST_SECONDS="${JASNA_TEST_SECONDS:-30}"
 FAST_ENCODE="${JASNA_FAST_ENCODE:-1}"
@@ -335,6 +336,12 @@ prepare_runtime_scratch() {
 trap cleanup_workflow EXIT
 trap 'exit 130' INT
 trap 'exit 143' HUP TERM
+if [[ "${JASNA_START_FRESH:-0}" == "1" ]]; then
+  /usr/bin/python3 "$ROOT_DIR/tools/archive_restoration_run.py" "$WORK_DIR" "$OUTPUT_PATH" "$$"
+elif [[ -e "$WORK_DIR/.jasna-fresh-start.json" ]]; then
+  echo "error: a previous fresh start was interrupted; choose Start Fresh to finish preserving the previous run" >&2
+  exit 1
+fi
 prepare_runtime_scratch
 
 report_persistent_work() {
@@ -613,6 +620,7 @@ if [[ ! -f "$TEST_INPUT_DONE" ]]; then
       "$TEST_INPUT_TEMP"
   else
     echo "Stage 1/4: preparing a hardware-encoded 30 fps SBS test clip"
+    source_audio_encoding_args
     "$FFMPEG_PATH" \
       -hide_banner \
       -ss "$START_TIME" \
@@ -629,8 +637,7 @@ if [[ ! -f "$TEST_INPUT_DONE" ]]; then
       -bufsize "$((VR_BITRATE * 3))" \
       -g 30 \
       -tag:v hvc1 \
-      -c:a aac \
-      -b:a 256k \
+      "${SOURCE_AUDIO_ARGS[@]}" \
       -n \
       "$TEST_INPUT_TEMP"
   fi
@@ -662,12 +669,18 @@ TEST_VIDEO_DURATION="$(video_stream_duration "$TEST_INPUT")"
   exit 1
 }
 EXPECTED_FRAME_COUNT="$(video_frame_count "$TEST_INPUT")"
-if [[ ! "$EXPECTED_FRAME_COUNT" =~ ^[0-9]+$ ]]; then
-  EXPECTED_FRAME_COUNT="$(
-    /usr/bin/awk -v duration="$TEST_VIDEO_DURATION" \
-      'BEGIN { printf "%d\n", int(duration * 30 + 0.5) }'
-  )"
+# The prepared HEVC clip can report fewer encoded frames than its 30 fps
+# presentation timeline. Segment fallback normalizes timestamps with fps=30,
+# so validate and process the timeline's frame count, including filled gaps.
+TIMELINE_FRAME_COUNT="$(
+  /usr/bin/awk -v duration="$TEST_VIDEO_DURATION" \
+    'BEGIN { printf "%d\n", int(duration * 30 + 0.5) }'
+)"
+if [[ "$EXPECTED_FRAME_COUNT" =~ ^[0-9]+$ \
+  && "$EXPECTED_FRAME_COUNT" != "$TIMELINE_FRAME_COUNT" ]]; then
+  echo "Prepared source has $EXPECTED_FRAME_COUNT encoded frames across $TIMELINE_FRAME_COUNT 30 fps timeline slots; normalizing gaps"
 fi
+EXPECTED_FRAME_COUNT="$TIMELINE_FRAME_COUNT"
 echo "JASNA_PROGRESS|1|1|1|Source video ready"
 
 if [[ -z "${JASNA_APP_BINARY:-}" ]]; then
@@ -1066,17 +1079,10 @@ if completed_sbs_output "$OUTPUT_PATH" \
   echo "Stage 4/4: combined SBS output already complete"
 elif completed_sbs_output "$FINAL_TEMP"; then
   echo "Stage 4/4: promoting previously joined and validated SBS output"
-  if [[ -e "$OUTPUT_PATH" ]]; then
-    mv "$OUTPUT_PATH" \
-      "$OUTPUT_DIR/${OUTPUT_STEM}.previous-$(date '+%Y%m%d-%H%M%S').${OUTPUT_NAME##*.}"
-  fi
-  mv "$FINAL_TEMP" "$OUTPUT_PATH"
+  publish_validated_sbs_output "$FINAL_TEMP"
 else
   if [[ -e "$FINAL_TEMP" ]]; then
     mv "$FINAL_TEMP" "$WORK_DIR/joined-sbs.interrupted-$(date '+%Y%m%d-%H%M%S').mov"
-  fi
-  if [[ -e "$OUTPUT_PATH" ]]; then
-    mv "$OUTPUT_PATH" "$OUTPUT_DIR/${OUTPUT_STEM}.previous-$(date '+%Y%m%d-%H%M%S').${OUTPUT_NAME##*.}"
   fi
 
   echo "Stage 4/4: rebuilding the side-by-side VR preview and copying audio"
@@ -1107,7 +1113,7 @@ else
     echo "error: combined output failed codec, dimensions, frame-count, or decode validation" >&2
     exit 1
   }
-  mv "$FINAL_TEMP" "$OUTPUT_PATH"
+  publish_validated_sbs_output "$FINAL_TEMP"
 fi
 
 FINAL_INFO="$("$FFPROBE_PATH" \

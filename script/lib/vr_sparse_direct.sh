@@ -203,7 +203,7 @@ run_direct_sbs_pipeline() {
       fi
       if [[ "$BYPASS_SUCCEEDED" == "0" ]]; then
         echo "Restoring source segment $((JOB_INDEX + 1))/${#LEFT_JOB_INPUTS[@]}, windows $((WINDOW_START + 1))-$WINDOW_END/$JOB_WINDOW_COUNT"
-        GPU_TIMEOUT_RETRIES="${JASNA_GPU_TIMEOUT_RETRIES:-2}"
+        GPU_TIMEOUT_RETRIES="${JASNA_GPU_TIMEOUT_RETRIES:-0}"
         [[ "$GPU_TIMEOUT_RETRIES" =~ ^[0-9]+$ ]] || {
           echo "error: JASNA_GPU_TIMEOUT_RETRIES must be a non-negative integer" >&2
           exit 1
@@ -237,7 +237,7 @@ run_direct_sbs_pipeline() {
             exit "$RESTORE_STATUS"
           fi
           if (( RESTORE_ATTEMPT >= GPU_TIMEOUT_RETRIES )); then
-            echo "error: Metal restoration exhausted $GPU_TIMEOUT_RETRIES fresh-process GPU-timeout retries" >&2
+            echo "error: Metal GPU timeout; restoration stopped. Checkpoints are preserved. Automatic retry limit: $GPU_TIMEOUT_RETRIES." >&2
             exit "$RESTORE_STATUS"
           fi
           RESTORE_ATTEMPT=$((RESTORE_ATTEMPT + 1))
@@ -340,18 +340,10 @@ run_direct_sbs_pipeline() {
     echo "Final direct SBS output already complete"
   elif completed_sbs_output "$FINAL_TEMP"; then
     echo "Promoting previously joined and validated direct SBS output"
-    if [[ -e "$OUTPUT_PATH" ]]; then
-      mv "$OUTPUT_PATH" \
-        "$OUTPUT_DIR/${OUTPUT_STEM}.previous-$(date '+%Y%m%d-%H%M%S').${OUTPUT_NAME##*.}"
-    fi
-    mv "$FINAL_TEMP" "$OUTPUT_PATH"
+    publish_validated_sbs_output "$FINAL_TEMP"
   else
     if [[ -e "$FINAL_TEMP" ]]; then
       mv "$FINAL_TEMP" "$WORK_DIR/direct-sbs.interrupted-$(date '+%Y%m%d-%H%M%S').mov"
-    fi
-    if [[ -e "$OUTPUT_PATH" ]]; then
-      mv "$OUTPUT_PATH" \
-        "$OUTPUT_DIR/${OUTPUT_STEM}.previous-$(date '+%Y%m%d-%H%M%S').${OUTPUT_NAME##*.}"
     fi
     echo "Joining direct SBS segments and copying source audio without video re-encoding"
     "$FFMPEG_PATH" \
@@ -371,7 +363,7 @@ run_direct_sbs_pipeline() {
       echo "error: direct SBS output failed codec, dimensions, frame-count, or decode validation" >&2
       exit 1
     }
-    mv "$FINAL_TEMP" "$OUTPUT_PATH"
+    publish_validated_sbs_output "$FINAL_TEMP"
   fi
   echo "JASNA_PROGRESS|4|1|1|Output verified"
   echo "Final assembly/validation wall: $((SECONDS - FINAL_ASSEMBLY_STARTED_SECONDS))s; streaming relocation disabled"
