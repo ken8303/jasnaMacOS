@@ -37,6 +37,7 @@ case "$DETECTOR" in
 esac
 DETECT_BATCH_SIZE="${JASNA_DETECT_BATCH_SIZE:-1}"
 DETECT_DEVICE="${JASNA_DETECT_DEVICE:-auto}"
+MLX_DETECTOR_MODE="${JASNA_MLX_DETECTOR_MODE:-stable-fp32}"
 DETECT_DECODE_MODE="${JASNA_DETECT_DECODE_MODE:-sequential}"
 DETECT_SAMPLE_STRIDE="${JASNA_DETECT_SAMPLE_STRIDE:-0.1}"
 STEREO_SAMPLE_MODE="${JASNA_STEREO_SAMPLE_MODE:-paired}"
@@ -66,6 +67,13 @@ fi
   echo "error: JASNA_DETECT_DEVICE must be auto, mps, cpu, or mlx" >&2
   exit 1
 }
+case "$MLX_DETECTOR_MODE" in
+  stable-fp32|compiled-fp32|float16|compiled-float16) ;;
+  *)
+    echo "error: JASNA_MLX_DETECTOR_MODE must be stable-fp32, compiled-fp32, float16, or compiled-float16" >&2
+    exit 1
+    ;;
+esac
 [[ "$DETECT_DECODE_MODE" == "sequential" || "$DETECT_DECODE_MODE" == "seek" ]] || {
   echo "error: JASNA_DETECT_DECODE_MODE must be sequential or seek" >&2
   exit 1
@@ -185,6 +193,7 @@ if [[ $# -eq 3 ]]; then
 fi
 DETECT_COMMAND+=(
   --device "$DETECT_DEVICE"
+  --mlx-mode "$MLX_DETECTOR_MODE"
   --batch-size "$DETECT_BATCH_SIZE"
   --max-detections "$RFDETR_MAX_DETECTIONS"
   --decode-mode "$DETECT_DECODE_MODE"

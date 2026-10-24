@@ -197,6 +197,7 @@ projection=$VR_PROJECTION
 fast_encode=$FAST_ENCODE
 detector=$DETECTOR
 detect_device=$DETECT_DEVICE
+mlx_detector_mode=${JASNA_MLX_DETECTOR_MODE:-stable-fp32}
 detect_batch_size=$DETECT_BATCH_SIZE
 detect_decode_mode=$DETECT_DECODE_MODE
 adaptive_detect=${JASNA_ADAPTIVE_DETECT:-0}
@@ -238,6 +239,14 @@ in_memory_crop_cache=${JASNA_IN_MEMORY_CROP_CACHE:-0}
 in_memory_cache_limit_mb=${JASNA_IN_MEMORY_CACHE_LIMIT_MB:-128}"
 if [[ -s "$RUN_CONFIG_PATH" ]]; then
   EXISTING_RUN_CONFIG="$(/bin/cat "$RUN_CONFIG_PATH")"
+  if ! /usr/bin/grep -q '^mlx_detector_mode=' "$RUN_CONFIG_PATH"; then
+    EXISTING_RUN_CONFIG="$(
+      printf '%s\n' "$EXISTING_RUN_CONFIG" | /usr/bin/awk '
+        { print }
+        /^detect_device=/ { print "mlx_detector_mode=stable-fp32" }
+      '
+    )"
+  fi
   if [[ "$EXISTING_RUN_CONFIG" != "$RUN_CONFIG" ]]; then
     EXISTING_WITHOUT_IMPLEMENTATION="$(
       printf '%s\n' "$EXISTING_RUN_CONFIG" \

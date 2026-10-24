@@ -2,7 +2,10 @@
 """Compare every implemented MLX restoration segment with v1.2 PyTorch math."""
 
 import argparse
+import sys
+from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "Models/MLXRuntime"))
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
@@ -19,7 +22,7 @@ def main():
     parser.add_argument("--archive", required=True)
     args = parser.parse_args()
     state = torch.load(args.weights, map_location="cpu", weights_only=True)
-    prefix = "generator_ema."
+    prefix = "generator_ema." if any(key.startswith("generator_ema.") for key in state) else "generator."
     model = BasicVSRSegments(args.archive)
     rng = np.random.default_rng(7)
 
@@ -112,6 +115,17 @@ def main():
     print(f"deform_conv: max={error.max():.6g} mean={error.mean():.6g}")
     if not np.allclose(expected, actual, atol=1e-4, rtol=1e-4):
         raise AssertionError("deformable convolution differs from PyTorch")
+    model.restoration_kernel = "fused"
+    fused = np.array(model.deform_conv(
+        mx.array(source.transpose(0, 2, 3, 1).copy()),
+        mx.array(offsets.transpose(0, 2, 3, 1).copy()),
+        mx.array(mask.transpose(0, 2, 3, 1).copy()), "backward_1"))
+    model.restoration_kernel = "reference"
+    fused = fused.transpose(0, 3, 1, 2)
+    fused_error = np.abs(expected - fused)
+    print(f"deform_conv_fused: max={fused_error.max():.6g} mean={fused_error.mean():.6g}")
+    if not np.allclose(expected, fused, atol=1e-4, rtol=1e-4):
+        raise AssertionError("fused deformable convolution differs from PyTorch")
 
     condition = rng.normal(size=(1, 192, 5, 6)).astype(np.float32) * 0.1
     flow1 = rng.normal(size=(1, 2, 5, 6)).astype(np.float32) * 0.2

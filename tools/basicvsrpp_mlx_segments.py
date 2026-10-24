@@ -5,8 +5,50 @@ convert_basicvsrpp_mlx.py. Intermediate results are evaluated as the video
 advances so full 30-frame windows fit Metal's graph resource limits.
 """
 
+import os
+
 import mlx.core as mx
 import mlx.nn as nn
+
+
+_DEFORM_SAMPLE_KERNEL = mx.fast.metal_kernel(
+    name="jasna_deform_sample_v1",
+    input_names=["image", "offsets", "mask"],
+    output_names=["patches"],
+    source="""
+        uint index = thread_position_in_grid.x;
+        if (index >= TOTAL) return;
+        uint feature = index % (CHANNELS * TAPS);
+        uint pixel = index / (CHANNELS * TAPS);
+        uint channel = feature / TAPS;
+        uint tap = feature % TAPS;
+        uint group = channel / CHANNELS_PER_GROUP;
+        uint y = (pixel / WIDTH) % HEIGHT;
+        uint x = pixel % WIDTH;
+        uint batch = pixel / (WIDTH * HEIGHT);
+        uint offset_base = (pixel * GROUPS * TAPS + group * TAPS + tap) * 2;
+        float sample_y = float(y) + float(offsets[offset_base]) + float(tap / KERNEL_WIDTH) - float(KERNEL_HEIGHT / 2);
+        float sample_x = float(x) + float(offsets[offset_base + 1]) + float(tap % KERNEL_WIDTH) - float(KERNEL_WIDTH / 2);
+        int x0 = int(floor(sample_x));
+        int y0 = int(floor(sample_y));
+        float dx = sample_x - float(x0);
+        float dy = sample_y - float(y0);
+        float value = 0.0f;
+        for (int yy = 0; yy < 2; ++yy) {
+            int iy = y0 + yy;
+            if (iy < 0 || iy >= HEIGHT) continue;
+            float wy = yy == 0 ? 1.0f - dy : dy;
+            for (int xx = 0; xx < 2; ++xx) {
+                int ix = x0 + xx;
+                if (ix < 0 || ix >= WIDTH) continue;
+                float wx = xx == 0 ? 1.0f - dx : dx;
+                uint source = (((batch * HEIGHT + uint(iy)) * WIDTH + uint(ix)) * CHANNELS) + channel;
+                value += wx * wy * float(image[source]);
+            }
+        }
+        patches[index] = T(value * float(mask[pixel * GROUPS * TAPS + group * TAPS + tap]));
+    """,
+)
 
 
 def flow_warp(x, flow, padding="zeros"):
@@ -47,6 +89,13 @@ def flow_warp(x, flow, padding="zeros"):
 class BasicVSRSegments:
     def __init__(self, archive):
         self.weights = mx.load(str(archive))
+        self.restoration_kernel = os.environ.get(
+            "JASNA_MLX_RESTORATION_KERNEL", "reference"
+        )
+        if self.restoration_kernel not in ("reference", "fused"):
+            raise ValueError(
+                "JASNA_MLX_RESTORATION_KERNEL must be reference or fused"
+            )
 
     def conv(self, x, name, stride=1, padding=1):
         w = self.weights[name + ".weight"]
@@ -114,7 +163,7 @@ class BasicVSRSegments:
         return x
 
     def deform_conv(self, x, offsets, mask, direction):
-        """Reference MLX DCNv2, vectorized across pixels but not kernel taps."""
+        """DCNv2 with selectable reference or fused Metal sampling."""
         batch, height, width, channels = x.shape
         weight = self.weights[f"deform_align.{direction}.weight"]  # OIHW
         bias = self.weights[f"deform_align.{direction}.bias"]
@@ -127,26 +176,67 @@ class BasicVSRSegments:
             raise ValueError("unexpected offset shape")
         if mask.shape != (batch, height, width, groups * taps):
             raise ValueError("unexpected mask shape")
-        # A full video window contains many second-order warps. Materialize
-        # their inputs before expanding 144 bilinear tap samples; otherwise
-        # MLX retains the preceding frames' graphs and exhausts Metal's
-        # resource-count limit on 30-frame windows.
+        # Bound the video graph before expanding the channel/tap samples.
         mx.eval(x, offsets, mask)
-        patches = []
-        for group in range(groups):
-            group_x = x[..., group * (channels // groups):(group + 1) * (channels // groups)]
-            samples = []
-            for tap in range(taps):
-                offset_index = (group * taps + tap) * 2
-                oy = offsets[..., offset_index]
-                ox = offsets[..., offset_index + 1]
-                flow = mx.stack((ox + tap % kw - kw // 2,
-                                 oy + tap // kw - kh // 2), axis=-1)
-                samples.append(flow_warp(group_x, flow) * mask[..., group * taps + tap, None])
-            patches.append(mx.reshape(mx.stack(samples, axis=-1),
-                                      (batch, height, width, (channels // groups) * taps)))
-            mx.eval(patches[-1])
-        unfolded = mx.concatenate(patches, axis=-1)
+        if self.restoration_kernel == "reference":
+            patches = []
+            for group in range(groups):
+                group_x = x[
+                    ...,
+                    group * (channels // groups):(group + 1) * (channels // groups),
+                ]
+                samples = []
+                for tap in range(taps):
+                    offset_index = (group * taps + tap) * 2
+                    oy = offsets[..., offset_index]
+                    ox = offsets[..., offset_index + 1]
+                    flow = mx.stack(
+                        (
+                            ox + tap % kw - kw // 2,
+                            oy + tap // kw - kh // 2,
+                        ),
+                        axis=-1,
+                    )
+                    samples.append(
+                        flow_warp(group_x, flow)
+                        * mask[..., group * taps + tap, None]
+                    )
+                patches.append(
+                    mx.reshape(
+                        mx.stack(samples, axis=-1),
+                        (
+                            batch,
+                            height,
+                            width,
+                            (channels // groups) * taps,
+                        ),
+                    )
+                )
+                mx.eval(patches[-1])
+            unfolded = mx.concatenate(patches, axis=-1)
+            return (
+                mx.matmul(
+                    unfolded,
+                    mx.transpose(mx.reshape(weight, (out_channels, -1))),
+                )
+                + bias
+            )
+        # The fused kernel materializes one channel/tap patch matrix for the
+        # following matrix multiply.
+        unfolded = _DEFORM_SAMPLE_KERNEL(
+            inputs=[x, offsets, mask],
+            template=[
+                ("T", x.dtype), ("HEIGHT", height), ("WIDTH", width),
+                ("CHANNELS", channels), ("CHANNELS_PER_GROUP", channels // groups),
+                ("GROUPS", groups), ("TAPS", taps),
+                ("KERNEL_HEIGHT", kh), ("KERNEL_WIDTH", kw),
+                ("TOTAL", batch * height * width * channels * taps),
+            ],
+            grid=(batch * height * width * channels * taps, 1, 1),
+            threadgroup=(256, 1, 1),
+            output_shapes=[(batch, height, width, channels * taps)],
+            output_dtypes=[x.dtype],
+        )[0]
         return mx.matmul(unfolded, mx.transpose(mx.reshape(weight, (out_channels, -1)))) + bias
 
     def align(self, x, condition, flow_1, flow_2, direction):

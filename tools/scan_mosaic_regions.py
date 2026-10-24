@@ -105,6 +105,12 @@ def parse_args() -> argparse.Namespace:
         help="square segmentation-mask resolution; power of two from 32 through 256",
     )
     parser.add_argument("--device", choices=("auto", "mps", "cpu", "mlx"), default="auto")
+    parser.add_argument(
+        "--mlx-mode",
+        choices=("stable-fp32", "compiled-fp32", "float16", "compiled-float16"),
+        default="stable-fp32",
+        help="MLX detector execution mode; non-default modes are experimental",
+    )
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument(
         "--max-detections",
@@ -853,6 +859,7 @@ def main() -> int:
     else:
         try:
             from rfdetr_mlx_detector import RFDetrMLXDetector
+            from rfdetr_mlx_experimental import ExperimentalRFDetrMLXDetector
         except ImportError as error:
             raise SystemExit("MLX RF-DETR dependencies are missing") from error
 
@@ -902,6 +909,8 @@ def main() -> int:
     detector_description = args.backend
     if args.backend == "rfdetr":
         detector_description += f"/{args.rfdetr_variant}"
+    if device == "mlx":
+        detector_description += f"/{args.mlx_mode}"
     print(
         f"Scanning {width}x{height}, {frame_count} frames at {source_fps:.3f} fps "
         f"on {device}; {detector_description} detector, {args.decode_mode} decode, "
@@ -923,7 +932,15 @@ def main() -> int:
         archive = args.model.parent.parent / "MLXDetector/rfdetr-vr-v1.safetensors"
         if not archive.is_file():
             raise SystemExit(f"MLX RF-DETR archive is missing: {archive}")
-        model = RFDetrMLXDetector(archive, max_select=args.max_detections)
+        if args.mlx_mode == "stable-fp32":
+            model = RFDetrMLXDetector(archive, max_select=args.max_detections)
+        else:
+            model = ExperimentalRFDetrMLXDetector(
+                archive,
+                max_select=args.max_detections,
+                precision="float16" if "float16" in args.mlx_mode else "float32",
+                compile_forward=args.mlx_mode.startswith("compiled-"),
+            )
     else:
         model = RFDetrMPSDetector(
             args.model,

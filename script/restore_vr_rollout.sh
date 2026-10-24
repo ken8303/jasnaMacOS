@@ -14,6 +14,11 @@ source "$ROOT_DIR/script/lib/runtime_environment.sh"
 BASELINE_MODELS="$ROOT_DIR/Models/MetalML"
 BASELINE_BATCH2_MODELS="$ROOT_DIR/Models/MetalMLBatch2"
 RESTORATION_BACKEND="${JASNA_RESTORATION_BACKEND:-metal}"
+MLX_RESTORATION_KERNEL="${JASNA_MLX_RESTORATION_KERNEL:-reference}"
+case "$MLX_RESTORATION_KERNEL" in
+  reference|fused) ;;
+  *) echo "error: JASNA_MLX_RESTORATION_KERNEL must be reference or fused" >&2; exit 1 ;;
+esac
 case "$RESTORATION_BACKEND" in
   metal) ;;
   mlx)
@@ -31,6 +36,7 @@ case "$RESTORATION_BACKEND" in
   *) echo "error: JASNA_RESTORATION_BACKEND must be metal or mlx" >&2; exit 1 ;;
 esac
 export JASNA_RESTORATION_BACKEND="$RESTORATION_BACKEND"
+export JASNA_MLX_RESTORATION_KERNEL="$MLX_RESTORATION_KERNEL"
 
 metal_model_packages_available() {
   local directory="$1"
@@ -133,6 +139,11 @@ if [[ "${JASNA_START_FRESH:-0}" != "1" ]]; then
     "$ROLLOUT_RESUME_CONFIG" detect_device JASNA_DETECT_DEVICE
 fi
 export JASNA_DETECT_DEVICE="${JASNA_DETECT_DEVICE:-mlx}"
+export JASNA_MLX_DETECTOR_MODE="${JASNA_MLX_DETECTOR_MODE:-stable-fp32}"
+case "$JASNA_MLX_DETECTOR_MODE" in
+  stable-fp32|compiled-fp32|float16|compiled-float16) ;;
+  *) echo "error: JASNA_MLX_DETECTOR_MODE must be stable-fp32, compiled-fp32, float16, or compiled-float16" >&2; exit 1 ;;
+esac
 export JASNA_DETECT_DECODE_MODE="${JASNA_DETECT_DECODE_MODE:-sequential}"
 if [[ "$JASNA_DETECT_DEVICE" == "mlx" ]]; then
   [[ "$JASNA_DETECTOR" == "rfdetr-vr-v1" ]] || {
@@ -184,8 +195,14 @@ echo "Jasna macOS 27 rollout profile"
 echo "Performance profile: $PERFORMANCE_PROFILE"
 echo "Model track: baseline (fine-tuned candidates are test-only)"
 echo "Restoration backend: $RESTORATION_BACKEND"
+if [[ "$RESTORATION_BACKEND" == "mlx" ]]; then
+  echo "MLX restoration kernel: $JASNA_MLX_RESTORATION_KERNEL"
+fi
 echo "Models: $JASNA_MODELS_DIR"
 echo "Detector: $JASNA_DETECTOR on $JASNA_DETECT_DEVICE; model batch: $JASNA_MODEL_BATCH"
+if [[ "$JASNA_DETECT_DEVICE" == "mlx" ]]; then
+  echo "MLX detector mode: $JASNA_MLX_DETECTOR_MODE"
+fi
 echo "Detector memory: batch $JASNA_DETECT_BATCH_SIZE, $JASNA_DETECT_DECODE_MODE decode"
 echo "Container profile: $JASNA_WORK_CONTAINER working source; user-selected final extension"
 echo "Metal windows/process: $JASNA_METAL_WINDOWS_PER_PROCESS"

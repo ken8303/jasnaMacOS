@@ -7,7 +7,12 @@ struct ContentView: View {
         RestorationPerformanceProfile.fast.rawValue
     @AppStorage("restorationBackend") private var backendRawValue =
         RestorationBackend.metal.rawValue
+    @AppStorage("detectorExecutionMode") private var detectorModeRawValue =
+        DetectorExecutionMode.stableFP32.rawValue
+    @AppStorage("mlxRestorationKernel") private var restorationKernelRawValue =
+        MLXRestorationKernel.reference.rawValue
     @AppStorage("hybridDetectorDefaultApplied") private var hybridDetectorDefaultApplied = false
+    @State private var showsExperimentalOptions = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -47,6 +52,35 @@ struct ContentView: View {
                         .frame(width: 180)
                         .help(performanceProfile.detail)
                     }
+                    DisclosureGroup("Experimental options", isExpanded: $showsExperimentalOptions) {
+                        HStack(spacing: 16) {
+                            LabeledContent("MLX detector") {
+                                Picker("MLX detector", selection: detectorModeBinding) {
+                                    ForEach(DetectorExecutionMode.allCases) { mode in
+                                        Text(mode.title).tag(mode)
+                                    }
+                                }
+                                .labelsHidden()
+                                .frame(width: 180)
+                                .help(detectorMode.detail)
+                            }
+                            if backend == .mlx {
+                                LabeledContent("Restoration kernel") {
+                                    Picker("Restoration kernel", selection: restorationKernelBinding) {
+                                        ForEach(MLXRestorationKernel.allCases) { kernel in
+                                            Text(kernel.title).tag(kernel)
+                                        }
+                                    }
+                                    .labelsHidden()
+                                    .frame(width: 180)
+                                    .help(restorationKernel.detail)
+                                }
+                            }
+                            Spacer()
+                        }
+                        .padding(.top, 6)
+                    }
+                    .font(.caption)
                     MosaicRangesView(session: session)
                     Toggle("Shut down after all videos finish successfully", isOn: $session.autoShutdownAfterCompletion)
                         .font(.caption)
@@ -131,12 +165,24 @@ struct ContentView: View {
                 } else {
                     if session.implementationResumeAvailable {
                         Button("Resume Saved Work") {
-                            session.start(performanceProfile: performanceProfile, backend: backend, allowImplementationResume: true)
+                            session.start(
+                                performanceProfile: performanceProfile,
+                                backend: backend,
+                                detectorMode: detectorMode,
+                                restorationKernel: restorationKernel,
+                                allowImplementationResume: true
+                            )
                         }
                         .disabled(!session.canStart)
                     }
                     Button(session.freshStartAvailable ? "Start Fresh" : "Start Restoration") {
-                        session.start(performanceProfile: performanceProfile, backend: backend, startFresh: session.freshStartAvailable)
+                        session.start(
+                            performanceProfile: performanceProfile,
+                            backend: backend,
+                            detectorMode: detectorMode,
+                            restorationKernel: restorationKernel,
+                            startFresh: session.freshStartAvailable
+                        )
                     }
                     .help(session.freshStartAvailable
                           ? "Preserve this video's previous output and saved work in a backup folder, then restart with the selected settings."
@@ -168,6 +214,14 @@ struct ContentView: View {
         RestorationBackend(rawValue: backendRawValue) ?? .metal
     }
 
+    private var detectorMode: DetectorExecutionMode {
+        DetectorExecutionMode(rawValue: detectorModeRawValue) ?? .stableFP32
+    }
+
+    private var restorationKernel: MLXRestorationKernel {
+        MLXRestorationKernel(rawValue: restorationKernelRawValue) ?? .reference
+    }
+
     private var backendBinding: Binding<RestorationBackend> {
         Binding(
             get: { backend },
@@ -182,6 +236,20 @@ struct ContentView: View {
         Binding(
             get: { performanceProfile },
             set: { performanceProfileRawValue = $0.rawValue }
+        )
+    }
+
+    private var detectorModeBinding: Binding<DetectorExecutionMode> {
+        Binding(
+            get: { detectorMode },
+            set: { detectorModeRawValue = $0.rawValue }
+        )
+    }
+
+    private var restorationKernelBinding: Binding<MLXRestorationKernel> {
+        Binding(
+            get: { restorationKernel },
+            set: { restorationKernelRawValue = $0.rawValue }
         )
     }
 

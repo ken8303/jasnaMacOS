@@ -170,6 +170,8 @@ final class RestorationSession {
     func start(
         performanceProfile: RestorationPerformanceProfile,
         backend: RestorationBackend,
+        detectorMode: DetectorExecutionMode = .stableFP32,
+        restorationKernel: MLXRestorationKernel = .reference,
         allowImplementationResume: Bool = false,
         startFresh: Bool = false
     ) {
@@ -184,7 +186,13 @@ final class RestorationSession {
             try RestorationSourceQueue.validate(sourceURLs)
             if state == .completed { activeSourceIndex = 0 }
             pendingRequests = try sourceURLs.dropFirst(activeSourceIndex).map { source in
-                try validatedRequest(inputURL: source, performanceProfile: performanceProfile, backend: backend)
+                try validatedRequest(
+                    inputURL: source,
+                    performanceProfile: performanceProfile,
+                    backend: backend,
+                    detectorMode: detectorMode,
+                    restorationKernel: restorationKernel
+                )
             }
             guard !pendingRequests.isEmpty else { throw ValidationError("Add at least one source video.") }
             let request = pendingRequests.removeFirst()
@@ -230,12 +238,16 @@ final class RestorationSession {
         let autoShutdownAfterCompletion: Bool
         let performanceProfile: RestorationPerformanceProfile
         let backend: RestorationBackend
+        let detectorMode: DetectorExecutionMode
+        let restorationKernel: MLXRestorationKernel
     }
 
     private func validatedRequest(
         inputURL: URL,
         performanceProfile: RestorationPerformanceProfile,
-        backend: RestorationBackend
+        backend: RestorationBackend,
+        detectorMode: DetectorExecutionMode,
+        restorationKernel: MLXRestorationKernel
     ) throws -> Request {
         guard FileManager.default.fileExists(atPath: inputURL.path) else {
             throw ValidationError("The selected source video no longer exists.")
@@ -263,7 +275,9 @@ final class RestorationSession {
             ranges: ranges,
             autoShutdownAfterCompletion: autoShutdownAfterCompletion,
             performanceProfile: performanceProfile,
-            backend: backend
+            backend: backend,
+            detectorMode: detectorMode,
+            restorationKernel: restorationKernel
         )
     }
 
@@ -295,6 +309,8 @@ final class RestorationSession {
         }
         environment.merge(request.performanceProfile.processEnvironment) { _, requested in requested }
         environment.merge(request.backend.processEnvironment) { _, requested in requested }
+        environment.merge(request.detectorMode.processEnvironment) { _, requested in requested }
+        environment.merge(request.restorationKernel.processEnvironment) { _, requested in requested }
         // This opt-in belongs to this attempt only. The shell still verifies all other settings.
         environment["JASNA_ALLOW_IMPLEMENTATION_RESUME"] = allowImplementationResume ? "1" : "0"
         // Fresh start applies only to the failed video, never the remaining queue.
@@ -325,6 +341,10 @@ final class RestorationSession {
                 + "\(request.ranges ?? "full video (automatic detection)")\n"
                 + "Performance: \(request.performanceProfile.logDescription)\n"
                 + "Restoration model: \(request.backend.title)\n"
+                + "MLX detector mode: \(request.detectorMode.title)\n"
+                + (request.backend == .mlx
+                    ? "MLX restoration kernel: \(request.restorationKernel.title)\n"
+                    : "")
                 + "Compatible interrupted work retains its recorded model batch.\n"
                 + "Restart files: always preserved\n"
                 + "Automatic shutdown after success: "

@@ -60,6 +60,7 @@ jasna_implementation_fingerprint() {
     "$root_dir/tools/rfdetr_mlx_segmentation.py" \
     "$root_dir/tools/rfdetr_mlx_postprocess.py" \
     "$root_dir/tools/rfdetr_mlx_detector.py" \
+    "$root_dir/tools/rfdetr_mlx_experimental.py" \
     "$root_dir/tools/basicvsrpp_mlx_segments.py" \
     "$root_dir/tools/restore_mlx_crop.py" \
     "$root_dir/tools/scan_mosaic_regions.py" \

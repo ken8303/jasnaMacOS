@@ -420,11 +420,13 @@ temporal_warmup_frames=$TEMPORAL_WARMUP_FRAMES
 projection=fisheye
 detector=$DETECTOR"
 RUN_CONFIG="$RUN_CONFIG
-detect_device=$DETECT_DEVICE"
+detect_device=$DETECT_DEVICE
+mlx_detector_mode=${JASNA_MLX_DETECTOR_MODE:-stable-fp32}"
 case "${JASNA_RESTORATION_BACKEND:-metal}" in
   metal) ;;
   mlx) RUN_CONFIG="$RUN_CONFIG
-restoration_backend=mlx" ;;
+restoration_backend=mlx
+mlx_restoration_kernel=${JASNA_MLX_RESTORATION_KERNEL:-reference}" ;;
   *) echo "error: JASNA_RESTORATION_BACKEND must be metal or mlx" >&2; exit 1 ;;
 esac
 if [[ -s "$RUN_CONFIG_PATH" ]]; then
@@ -436,6 +438,23 @@ if [[ -s "$RUN_CONFIG_PATH" ]]; then
       -e '/^eye_pair_segments=/d' \
       "$RUN_CONFIG_PATH"
   )"
+  if ! /usr/bin/grep -q '^mlx_detector_mode=' "$RUN_CONFIG_PATH"; then
+    EXISTING_STABLE_CONFIG="$(
+      printf '%s\n' "$EXISTING_STABLE_CONFIG" | /usr/bin/awk '
+        { print }
+        /^detect_device=/ { print "mlx_detector_mode=stable-fp32" }
+      '
+    )"
+  fi
+  if /usr/bin/grep -q '^restoration_backend=mlx$' "$RUN_CONFIG_PATH" \
+    && ! /usr/bin/grep -q '^mlx_restoration_kernel=' "$RUN_CONFIG_PATH"; then
+    EXISTING_STABLE_CONFIG="$(
+      printf '%s\n' "$EXISTING_STABLE_CONFIG" | /usr/bin/awk '
+        { print }
+        /^restoration_backend=mlx$/ { print "mlx_restoration_kernel=reference" }
+      '
+    )"
+  fi
   if ! /usr/bin/grep -q '^detector=' "$RUN_CONFIG_PATH"; then
     EXISTING_STABLE_CONFIG="$EXISTING_STABLE_CONFIG
 detector=yolo-v2-fast"

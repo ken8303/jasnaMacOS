@@ -27,6 +27,12 @@ class RFDetrMLXDetector:
         """Accept normalized RGB NHWC [B,768,768,3] and return model outputs."""
         if image.ndim != 4 or image.shape[1:] != (768, 768, 3):
             raise ValueError("expected normalized RGB 768x768 image batch")
+        result = self._forward(image)
+        mx.eval(result)
+        return result
+
+    def _forward(self, image):
+        """Lazy forward graph, separated from evaluation for benchmark compilation."""
         weights = self.weights
         features = backbone_features(image, weights)
         projected = project_features(features, weights)
@@ -49,7 +55,6 @@ class RFDetrMLXDetector:
             mx.exp(delta[..., 2:]) * reference[..., 2:]), axis=-1)
         logits = linear(decoder_features[-1], "class_embed")
         masks = segmentation_masks(projected, decoder_features, weights)[-1]
-        mx.eval(predicted_boxes, logits, masks)
         return {"pred_boxes": predicted_boxes, "pred_logits": logits,
                 "pred_masks": masks}
 
